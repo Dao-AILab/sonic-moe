@@ -1,0 +1,11 @@
+# ********************************************************************************
+# Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
+# ********************************************************************************
+
+torch>=2.7.1
+nvidia-cutlass-dsl==4.2.1
+quack-kernels @ git+https://github.com/Dao-AILab/quack.git@3d0ab3ec2164749caac8f269f771e66a40efd2de
+pytest
+parameterized
+ninja
+rich
