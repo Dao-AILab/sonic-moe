@@ -40,7 +40,7 @@ def _gelu(x: torch.Tensor) -> torch.Tensor:
 def _reglu(x: torch.Tensor) -> torch.Tensor:
     u = x[..., 1::2]
     g = x[..., ::2]
-    return (F.gelu(g.to(dtype=torch.float32)) * u).to(dtype=g.dtype)
+    return (F.relu(g.to(dtype=torch.float32)) * u).to(dtype=g.dtype)
 
 
 def _relu(x: torch.Tensor) -> torch.Tensor:
