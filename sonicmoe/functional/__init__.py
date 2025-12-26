@@ -491,6 +491,10 @@ def moe_TC_softmax_topk_layer(
 
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# Weight format requirements:
+# - w1_weight: Shape (2*I, H, E), stride order (2, 0, 1), must be interleaved [gate_row0, up_row0, gate_row1, up_row1, ...]
+# - w2_weight: Shape (H, I, E), stride order (2, 0, 1)
+# 
 # We assume token_indices is already SORTED ascendingly !!!
 #   and len(token_indices) = len(expert_indices) = len(router_scores)
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
