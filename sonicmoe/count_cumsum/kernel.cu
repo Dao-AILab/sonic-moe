@@ -146,7 +146,9 @@ __global__ void count_cumsum_cuda_kernel(
 
 void count_cumsum_cuda(const torch::Tensor &x,
                        torch::Tensor &count_output,
-                       std::optional<torch::Tensor> &_cumsum_output) {
+                       std::optional<torch::Tensor> &_cumsum_output,
+                       int64_t stream_ptr) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const bool do_cumsum = _cumsum_output.has_value();
 
     // check that all tensors are on GPU
@@ -184,6 +186,7 @@ void count_cumsum_cuda(const torch::Tensor &x,
             launch_config.blockDim = BLOCK_SIZE;
             launch_config.gridDim = num_SMs;
             launch_config.dynamicSmemBytes = E * sizeof(uint32_t) + block_reduce_smem_size;
+            launch_config.stream = stream;
 
             cudaLaunchAttribute attributes[1];
 
@@ -204,4 +207,10 @@ void count_cumsum_cuda(const torch::Tensor &x,
         }));
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("count_cumsum_cuda", &count_cumsum_cuda, "count cumsum (CUDA)"); }
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("count_cumsum_cuda", &count_cumsum_cuda, "count cumsum (CUDA)",
+          py::arg("x"),
+          py::arg("count_output"),
+          py::arg("cumsum_output"),
+          py::arg("stream"));
+}
