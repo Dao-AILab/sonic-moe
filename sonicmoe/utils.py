@@ -70,7 +70,11 @@ class _TensorWithStream:
 
     def __init__(self, tensor: torch.Tensor, stream: int):
         self._tensor = tensor
-        self._stream = stream
+        # Convert CUDA stream pointer to PyTorch's __dlpack__ convention:
+        # - stream=0 (null/default stream) -> use -1 to disable synchronization
+        # - stream=non-zero -> use the raw pointer value
+        # This prevents "unsupported stream on CUDA: 0" error
+        self._stream = -1 if stream == 0 else stream
 
     def __dlpack__(self, stream=None):  # noqa: ARG002
         # Use the wrapped stream to prevent cross-stream synchronization
