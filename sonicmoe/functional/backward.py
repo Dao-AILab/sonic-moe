@@ -217,21 +217,21 @@ def _up_projection_backward(
     if db1 is not None:
         db1_kernel[(E,)](dz, db1, expert_frequency_offset, (2 * I if is_glu_activation else I), E)
 
-    mDz_trans = convert_torch_tensor_to_cute_tensor(dz.T, (1, 0), 0, 16, 8)
-    mDw1_trans = convert_torch_tensor_to_cute_tensor(dw1.permute(1, 0, 2), (2, 1, 0), 0, 16, 8)
+    mDz_trans = convert_torch_tensor_to_cute_tensor(dz.T, (1, 0), 0, 16, 8, stream=stream_id)
+    mDw1_trans = convert_torch_tensor_to_cute_tensor(dw1.permute(1, 0, 2), (2, 1, 0), 0, 16, 8, stream=stream_id)
 
-    mX_trans = convert_torch_tensor_to_cute_tensor(x.T, (1, 0), 0, 16, 8)
-    mE_offset = convert_torch_tensor_to_cute_tensor(expert_frequency_offset, (0,), 0, 4, 1)
-    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1)
-    mS_scatter = convert_torch_tensor_to_cute_tensor(s_scatter_idx, (0,), 0, 4, 1)
-    mDz = convert_torch_tensor_to_cute_tensor(dz, (0, 1), 1, 16, 8)
-    mDx_expanded = convert_torch_tensor_to_cute_tensor(dx_expanded, (0, 1), 1, 16, 8)
-    mW1_trans = convert_torch_tensor_to_cute_tensor(w1.permute(1, 0, 2), (2, 1, 0), 0, 16, 8)
+    mX_trans = convert_torch_tensor_to_cute_tensor(x.T, (1, 0), 0, 16, 8, stream=stream_id)
+    mE_offset = convert_torch_tensor_to_cute_tensor(expert_frequency_offset, (0,), 0, 4, 1, stream=stream_id)
+    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1, stream=stream_id)
+    mS_scatter = convert_torch_tensor_to_cute_tensor(s_scatter_idx, (0,), 0, 4, 1, stream=stream_id)
+    mDz = convert_torch_tensor_to_cute_tensor(dz, (0, 1), 1, 16, 8, stream=stream_id)
+    mDx_expanded = convert_torch_tensor_to_cute_tensor(dx_expanded, (0, 1), 1, 16, 8, stream=stream_id)
+    mW1_trans = convert_torch_tensor_to_cute_tensor(w1.permute(1, 0, 2), (2, 1, 0), 0, 16, 8, stream=stream_id)
 
     if expert_schedule_order is None:
         mE_permute_order = None
     else:
-        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1)
+        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
     current_stream = cuda.CUstream(stream_id)
 
     compile_dw1_key = ("dw1", E, H, I, is_glu_activation, x.dtype)
@@ -311,28 +311,32 @@ def _down_projection_backward(
     w2 = w2.detach()
     topk_scores = topk_scores.detach()
 
-    mDout = convert_torch_tensor_to_cute_tensor(dout, (0, 1), 1, 16, 8)
-    mDout_trans = convert_torch_tensor_to_cute_tensor(dout.T, (1, 0), 0, 16, 8)
-    mDw2 = convert_torch_tensor_to_cute_tensor(dw2, (2, 0, 1), 1, 16, 8)
-    mW2_trans = convert_torch_tensor_to_cute_tensor(w2.permute(1, 0, 2), (2, 1, 0), 0, 16, 8)
-    mS = convert_torch_tensor_to_cute_tensor(topk_scores, (0,), 0, 4, 1)
+    mDout = convert_torch_tensor_to_cute_tensor(dout, (0, 1), 1, 16, 8, stream=stream_id)
+    mDout_trans = convert_torch_tensor_to_cute_tensor(dout.T, (1, 0), 0, 16, 8, stream=stream_id)
+    mDw2 = convert_torch_tensor_to_cute_tensor(dw2, (2, 0, 1), 1, 16, 8, stream=stream_id)
+    mW2_trans = convert_torch_tensor_to_cute_tensor(w2.permute(1, 0, 2), (2, 1, 0), 0, 16, 8, stream=stream_id)
+    mS = convert_torch_tensor_to_cute_tensor(topk_scores, (0,), 0, 4, 1, stream=stream_id)
     if is_glu_activation:
-        mDz_kernel_input = convert_torch_tensor_to_cute_tensor(dz.view(torch.float32), (0, 1), 1, 16, 8)
-        mZ_kernel_input = convert_torch_tensor_to_cute_tensor(z.view(torch.float32), (0, 1), 1, 16, 8)
+        mDz_kernel_input = convert_torch_tensor_to_cute_tensor(
+            dz.view(torch.float32), (0, 1), 1, 16, 8, stream=stream_id
+        )
+        mZ_kernel_input = convert_torch_tensor_to_cute_tensor(
+            z.view(torch.float32), (0, 1), 1, 16, 8, stream=stream_id
+        )
     else:
-        mDz_kernel_input = convert_torch_tensor_to_cute_tensor(dz.detach(), (0, 1), 1, 16, 8)
-        mZ_kernel_input = convert_torch_tensor_to_cute_tensor(z.detach(), (0, 1), 1, 16, 8)
+        mDz_kernel_input = convert_torch_tensor_to_cute_tensor(dz.detach(), (0, 1), 1, 16, 8, stream=stream_id)
+        mZ_kernel_input = convert_torch_tensor_to_cute_tensor(z.detach(), (0, 1), 1, 16, 8, stream=stream_id)
 
-    mY1S = convert_torch_tensor_to_cute_tensor(y1s, (0, 1), 1, 16, 8)
-    mY1S_trans = convert_torch_tensor_to_cute_tensor(y1s.T, (1, 0), 0, 16, 8)
-    mE_offset = convert_torch_tensor_to_cute_tensor(expert_frequency_offset, (0,), 0, 4, 1)
-    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1)
-    mS_scatter = convert_torch_tensor_to_cute_tensor(s_scatter_idx, (0,), 0, 4, 1)
+    mY1S = convert_torch_tensor_to_cute_tensor(y1s, (0, 1), 1, 16, 8, stream=stream_id)
+    mY1S_trans = convert_torch_tensor_to_cute_tensor(y1s.T, (1, 0), 0, 16, 8, stream=stream_id)
+    mE_offset = convert_torch_tensor_to_cute_tensor(expert_frequency_offset, (0,), 0, 4, 1, stream=stream_id)
+    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1, stream=stream_id)
+    mS_scatter = convert_torch_tensor_to_cute_tensor(s_scatter_idx, (0,), 0, 4, 1, stream=stream_id)
 
     if expert_schedule_order is None:
         mE_permute_order = None
     else:
-        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1)
+        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
     current_stream = cuda.CUstream(stream_id)
     ds_partial = None
 
@@ -345,7 +349,7 @@ def _down_projection_backward(
 
         ds_partial_N = max(ceil_divide(I, dz_module.module.tile_shape_mnk[1]), 1)
         ds_partial = torch.empty(TK, ds_partial_N, dtype=torch.float32, device=topk_scores.device)
-        mDS_partial = convert_torch_tensor_to_cute_tensor(ds_partial, (0, 1), 1, 4, 1)
+        mDS_partial = convert_torch_tensor_to_cute_tensor(ds_partial, (0, 1), 1, 4, 1, stream=stream_id)
 
         _down_projection_backward.compile_cache["ds_partial_N"] = ds_partial_N
         _down_projection_backward.compile_cache[compile_dz_key] = cute.compile(
@@ -369,7 +373,7 @@ def _down_projection_backward(
     if ds_partial is None:
         ds_partial_N = _down_projection_backward.compile_cache["ds_partial_N"]
         ds_partial = torch.empty(TK, ds_partial_N, dtype=torch.float32, device=topk_scores.device)
-        mDS_partial = convert_torch_tensor_to_cute_tensor(ds_partial, (0, 1), 1, 4, 1)
+        mDS_partial = convert_torch_tensor_to_cute_tensor(ds_partial, (0, 1), 1, 4, 1, stream=stream_id)
 
     dz_tensormaps = _down_projection_backward.compile_cache[f"dz-{TENSORMAP}"]
     _down_projection_backward.compile_cache[compile_dz_key](

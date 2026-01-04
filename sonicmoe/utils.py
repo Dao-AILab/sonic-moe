@@ -60,11 +60,40 @@ def get_next_power_of_2(x: int) -> int:
     return x
 
 
+class _TensorWithStream:
+    """Wrapper to pass stream parameter to __dlpack__() for CUDA graph compatibility.
+
+    This wrapper allows us to pass a stream parameter to the tensor's __dlpack__() method
+    when cutlass's from_dlpack() calls it, preventing cross-stream synchronization during
+    CUDA graph capture.
+    """
+
+    def __init__(self, tensor: torch.Tensor, stream: int):
+        self._tensor = tensor
+        self._stream = stream
+
+    def __dlpack__(self, stream=None):  # noqa: ARG002
+        # Use the wrapped stream to prevent cross-stream synchronization
+        # The stream parameter is required by the DLPack protocol but ignored here
+        return self._tensor.__dlpack__(stream=self._stream)
+
+    def __dlpack_device__(self):
+        return self._tensor.__dlpack_device__()
+
+
 def convert_torch_tensor_to_cute_tensor(
-    x: torch.Tensor, stride_order, leading_dim: int, alignment: int, divisibility: int
+    x: torch.Tensor,
+    stride_order,
+    leading_dim: int,
+    alignment: int,
+    divisibility: int,
+    stream: int | None = None,
 ):
+    # Wrap tensor with stream if provided to prevent cross-stream synchronization during CUDA graph capture
+    tensor_input = _TensorWithStream(x, stream) if stream is not None else x
+
     return (
-        from_dlpack(x, assumed_align=alignment)
+        from_dlpack(tensor_input, assumed_align=alignment)
         .mark_layout_dynamic(leading_dim=leading_dim)
         .mark_compact_shape_dynamic(mode=leading_dim, stride_order=stride_order, divisibility=divisibility)
     )
