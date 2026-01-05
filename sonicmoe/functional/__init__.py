@@ -50,30 +50,38 @@ def TC_topk_router_metadata(
         num_activated_expert_per_token_offset,
     )
 
-
 def expert_parallel_TC_topk_router_metadata(
     topk_router_indices: torch.Tensor, expert_frequency_offset, K: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+
     invalid_tokens = torch.sum(topk_router_indices == -1)
     s_scatter_idx = torch.argsort(topk_router_indices.view(-1)).int()
     expert_frequency_offset = torch.cat([torch.zeros(1, device=expert_frequency_offset.device, dtype=expert_frequency_offset.dtype), expert_frequency_offset])
-    expert_frequency_offset += invalid_tokens
     s_reverse_scatter_idx = torch.empty_like(s_scatter_idx)
     s_reverse_scatter_idx[s_scatter_idx] = torch.arange(
         s_scatter_idx.shape[0], device=s_scatter_idx.device, dtype=s_scatter_idx.dtype
     )
 
     num_activated_expert_per_token_offset = (topk_router_indices > -1).sum(dim=-1)
-    num_activated_expert_per_token_offset = torch.cat([torch.tensor([invalid_tokens], device=num_activated_expert_per_token_offset.device, dtype=num_activated_expert_per_token_offset.dtype), num_activated_expert_per_token_offset])
+    num_activated_expert_per_token_offset = torch.cat([torch.tensor([0], device=num_activated_expert_per_token_offset.device, dtype=num_activated_expert_per_token_offset.dtype), num_activated_expert_per_token_offset])
     num_activated_expert_per_token_offset = num_activated_expert_per_token_offset.cumsum(0)
 
     x_gather_idx = s_scatter_idx // K
 
+
+    topk_router_indices_valid = topk_router_indices[topk_router_indices >= 0]
+    s_scatter_idx_valid = torch.argsort(topk_router_indices_valid.view(-1)).int()
+    s_reverse_scatter_idx_valid = torch.empty_like(s_scatter_idx_valid)
+    s_reverse_scatter_idx_valid[s_scatter_idx_valid] = torch.arange(
+        s_scatter_idx_valid.shape[0], device=s_scatter_idx_valid.device, dtype=s_scatter_idx_valid.dtype
+    )
+
     return (
         expert_frequency_offset,
-        x_gather_idx,
-        s_scatter_idx,
-        s_reverse_scatter_idx,
+        x_gather_idx[invalid_tokens:],
+        s_scatter_idx_valid,
+        # s_reverse_scatter_idx[s_reverse_scatter_idx >= invalid_tokens],
+        s_reverse_scatter_idx_valid,
         num_activated_expert_per_token_offset,
     )
 
@@ -498,6 +506,7 @@ def moe_TC_softmax_topk_layer(
         x = recv_x
         topk_indices = recv_topk_indices.int()
         topk_scores = recv_topk_weights
+        topk_scores = topk_scores[topk_scores > 0]
     
     expert_frequency, expert_frequency_offset = count_cumsum(topk_indices.view(-1), loacl_num_experts, do_cumsum=True)
     
@@ -514,23 +523,32 @@ def moe_TC_softmax_topk_layer(
         activation_type = ActivationType(activation_type)
 
     T = x.size(0)
+
+    if ep_size > 1:
+        TK = s_scatter_idx.shape[0]
+        is_varlen_K = True
+    else:
+        TK = T * K
+        is_varlen_K = False
+
     if T > 0:
         y1, z = _UpProjection.apply(
             x,
             w1,
             b1,
             expert_frequency_offset,
-            T * K,
+            TK,
             K,
             stream_id,
             x_gather_idx,
             s_scatter_idx,
             s_reverse_scatter_idx,
             num_activated_expert_per_token_offset,
-            False,  # is_varlen_K
+            is_varlen_K,
             activation_type,
             is_inference_mode_enabled,
         )
+
 
         o = _DownProjection.apply(
             y1,
@@ -546,7 +564,7 @@ def moe_TC_softmax_topk_layer(
             s_scatter_idx,
             s_reverse_scatter_idx,
             num_activated_expert_per_token_offset,
-            False,  # is_varlen_K
+            is_varlen_K,
             activation_type,
         )
 
