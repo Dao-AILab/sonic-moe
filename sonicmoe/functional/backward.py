@@ -324,12 +324,12 @@ def _up_projection_backward(
     is_glu_activation: bool,
     stream_id: int,
 ) -> None:
-    _up_projection_backward_weight(
-        x, dw1, dz, db1, expert_frequency_offset, expert_schedule_order, x_gather_idx, is_glu_activation, stream_id
-    )
     _up_projection_backward_act(
         w1, dx_expanded, dz, expert_frequency_offset, expert_schedule_order, x_gather_idx, s_scatter_idx,
         is_glu_activation, stream_id
+    )
+    _up_projection_backward_weight(
+        x, dw1, dz, db1, expert_frequency_offset, expert_schedule_order, x_gather_idx, is_glu_activation, stream_id
     )
 
 
