@@ -561,14 +561,7 @@ def _down_projection_backward_weight(
 
     dw2_tensormaps = _down_projection_backward_weight.compile_cache[f"dw2-{TENSORMAP}"]
     _down_projection_backward_weight.compile_cache[compile_dw2_key](
-        mDout_trans,
-        mY1S_trans,
-        mDw2,
-        mE_offset,
-        mX_gather,
-        dw2_tensormaps,
-        mE_permute_order,
-        current_stream
+        mDout_trans, mY1S_trans, mDw2, mE_offset, mX_gather, dw2_tensormaps, mE_permute_order, current_stream
     )
 
 
@@ -615,7 +608,7 @@ def _down_projection_backward(
         s_scatter_idx=s_scatter_idx,
         is_glu_activation=is_glu_activation,
         activation_type=activation_type,
-        stream_id=stream_id
+        stream_id=stream_id,
     )
     _down_projection_backward_weight(
         dout=dout,
@@ -624,7 +617,7 @@ def _down_projection_backward(
         expert_frequency_offset=expert_frequency_offset,
         expert_schedule_order=expert_schedule_order,
         x_gather_idx=x_gather_idx,
-        stream_id=stream_id
+        stream_id=stream_id,
     )
 
 

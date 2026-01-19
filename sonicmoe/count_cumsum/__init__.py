@@ -10,7 +10,9 @@ from ..jit import cpp_jit
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::count_cumsum_cuda", mutates_args={"count_output", "cumsum_output"})
 @cpp_jit()
-def count_cumsum_cuda(x: torch.Tensor, count_output: torch.Tensor, cumsum_output: torch.Tensor | None, stream: int) -> None: ...
+def count_cumsum_cuda(
+    x: torch.Tensor, count_output: torch.Tensor, cumsum_output: torch.Tensor | None, stream: int
+) -> None: ...
 
 
 @torch.no_grad()
