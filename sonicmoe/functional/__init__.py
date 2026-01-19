@@ -433,7 +433,7 @@ class _DownProjection(torch.autograd.Function):
                 x_gather_idx=x_gather_idx,
                 s_scatter_idx=s_scatter_idx,
                 is_glu_activation=is_glu_activation,
-                activation_type=activation_type,
+                activation_type=activation_type.value,
                 stream_id=stream_id,
             )
 
