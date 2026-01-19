@@ -529,59 +529,6 @@ def _down_projection_backward_weight(
 _down_projection_backward_weight.compile_cache = {}
 
 
-def _down_projection_backward(
-    dout: torch.Tensor,
-    z: torch.Tensor,
-    w2: torch.Tensor,
-    dw2: torch.Tensor,
-    dz: torch.Tensor,
-    ds: torch.Tensor,
-    b2: torch.Tensor | None,
-    db2: torch.Tensor | None,
-    topk_scores: torch.Tensor,
-    expert_frequency_offset: torch.Tensor,
-    expert_schedule_order: torch.Tensor,
-    x_gather_idx: torch.Tensor,
-    s_scatter_idx: torch.Tensor,
-    stream_id: int,
-    is_glu_activation: bool,
-    activation_type: str,
-) -> None:
-    I = w2.size(1)
-    TK = x_gather_idx.size(0)
-
-    y1s = torch.empty(TK, I, dtype=z.dtype, device=z.device)
-
-    _down_projection_backward_act(
-        dout=dout,
-        z=z,
-        w2=w2,
-        dz=dz,
-        ds=ds,
-        b2=b2,
-        db2=db2,
-        y1s=y1s,
-        topk_scores=topk_scores,
-        expert_frequency_offset=expert_frequency_offset,
-        expert_schedule_order=expert_schedule_order,
-        x_gather_idx=x_gather_idx,
-        s_scatter_idx=s_scatter_idx,
-        is_glu_activation=is_glu_activation,
-        activation_type=activation_type,
-        stream_id=stream_id,
-    )
-
-    _down_projection_backward_weight(
-        dout=dout,
-        y1s=y1s,
-        dw2=dw2,
-        expert_frequency_offset=expert_frequency_offset,
-        expert_schedule_order=expert_schedule_order,
-        x_gather_idx=x_gather_idx,
-        stream_id=stream_id,
-    )
-
-
 @torch.library.custom_op(f"{LIBRARY_NAME}::_token_broadcast_backward", mutates_args={"dx_reduced"})
 def _token_broadcast_backward(
     dx_reduced: torch.Tensor,

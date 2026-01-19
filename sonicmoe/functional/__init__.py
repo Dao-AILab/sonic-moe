@@ -12,7 +12,8 @@ from ..count_cumsum import count_cumsum
 from ..enums import ActivationType, is_glu
 from ..quack_utils import gemm_dgated, gemm_gated
 from .backward import (
-    _down_projection_backward,
+    _down_projection_backward_act,
+    _down_projection_backward_weight,
     _softmax_topk_bwd,
     _token_broadcast_backward,
     _up_projection_backward_act,
@@ -410,23 +411,40 @@ class _DownProjection(torch.autograd.Function):
             ds = ds[s_reverse_scatter_idx]
         else:
             ds = torch.empty_like(topk_scores)
-            _down_projection_backward(
+
+            I = w2.size(1)
+            TK = x_gather_idx.size(0)
+
+            y1s = torch.empty(TK, I, dtype=z.dtype, device=z.device)
+            is_glu_activation = is_glu(activation_type)
+
+            _down_projection_backward_act(
                 dout=dout,
                 z=z,
                 w2=w2,
-                dw2=dw2,
                 dz=dz,
                 ds=ds,
                 b2=b2,
                 db2=db2,
+                y1s=y1s,
                 topk_scores=topk_scores,
                 expert_frequency_offset=expert_frequency_offset,
                 expert_schedule_order=None,
                 x_gather_idx=x_gather_idx,
                 s_scatter_idx=s_scatter_idx,
+                is_glu_activation=is_glu_activation,
+                activation_type=activation_type,
                 stream_id=stream_id,
-                is_glu_activation=is_glu(activation_type),
-                activation_type=activation_type.value,
+            )
+
+            _down_projection_backward_weight(
+                dout=dout,
+                y1s=y1s,
+                dw2=dw2,
+                expert_frequency_offset=expert_frequency_offset,
+                expert_schedule_order=None,
+                x_gather_idx=x_gather_idx,
+                stream_id=stream_id,
             )
 
         # TC top-K routing
