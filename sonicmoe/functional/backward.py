@@ -192,11 +192,12 @@ def _colsum_smallN_kernel(
     tl.store(y_ptr + row * stride_y, acc)
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_backward_act", mutates_args={"dx_expanded"})
+@torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_backward_act", mutates_args={"dx_expanded", "db1"})
 def _up_projection_backward_act(
     w1: torch.Tensor,
     dx_expanded: torch.Tensor,
     dz: torch.Tensor,
+    db1: torch.Tensor | None,
     expert_frequency_offset: torch.Tensor,
     expert_schedule_order: torch.Tensor | None,
     x_gather_idx: torch.Tensor,
@@ -207,6 +208,10 @@ def _up_projection_backward_act(
     I, H, E = w1.size()
     if is_glu_activation:
         I //= 2
+
+    # db1 computation
+    if db1 is not None:
+        db1_kernel[(E,)](dz, db1, expert_frequency_offset, (2 * I if is_glu_activation else I), E)
 
     mE_offset = convert_torch_tensor_to_cute_tensor(expert_frequency_offset, (0,), 0, 4, 1, stream=stream_id)
     mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1, stream=stream_id)
@@ -256,12 +261,11 @@ def _up_projection_backward_act(
 _up_projection_backward_act.compile_cache = {}
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_backward_weight", mutates_args={"dw1", "db1"})
+@torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_backward_weight", mutates_args={"dw1"})
 def _up_projection_backward_weight(
     x: torch.Tensor,
     dw1: torch.Tensor,
     dz: torch.Tensor,
-    db1: torch.Tensor | None,
     expert_frequency_offset: torch.Tensor,
     expert_schedule_order: torch.Tensor | None,
     x_gather_idx: torch.Tensor,
@@ -273,10 +277,6 @@ def _up_projection_backward_weight(
         I //= 2
 
     x = x.detach()
-
-    # db1 computation
-    if db1 is not None:
-        db1_kernel[(E,)](dz, db1, expert_frequency_offset, (2 * I if is_glu_activation else I), E)
 
     mDz_trans = convert_torch_tensor_to_cute_tensor(dz.T, (1, 0), 0, 16, 8, stream=stream_id)
     mDw1_trans = convert_torch_tensor_to_cute_tensor(dw1.permute(1, 0, 2), (2, 1, 0), 0, 16, 8, stream=stream_id)
@@ -343,6 +343,7 @@ def _up_projection_backward(
         w1=w1,
         dx_expanded=dx_expanded,
         dz=dz,
+        db1=db1,
         expert_frequency_offset=expert_frequency_offset,
         expert_schedule_order=expert_schedule_order,
         x_gather_idx=x_gather_idx,
@@ -354,7 +355,6 @@ def _up_projection_backward(
         x=x,
         dw1=dw1,
         dz=dz,
-        db1=db1,
         expert_frequency_offset=expert_frequency_offset,
         expert_schedule_order=expert_schedule_order,
         x_gather_idx=x_gather_idx,
