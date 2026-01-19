@@ -324,45 +324,6 @@ def _up_projection_backward_weight(
 _up_projection_backward_weight.compile_cache = {}
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_backward", mutates_args={"dw1", "dx_expanded", "db1"})
-def _up_projection_backward(
-    x: torch.Tensor,
-    w1: torch.Tensor,
-    dx_expanded: torch.Tensor,
-    dw1: torch.Tensor,
-    dz: torch.Tensor,
-    db1: torch.Tensor | None,
-    expert_frequency_offset: torch.Tensor,
-    expert_schedule_order: torch.Tensor,
-    x_gather_idx: torch.Tensor,
-    s_scatter_idx: torch.Tensor,
-    is_glu_activation: bool,
-    stream_id: int,
-) -> None:
-    _up_projection_backward_act(
-        w1=w1,
-        dx_expanded=dx_expanded,
-        dz=dz,
-        db1=db1,
-        expert_frequency_offset=expert_frequency_offset,
-        expert_schedule_order=expert_schedule_order,
-        x_gather_idx=x_gather_idx,
-        s_scatter_idx=s_scatter_idx,
-        is_glu_activation=is_glu_activation,
-        stream_id=stream_id,
-    )
-    _up_projection_backward_weight(
-        x=x,
-        dw1=dw1,
-        dz=dz,
-        expert_frequency_offset=expert_frequency_offset,
-        expert_schedule_order=expert_schedule_order,
-        x_gather_idx=x_gather_idx,
-        is_glu_activation=is_glu_activation,
-        stream_id=stream_id,
-    )
-
-
 @torch.library.custom_op(f"{LIBRARY_NAME}::_down_projection_backward_act", mutates_args={"dz", "ds", "db2", "y1s"})
 def _down_projection_backward_act(
     dout: torch.Tensor,
@@ -568,7 +529,6 @@ def _down_projection_backward_weight(
 _down_projection_backward_weight.compile_cache = {}
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_down_projection_backward", mutates_args={"dw2", "dz", "ds", "db2"})
 def _down_projection_backward(
     dout: torch.Tensor,
     z: torch.Tensor,
@@ -587,7 +547,7 @@ def _down_projection_backward(
     is_glu_activation: bool,
     activation_type: str,
 ) -> None:
-    _, I, _ = w2.size()
+    I = w2.size(1)
     TK = x_gather_idx.size(0)
 
     y1s = torch.empty(TK, I, dtype=z.dtype, device=z.device)
@@ -610,6 +570,7 @@ def _down_projection_backward(
         activation_type=activation_type,
         stream_id=stream_id,
     )
+
     _down_projection_backward_weight(
         dout=dout,
         y1s=y1s,

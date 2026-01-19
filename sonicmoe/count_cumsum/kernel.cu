@@ -208,7 +208,9 @@ void count_cumsum_cuda(const torch::Tensor &x,
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("count_cumsum_cuda", &count_cumsum_cuda, "count cumsum (CUDA)",
+    m.def("count_cumsum_cuda",
+          &count_cumsum_cuda,
+          "count cumsum (CUDA)",
           py::arg("x"),
           py::arg("count_output"),
           py::arg("cumsum_output"),

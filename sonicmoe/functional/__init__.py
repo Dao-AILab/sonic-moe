@@ -11,7 +11,13 @@ from quack.gemm_interface import gemm
 from ..count_cumsum import count_cumsum
 from ..enums import ActivationType, is_glu
 from ..quack_utils import gemm_dgated, gemm_gated
-from .backward import _down_projection_backward, _softmax_topk_bwd, _token_broadcast_backward, _up_projection_backward
+from .backward import (
+    _down_projection_backward,
+    _softmax_topk_bwd,
+    _token_broadcast_backward,
+    _up_projection_backward_act,
+    _up_projection_backward_weight,
+)
 from .forward import _down_projection_forward, _router_forward, _softmax_topk_fwd, _up_projection_forward
 from .utils import enable_quack_gemm, is_using_quack_gemm
 
@@ -237,17 +243,27 @@ class _UpProjection(torch.autograd.Function):
             dx_expanded = gemm(dz, w1.permute(2, 0, 1), cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False)
         else:
             dx_expanded = torch.empty(TK, H, dtype=dz.dtype, device=dz.device)
-            _up_projection_backward(
-                x=x,
+
+            _up_projection_backward_act(
                 w1=w1,
                 dx_expanded=dx_expanded,
-                dw1=dw1,
                 dz=dz,
                 db1=db1,
                 expert_frequency_offset=expert_frequency_offset,
                 expert_schedule_order=None,
                 x_gather_idx=x_gather_idx,
                 s_scatter_idx=s_scatter_idx,
+                is_glu_activation=is_glu_activation,
+                stream_id=stream_id,
+            )
+
+            _up_projection_backward_weight(
+                x=x,
+                dw1=dw1,
+                dz=dz,
+                expert_frequency_offset=expert_frequency_offset,
+                expert_schedule_order=None,
+                x_gather_idx=x_gather_idx,
                 is_glu_activation=is_glu_activation,
                 stream_id=stream_id,
             )
@@ -494,6 +510,7 @@ def moe_TC_softmax_topk_layer(
 # Weight format requirements:
 # - w1_weight: Shape (2*I, H, E), stride order (2, 0, 1), must be interleaved [gate_row0, up_row0, gate_row1, up_row1, ...]
 # - w2_weight: Shape (H, I, E), stride order (2, 0, 1)
+
 
 # We assume token_indices is already SORTED ascendingly !!!
 #   and len(token_indices) = len(expert_indices) = len(router_scores)
