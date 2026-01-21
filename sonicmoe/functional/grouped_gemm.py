@@ -30,12 +30,11 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import argparse
 import enum
 import math
 import operator
 from functools import partial
-from typing import Callable, List, Optional, Tuple, Type, Union
+from typing import Callable, Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -53,11 +52,11 @@ from quack.cute_dsl_utils import ParamsBase
 
 # return PipelineStateWAdvance instead of PipelineState
 from quack.pipeline import PipelineTmaCpAsync, make_pipeline_state
-from quack.reduce import warp_reduce
 from quack.sm90_utils import partition_for_epilogue
 from quack.tensormap_manager import TensorMapManagerSm90
 from quack.tile_scheduler import RasterOrderOption, TileSchedulerArguments, VarlenMTileSchedulerArguments
-from quack.utils import make_acc_tensor_mn_view, predicate_k, sm90_get_smem_load_op
+from quack.layout_utils import make_acc_tensor_mn_view
+from quack.copy_utils import sm90_get_smem_load_op
 
 from .tile_scheduler import SonicMoETileScheduler, SonicMoEVarlenMTileScheduler
 
@@ -1783,8 +1782,9 @@ class HopperWgmma_MoE_kernel:
 
                     if const_expr(self.is_A_gather):
                         cA = cute.local_tile(mcA_mkl, (self.tile_M, self.tile_K), (tile_coord_mnkl[0], None))
-
+                        print("BEFORE", sA)
                         tAsA = A_g2s_thr_copy.partition_D(sA)
+                        print("POST BEFORE", tAsA)
                         tAcA = A_g2s_thr_copy.partition_D(cA)
 
                         tApA = cute.make_fragment(
@@ -1901,6 +1901,7 @@ class HopperWgmma_MoE_kernel:
                                 )
 
                         if const_expr(self.is_A_gather):
+                            print("AFTER", tAsA, tAsA[None, None, None, mainloop_producer_state.index])
                             self.load_A_gather(
                                 mA_mkl,
                                 tmAIdx,
@@ -2550,7 +2551,7 @@ class HopperWgmma_MoE_kernel:
                         for c in cutlass.range_constexpr(cute.size(y1, mode=[1])):
                             col_sum = col_sum + y1[r, c]
 
-                        col_sum = warp_reduce(col_sum, operator.add, width=4)
+                        col_sum = cute.arch.warp_reduction(col_sum, operator.add, threads_in_group=4)
 
                         M_idx_raw = tile_M_offset + M_tile_idx
                         if tidx % 4 == 0 and M_idx_raw < TIdx_next_group:

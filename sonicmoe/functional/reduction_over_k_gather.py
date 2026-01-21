@@ -242,8 +242,8 @@ class Token_gather_and_sum_over_k:
         mO: cute.Tensor,
         mMoffset: cute.Tensor,
         mXIdx: cute.Tensor,
-        X_tiled_copy: cute.core.TiledCopy,
-        O_tiled_copy: cute.core.TiledCopy,
+        X_tiled_copy: cute.TiledCopy,
+        O_tiled_copy: cute.TiledCopy,
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
     ):

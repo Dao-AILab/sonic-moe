@@ -10,6 +10,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import quack.utils as utils
+from sonicmoe.utils import domain_offset_i64
 from cutlass import const_expr
 from quack.sort.bitonic_sort import bitonic_topk
 from triton import next_power_of_2
@@ -100,7 +101,7 @@ class TopK_Softmax:
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
         # We use domain_offset_i64 to deal with tensors larger than 2^31 elements
-        mX = utils.domain_offset_i64((bidx * input_tiler_mn[0], 0), mX)
+        mX = domain_offset_i64((bidx * input_tiler_mn[0], 0), mX)
         gX = cute.local_tile(mX, input_tiler_mn, (0, 0))
         cX = cute.local_tile(idX, input_tiler_mn, (bidx, 0))
 

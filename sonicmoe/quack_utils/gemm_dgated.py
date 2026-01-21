@@ -29,7 +29,6 @@ from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_wrapper_utils import GemmWrapperBase
-from quack.reduce import warp_reduce
 from quack.sm90_utils import partition_for_epilogue
 from quack.varlen_utils import VarlenManager
 from torch import Tensor
@@ -278,9 +277,9 @@ class GemmDGatedMixin(GemmActMixin):
             tDrCVR_flt = cute.filter_zeros(tDrColVecReduce)
             if const_expr(self.arch != 100):
                 for i in cutlass.range(cute.size(tDrCVR_flt), unroll_full=True):
-                    tDrCVR_flt[i] = warp_reduce(tDrCVR_flt[i], operator.add, width=4)
+                    tDrCVR_flt[i] = cute.arch.warp_reduction(tDrCVR_flt[i], operator.add, threads_in_group=4)
             else:
-                # Don't need warp_reduce since we load from tmem with one thread per row
+                # Don't need cute.arch.warp_reduction since we load from tmem with one thread per row
                 assert self.d_layout.is_n_major_c(), "GemmDGated only supports n-major output for now"
             batch_idx = tile_coord_mnkl[3]
             limit_n = params.mColVecReduce.shape[2] if not varlen_manager.varlen_m else params.mColVecReduce.shape[1]
