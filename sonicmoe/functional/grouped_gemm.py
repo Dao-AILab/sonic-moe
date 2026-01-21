@@ -1782,9 +1782,7 @@ class HopperWgmma_MoE_kernel:
 
                     if const_expr(self.is_A_gather):
                         cA = cute.local_tile(mcA_mkl, (self.tile_M, self.tile_K), (tile_coord_mnkl[0], None))
-                        print("BEFORE", sA)
                         tAsA = A_g2s_thr_copy.partition_D(sA)
-                        print("POST BEFORE", tAsA)
                         tAcA = A_g2s_thr_copy.partition_D(cA)
 
                         tApA = cute.make_fragment(
@@ -1901,7 +1899,6 @@ class HopperWgmma_MoE_kernel:
                                 )
 
                         if const_expr(self.is_A_gather):
-                            print("AFTER", tAsA, tAsA[None, None, None, mainloop_producer_state.index])
                             self.load_A_gather(
                                 mA_mkl,
                                 tmAIdx,
