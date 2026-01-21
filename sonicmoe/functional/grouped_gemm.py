@@ -590,8 +590,8 @@ class HopperWgmma_MoE_kernel:
                     mA_cur_copy = cute.make_tensor(tPrAptr, ((copy_elems_per_thr_load, 1), 1))
 
                     cute.copy(A_g2s_thr_copy, mA_cur_copy, tAsA[None, None, i])
-                else:
-                    tAsA[None, None, i].fill(0.0)
+                # else:
+                #     tAsA[None, None, i].fill(0.0)
 
             else:
                 MIdx = tmAIdx[i]
