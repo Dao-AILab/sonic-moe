@@ -41,7 +41,7 @@ class HopperGEMMConfig:
     def max_active_clusters(self) -> int:
         sms_per_cluster = self.cluster_shape_mnk[0] * self.cluster_shape_mnk[1]
         if self.num_sms is not None:
-            return self.num_sms / sms_per_cluster
+            return self.num_sms // sms_per_cluster
         return cutlass.utils.HardwareInfo().get_max_active_clusters(sms_per_cluster)
 
 
