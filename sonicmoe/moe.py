@@ -174,6 +174,7 @@ class MoE(nn.Module):
         activation_function: ActivationType,
         add_bias: bool,
         std: float,
+        num_sms: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -204,6 +205,7 @@ class MoE(nn.Module):
         )
 
         self.stream_id = torch.cuda.current_stream().cuda_stream
+        self.num_sms = num_sms
 
     def forward(
         self,
@@ -228,6 +230,7 @@ class MoE(nn.Module):
                 self.stream_id,
                 self.activation_function,
                 is_inference_mode or not self.training,
+                num_sms=self.num_sms,
             )
         else:
             # hidden_states -> (total_q, hidden_size)

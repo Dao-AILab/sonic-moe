@@ -4,6 +4,7 @@
 
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -34,10 +35,18 @@ class HopperGEMMConfig:
     raster_order: RasterOrderOption = RasterOrderOption.Heuristic
     L2_group_size: int = 8
     initial_d_epi_stage: cutlass.Constexpr[int] = 4
+    num_sms: Optional[int] = None
+
+    @property
+    def max_active_clusters(self) -> int:
+        sms_per_cluster = self.cluster_shape_mnk[0] * self.cluster_shape_mnk[1]
+        if self.num_sms is not None:
+            return self.num_sms / sms_per_cluster
+        return cutlass.utils.HardwareInfo().get_max_active_clusters(sms_per_cluster)
 
 
 class HopperWgmma_MoE_Up_proj_Fwd:
-    def __init__(self, E: int, H: int, I: int, activation_type: ActivationType, inference_mode=False):
+    def __init__(self, E: int, H: int, I: int, activation_type: ActivationType, inference_mode=False, num_sms: int | None = None):
         super().__init__()
         is_glu_activation = is_glu(activation_type)
         if is_glu_activation:
@@ -58,6 +67,7 @@ class HopperWgmma_MoE_Up_proj_Fwd:
                 is_pingpong=False,
                 initial_d_epi_stage=2,
                 raster_order=RasterOrderOption.AlongM,
+                num_sms=num_sms,
             )
         elif (I == 64 and is_glu_activation) or (I == 128 and not is_glu_activation):
             up_config = HopperGEMMConfig(
@@ -67,6 +77,7 @@ class HopperWgmma_MoE_Up_proj_Fwd:
                 is_pingpong=True,
                 initial_d_epi_stage=8,
                 raster_order=RasterOrderOption.AlongM,
+                num_sms=num_sms,
             )
         else:
             raise NotImplementedError()
@@ -118,9 +129,7 @@ class HopperWgmma_MoE_Up_proj_Fwd:
             initial_d_epi_stage=up_config.initial_d_epi_stage,
             inference_mode=inference_mode,
         )
-        self.max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
-            up_config.cluster_shape_mnk[0] * up_config.cluster_shape_mnk[1]
-        )
+        self.max_active_clusters = up_config.max_active_clusters
         self.current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     @cute.jit
@@ -153,7 +162,7 @@ class HopperWgmma_MoE_Up_proj_Fwd:
 
 
 class HopperWgmma_MoE_Down_proj_Fwd:
-    def __init__(self, E: int, H: int, I: int):
+    def __init__(self, E: int, H: int, I: int, num_sms: int | None = None):
         super().__init__()
         assert (
             H % 64 == 0 and H >= 512 and I % 64 == 0
@@ -166,6 +175,7 @@ class HopperWgmma_MoE_Down_proj_Fwd:
                 is_pingpong=False,
                 initial_d_epi_stage=4,
                 raster_order=RasterOrderOption.AlongN,
+                num_sms=num_sms,
             )
         elif I >= 256:
             down_config = HopperGEMMConfig(
@@ -175,6 +185,7 @@ class HopperWgmma_MoE_Down_proj_Fwd:
                 is_pingpong=True,
                 initial_d_epi_stage=5,
                 raster_order=RasterOrderOption.AlongN,
+                num_sms=num_sms,
             )
         elif I >= 64:
             down_config = HopperGEMMConfig(
@@ -184,6 +195,7 @@ class HopperWgmma_MoE_Down_proj_Fwd:
                 is_pingpong=True,
                 initial_d_epi_stage=8,
                 raster_order=RasterOrderOption.AlongN,
+                num_sms=num_sms,
             )
         else:
             raise NotImplementedError()
@@ -200,9 +212,7 @@ class HopperWgmma_MoE_Down_proj_Fwd:
             epi_tile_size=down_config.epi_tile_size,
             initial_d_epi_stage=down_config.initial_d_epi_stage,
         )
-        self.max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
-            down_config.cluster_shape_mnk[0] * down_config.cluster_shape_mnk[1]
-        )
+        self.max_active_clusters = down_config.max_active_clusters
 
     @cute.jit
     def __call__(self, mY1, mW2, mY2, mB2, mE_offset, mX_gather, mD_tensormap, mE_permute_order, stream):
@@ -234,7 +244,7 @@ class HopperWgmma_MoE_Down_proj_Fwd:
 
 
 class HopperWgmma_MoE_Down_proj_ActGrad_Bwd:
-    def __init__(self, E: int, H: int, I: int, activation_type: ActivationType):
+    def __init__(self, E: int, H: int, I: int, activation_type: ActivationType, num_sms: int | None = None):
         super().__init__()
         is_glu_activation = is_glu(activation_type)
         if is_glu_activation:
@@ -255,6 +265,7 @@ class HopperWgmma_MoE_Down_proj_ActGrad_Bwd:
             initial_d_epi_stage=4,
             is_pingpong=True,
             raster_order=RasterOrderOption.Heuristic,
+            num_sms=num_sms,
         )
 
         compute_swiglu = False
@@ -304,9 +315,7 @@ class HopperWgmma_MoE_Down_proj_ActGrad_Bwd:
             epi_tile_size=dz_partial_ds_config.epi_tile_size,
             initial_d_epi_stage=dz_partial_ds_config.initial_d_epi_stage,
         )
-        self.max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
-            dz_partial_ds_config.cluster_shape_mnk[0] * dz_partial_ds_config.cluster_shape_mnk[1]
-        )
+        self.max_active_clusters = dz_partial_ds_config.max_active_clusters
 
     @cute.jit
     def __call__(
@@ -351,7 +360,7 @@ class HopperWgmma_MoE_Down_proj_ActGrad_Bwd:
 
 
 class HopperWgmma_MoE_Down_proj_WeightGrad_Bwd:
-    def __init__(self, E: int, H: int, I: int):
+    def __init__(self, E: int, H: int, I: int, num_sms: int | None = None):
         super().__init__()
         assert (
             H % 64 == 0 and H >= 512 and I % 64 == 0
@@ -365,6 +374,7 @@ class HopperWgmma_MoE_Down_proj_WeightGrad_Bwd:
                 is_pingpong=False,
                 initial_d_epi_stage=6,
                 raster_order=RasterOrderOption.AlongN,
+                num_sms=num_sms,
             )
         elif I == 64:
             dw2_config = HopperGEMMConfig(
@@ -374,6 +384,7 @@ class HopperWgmma_MoE_Down_proj_WeightGrad_Bwd:
                 is_pingpong=True,
                 initial_d_epi_stage=6,
                 raster_order=RasterOrderOption.AlongN,
+                num_sms=num_sms,
             )
         else:
             raise NotImplementedError()
@@ -392,9 +403,7 @@ class HopperWgmma_MoE_Down_proj_WeightGrad_Bwd:
             epi_tile_size=dw2_config.epi_tile_size,
             initial_d_epi_stage=dw2_config.initial_d_epi_stage,
         )
-        self.max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
-            dw2_config.cluster_shape_mnk[0] * dw2_config.cluster_shape_mnk[1]
-        )
+        self.max_active_clusters = dw2_config.max_active_clusters
 
     @cute.jit
     def __call__(self, mDout_trans, mY1S_trans, mDw2, mE_offset, mX_gather, tensormaps, mE_permute_order, stream):
@@ -424,7 +433,7 @@ class HopperWgmma_MoE_Down_proj_WeightGrad_Bwd:
 
 
 class HopperWgmma_MoE_Up_proj_ActGrad_Bwd:
-    def __init__(self, E: int, H: int, I: int, is_glu_activation: bool):
+    def __init__(self, E: int, H: int, I: int, is_glu_activation: bool, num_sms: int | None = None):
         super().__init__()
         if is_glu_activation:
             assert (
@@ -443,6 +452,7 @@ class HopperWgmma_MoE_Up_proj_ActGrad_Bwd:
                 is_pingpong=False,
                 initial_d_epi_stage=4,
                 raster_order=RasterOrderOption.AlongN,
+                num_sms=num_sms,
             )
         elif (I >= 64 and is_glu_activation) or (I >= 128 and not is_glu_activation):
             dx_config = HopperGEMMConfig(
@@ -452,6 +462,7 @@ class HopperWgmma_MoE_Up_proj_ActGrad_Bwd:
                 is_pingpong=True,
                 initial_d_epi_stage=8,
                 raster_order=RasterOrderOption.AlongN,
+                num_sms=num_sms,
             )
         else:
             raise NotImplementedError()
@@ -469,9 +480,7 @@ class HopperWgmma_MoE_Up_proj_ActGrad_Bwd:
             epi_tile_size=dx_config.epi_tile_size,
         )
 
-        self.max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
-            dx_config.cluster_shape_mnk[0] * dx_config.cluster_shape_mnk[1]
-        )
+        self.max_active_clusters = dx_config.max_active_clusters
         self.current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     @cute.jit
@@ -504,7 +513,7 @@ class HopperWgmma_MoE_Up_proj_ActGrad_Bwd:
 
 
 class HopperWgmma_MoE_Up_proj_WeightGrad_Bwd:
-    def __init__(self, E: int, H: int, I: int, is_glu_activation: bool):
+    def __init__(self, E: int, H: int, I: int, is_glu_activation: bool, num_sms: int | None = None):
         super().__init__()
         if is_glu_activation:
             assert (
@@ -523,6 +532,7 @@ class HopperWgmma_MoE_Up_proj_WeightGrad_Bwd:
                 is_pingpong=False,
                 initial_d_epi_stage=6,
                 raster_order=RasterOrderOption.Heuristic,
+                num_sms=num_sms,
             )
         elif (I == 64 and is_glu_activation) or (I == 128 and not is_glu_activation):
             dw1_config = HopperGEMMConfig(
@@ -532,6 +542,7 @@ class HopperWgmma_MoE_Up_proj_WeightGrad_Bwd:
                 is_pingpong=False,
                 initial_d_epi_stage=6,
                 raster_order=RasterOrderOption.AlongN,
+                num_sms=num_sms,
             )
         else:
             raise NotImplementedError()
@@ -550,9 +561,7 @@ class HopperWgmma_MoE_Up_proj_WeightGrad_Bwd:
             epi_tile_size=dw1_config.epi_tile_size,
         )
 
-        self.max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
-            dw1_config.cluster_shape_mnk[0] * dw1_config.cluster_shape_mnk[1]
-        )
+        self.max_active_clusters = dw1_config.max_active_clusters
 
     @cute.jit
     def __call__(self, mX_trans, mDz_trans, mDw1_trans, mE_offset, mX_gather, tensormaps, mE_permute_order, stream):

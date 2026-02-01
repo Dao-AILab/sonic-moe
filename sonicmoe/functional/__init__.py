@@ -136,6 +136,7 @@ class _UpProjection(torch.autograd.Function):
         is_varlen_K: bool,
         activation_type: ActivationType,
         is_inference_mode_enabled: bool,
+        num_sms: int | None = None,
     ) -> torch.Tensor:
         T, H = x.shape
         I, H, E = w1.shape
@@ -171,6 +172,7 @@ class _UpProjection(torch.autograd.Function):
                 activation_type=activation_type.value,
                 is_glu_activation=is_glu_activation,
                 is_inference_mode_enabled=is_inference_mode_enabled,
+                num_sms=num_sms,
             )
 
         ctx.T = T
@@ -182,6 +184,7 @@ class _UpProjection(torch.autograd.Function):
         ctx.is_varlen_K = is_varlen_K
         ctx.is_glu_activation = is_glu_activation
         ctx.stream_id = stream_id
+        ctx.num_sms = num_sms
 
         ctx.save_for_backward(
             x,
@@ -214,6 +217,7 @@ class _UpProjection(torch.autograd.Function):
         is_glu_activation = ctx.is_glu_activation
         is_varlen_K = ctx.is_varlen_K
         stream_id = ctx.stream_id
+        num_sms = ctx.num_sms
 
         (
             x,
@@ -256,6 +260,7 @@ class _UpProjection(torch.autograd.Function):
                 s_scatter_idx=s_scatter_idx,
                 is_glu_activation=is_glu_activation,
                 stream_id=stream_id,
+                num_sms=num_sms,
             )
 
             _up_projection_backward_weight(
@@ -267,6 +272,7 @@ class _UpProjection(torch.autograd.Function):
                 x_gather_idx=x_gather_idx,
                 is_glu_activation=is_glu_activation,
                 stream_id=stream_id,
+                num_sms=num_sms,
             )
 
         dx_reduced = torch.empty(T, H, dtype=dz.dtype, device=dz.device)
@@ -281,7 +287,7 @@ class _UpProjection(torch.autograd.Function):
             is_varlen_K=is_varlen_K,
         )
 
-        return dx_reduced, dw1, db1, *[None] * 12
+        return dx_reduced, dw1, db1, *[None] * 13
 
 
 class _DownProjection(torch.autograd.Function):
@@ -303,6 +309,7 @@ class _DownProjection(torch.autograd.Function):
         num_activated_expert_per_token_offset: torch.Tensor,
         is_varlen_K: bool,
         activation_type: ActivationType,
+        num_sms: int | None = None,
     ) -> torch.Tensor:
         TK = y1.size(0)
         H, I, E = w2.shape
@@ -323,6 +330,7 @@ class _DownProjection(torch.autograd.Function):
                 expert_schedule_order=None,
                 x_gather_idx=x_gather_idx,
                 stream_id=stream_id,
+                num_sms=num_sms,
             )
 
         o = torch.empty(T, H, device=z.device, dtype=z.dtype)
@@ -344,6 +352,7 @@ class _DownProjection(torch.autograd.Function):
         ctx.is_varlen_K = is_varlen_K
         ctx.activation_type = activation_type
         ctx.stream_id = stream_id
+        ctx.num_sms = num_sms
 
         ctx.save_for_backward(
             z,
@@ -365,6 +374,7 @@ class _DownProjection(torch.autograd.Function):
         stream_id = ctx.stream_id
         is_varlen_K = ctx.is_varlen_K
         activation_type = ctx.activation_type
+        num_sms = ctx.num_sms
 
         (
             z,
@@ -435,6 +445,7 @@ class _DownProjection(torch.autograd.Function):
                 is_glu_activation=is_glu_activation,
                 activation_type=activation_type.value,
                 stream_id=stream_id,
+                num_sms=num_sms,
             )
 
             _down_projection_backward_weight(
@@ -445,13 +456,14 @@ class _DownProjection(torch.autograd.Function):
                 expert_schedule_order=None,
                 x_gather_idx=x_gather_idx,
                 stream_id=stream_id,
+                num_sms=num_sms,
             )
 
         # TC top-K routing
         if not is_varlen_K:
             ds = ds.view(T, K)
 
-        return None, dz, dw2, db2, ds, *[None] * 10
+        return None, dz, dw2, db2, ds, *[None] * 11
 
 
 def moe_TC_softmax_topk_layer(
@@ -465,6 +477,7 @@ def moe_TC_softmax_topk_layer(
     stream_id: int,
     activation_type: ActivationType | str = ActivationType.SWIGLU,
     is_inference_mode_enabled: bool = False,
+    num_sms: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
@@ -501,6 +514,7 @@ def moe_TC_softmax_topk_layer(
         False,  # is_varlen_K
         activation_type,
         is_inference_mode_enabled,
+        num_sms,
     )
 
     o = _DownProjection.apply(
@@ -519,6 +533,7 @@ def moe_TC_softmax_topk_layer(
         num_activated_expert_per_token_offset,
         False,  # is_varlen_K
         activation_type,
+        num_sms,
     )
 
     return o, router_logits, expert_frequency
@@ -546,6 +561,7 @@ def moe_general_routing_inputs(
     stream_id: int,
     activation_type: ActivationType,
     is_inference_mode_enabled: bool = False,
+    num_sms: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
@@ -578,6 +594,7 @@ def moe_general_routing_inputs(
         True,  # is_varlen_K
         activation_type,
         is_inference_mode_enabled,
+        num_sms,
     )
 
     o = _DownProjection.apply(
@@ -596,6 +613,7 @@ def moe_general_routing_inputs(
         num_activated_expert_per_token_offset,
         True,  # is_varlen_K
         activation_type,
+        num_sms,
     )
 
     return o, expert_frequency

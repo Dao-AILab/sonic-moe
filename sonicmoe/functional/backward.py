@@ -204,6 +204,7 @@ def _up_projection_backward_act(
     s_scatter_idx: torch.Tensor,
     is_glu_activation: bool,
     stream_id: int,
+    num_sms: int | None = None,
 ) -> None:
     I, H, E = w1.size()
     if is_glu_activation:
@@ -226,9 +227,9 @@ def _up_projection_backward_act(
         mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
     current_stream = cuda.CUstream(stream_id)
 
-    compile_dx_key = ("dx", E, H, I, is_glu_activation, dx_expanded.dtype)
+    compile_dx_key = ("dx", E, H, I, is_glu_activation, dx_expanded.dtype, num_sms)
     if compile_dx_key not in _up_projection_backward_act.compile_cache:
-        dx_module = HopperWgmma_MoE_Up_proj_ActGrad_Bwd(E, H, I, is_glu_activation)
+        dx_module = HopperWgmma_MoE_Up_proj_ActGrad_Bwd(E, H, I, is_glu_activation, num_sms=num_sms)
         tensormaps = [dx_module.module.generate_tensormap(None, None, None) for _ in range(2)]
         _up_projection_backward_act.compile_cache[compile_dx_key] = cute.compile(
             dx_module,
@@ -271,6 +272,7 @@ def _up_projection_backward_weight(
     x_gather_idx: torch.Tensor,
     is_glu_activation: bool,
     stream_id: int,
+    num_sms: int | None = None,
 ) -> None:
     I, H, E = dw1.size()
     if is_glu_activation:
@@ -291,9 +293,9 @@ def _up_projection_backward_weight(
         mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
     current_stream = cuda.CUstream(stream_id)
 
-    compile_dw1_key = ("dw1", E, H, I, is_glu_activation, x.dtype)
+    compile_dw1_key = ("dw1", E, H, I, is_glu_activation, x.dtype, num_sms)
     if compile_dw1_key not in _up_projection_backward_weight.compile_cache:
-        dw1_module = HopperWgmma_MoE_Up_proj_WeightGrad_Bwd(E, H, I, is_glu_activation)
+        dw1_module = HopperWgmma_MoE_Up_proj_WeightGrad_Bwd(E, H, I, is_glu_activation, num_sms=num_sms)
         tensormaps = [dw1_module.module.generate_tensormap(None, None, None) for _ in range(1)]
         _up_projection_backward_weight.compile_cache[compile_dw1_key] = cute.compile(
             dw1_module,
@@ -342,6 +344,7 @@ def _down_projection_backward_act(
     is_glu_activation: bool,
     activation_type: str,
     stream_id: int,
+    num_sms: int | None = None,
 ) -> None:
     H, I, E = w2.size()
     TK = x_gather_idx.size(0)
@@ -376,11 +379,11 @@ def _down_projection_backward_act(
     current_stream = cuda.CUstream(stream_id)
     ds_partial = None
 
-    compile_dz_key = ("dz", E, H, I, z.dtype, activation_type)
+    compile_dz_key = ("dz", E, H, I, z.dtype, activation_type, num_sms)
     if compile_dz_key not in _down_projection_backward_act.compile_cache:
         # I don't know why but this sync appears to fix a mysterious initialization bug??
         torch.cuda.synchronize()
-        dz_module = HopperWgmma_MoE_Down_proj_ActGrad_Bwd(E, H, I, ActivationType(activation_type))
+        dz_module = HopperWgmma_MoE_Down_proj_ActGrad_Bwd(E, H, I, ActivationType(activation_type), num_sms=num_sms)
         tensormaps = [dz_module.module.generate_tensormap(None, None, None) for _ in range(3)]
 
         ds_partial_N = max(ceil_divide(I, dz_module.module.tile_shape_mnk[1]), 1)
@@ -488,6 +491,7 @@ def _down_projection_backward_weight(
     expert_schedule_order: torch.Tensor | None,
     x_gather_idx: torch.Tensor,
     stream_id: int,
+    num_sms: int | None = None,
 ) -> None:
     H, I, E = dw2.size()
 
@@ -503,9 +507,9 @@ def _down_projection_backward_weight(
         mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
     current_stream = cuda.CUstream(stream_id)
 
-    compile_dw2_key = ("dw2", E, H, I, dw2.dtype)
+    compile_dw2_key = ("dw2", E, H, I, dw2.dtype, num_sms)
     if compile_dw2_key not in _down_projection_backward_weight.compile_cache:
-        dw2_module = HopperWgmma_MoE_Down_proj_WeightGrad_Bwd(E, H, I)
+        dw2_module = HopperWgmma_MoE_Down_proj_WeightGrad_Bwd(E, H, I, num_sms=num_sms)
         tensormaps = [dw2_module.module.generate_tensormap(None, None, None) for _ in range(1)]
         _down_projection_backward_weight.compile_cache[compile_dw2_key] = cute.compile(
             dw2_module,
