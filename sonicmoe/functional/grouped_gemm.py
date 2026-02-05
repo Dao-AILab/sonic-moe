@@ -471,9 +471,10 @@ class HopperWgmma_MoE_kernel:
         threads_per_stride_1_dim = const_expr(stride_1_tile // copy_elems_per_thr_load)
         num_other_dim_per_load = const_expr(self.num_load_A_threads // threads_per_stride_1_dim)
 
-        tmAIdx = cute.make_fragment((num_other_dim_per_load,), dtype=mAIdx.element_type)
+        num_other_dim_per_thread = const_expr(other_tile // num_other_dim_per_load)
+        tmAIdx = cute.make_fragment((num_other_dim_per_thread,), dtype=mAIdx.element_type)
 
-        for i in cutlass.range_constexpr(num_other_dim_per_load):
+        for i in cutlass.range_constexpr(num_other_dim_per_thread):
             other_dim_offset = const_expr(i * num_other_dim_per_load) + tidx // threads_per_stride_1_dim
 
             if other_dim_offset < M_boundary:
