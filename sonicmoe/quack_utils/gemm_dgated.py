@@ -14,6 +14,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import quack.activation
 import quack.sm90_utils as sm90_utils
 import quack.utils as utils
+import quack.layout_utils as layout_utils
 import torch
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.runtime import from_dlpack
@@ -179,9 +180,9 @@ class GemmDGatedMixin(GemmActMixin):
             if const_expr(self.arch < 100):
                 tRS_rD_scaled.store(tRS_rD.load() * tDrColVec.load().to(tRS_rD.element_type))
             else:
-                tDrColVec_mn = utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
-                tRS_rD_mn = utils.convert_layout_zero_stride(tRS_rD, tDrColVec.layout)
-                tRS_rD_scaled_mn = utils.convert_layout_zero_stride(tRS_rD_scaled, tDrColVec.layout)
+                tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
+                tRS_rD_mn = layout_utils.convert_layout_zero_stride(tRS_rD, tDrColVec.layout)
+                tRS_rD_scaled_mn = layout_utils.convert_layout_zero_stride(tRS_rD_scaled, tDrColVec.layout)
                 for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
                     for n in cutlass.range(cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True):
                         (
@@ -217,9 +218,9 @@ class GemmDGatedMixin(GemmActMixin):
                 for i in cutlass.range(cute.size(tDrColVecReduce), unroll_full=True):
                     tDrColVecReduce[i] += tRS_rOut[i] * tRS_rD[i]
             else:
-                tDrColVecReduce_mn = utils.convert_layout_zero_stride(tDrColVecReduce, tDrColVecReduce.layout)
-                tRS_rD_mn = utils.convert_layout_zero_stride(tRS_rD, tDrColVecReduce.layout)
-                tRS_rOut_mn = utils.convert_layout_zero_stride(tRS_rOut, tDrColVecReduce.layout)
+                tDrColVecReduce_mn = layout_utils.convert_layout_zero_stride(tDrColVecReduce, tDrColVecReduce.layout)
+                tRS_rD_mn = layout_utils.convert_layout_zero_stride(tRS_rD, tDrColVecReduce.layout)
+                tRS_rOut_mn = layout_utils.convert_layout_zero_stride(tRS_rOut, tDrColVecReduce.layout)
                 for m in cutlass.range(cute.size(tDrColVecReduce_mn, mode=[0]), unroll_full=True):
                     row_sum = utils.mul_packed_f32x2(
                         (tRS_rD_mn[m, 0], tRS_rD_mn[m, 1]), (tRS_rOut_mn[m, 0], tRS_rOut_mn[m, 1])
@@ -236,8 +237,8 @@ class GemmDGatedMixin(GemmActMixin):
             if const_expr(self.arch < 100):
                 tRS_rOut.store(tRS_rOut.load() * tDrColVec.load().to(tRS_rD.element_type))
             else:
-                tDrColVec_mn = utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
-                tRS_rOut_mn = utils.convert_layout_zero_stride(tRS_rOut, tDrColVec.layout)
+                tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
+                tRS_rOut_mn = layout_utils.convert_layout_zero_stride(tRS_rOut, tDrColVec.layout)
                 for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
                     for n in cutlass.range(cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True):
                         tRS_rOut_mn[m, 2 * n], tRS_rOut_mn[m, 2 * n + 1] = utils.mul_packed_f32x2(
@@ -294,8 +295,8 @@ class GemmDGatedMixin(GemmActMixin):
                 gColVec = cute.local_tile(mColVec, (tile_M,), (tile_coord_mnkl[0],))
                 limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M)
                 tDcCV = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
-                tDrColVecReduce_m = utils.convert_layout_zero_stride(tDrColVecReduce, tDrColVecReduce.layout)[None, 0]
-                tDcCV_m = utils.convert_layout_zero_stride(tDcCV, tDrColVecReduce.layout)[None, 0]
+                tDrColVecReduce_m = layout_utils.convert_layout_zero_stride(tDrColVecReduce, tDrColVecReduce.layout)[None, 0]
+                tDcCV_m = layout_utils.convert_layout_zero_stride(tDcCV, tDrColVecReduce.layout)[None, 0]
                 if tDcCV_m[0][1] == 0:
                     for m in cutlass.range(cute.size(tDcCV_m, mode=[0])):
                         row_idx = tDcCV_m[m][0]
