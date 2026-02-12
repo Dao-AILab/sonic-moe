@@ -11,7 +11,6 @@ import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
 import quack.activation
 import quack.sm90_utils as sm90_utils
-import quack.utils as utils
 from cutlass import const_expr
 from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
@@ -20,6 +19,7 @@ from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
+from quack.layout_utils import permute_gated_Cregs_b16
 from torch import Tensor
 
 
@@ -109,7 +109,7 @@ class GemmGatedMixin(GemmActMixin):
         tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
         if const_expr(self.arch == 90):
             # Only need this if we're using STSM
-            utils.permute_gated_Cregs_b16(tRS_rPostAct_out)
+            permute_gated_Cregs_b16(tRS_rPostAct_out)
         return tRS_rPostAct_out
 
 

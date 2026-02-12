@@ -30,12 +30,11 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import argparse
 import enum
 import math
 import operator
 from functools import partial
-from typing import Callable, List, Optional, Tuple, Type, Union
+from typing import Callable, Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -49,15 +48,15 @@ from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+from quack.copy_utils import sm90_get_smem_load_op
 from quack.cute_dsl_utils import ParamsBase
+from quack.layout_utils import make_acc_tensor_mn_view
 
 # return PipelineStateWAdvance instead of PipelineState
 from quack.pipeline import PipelineTmaCpAsync, make_pipeline_state
-from quack.reduce import warp_reduce
 from quack.sm90_utils import partition_for_epilogue
 from quack.tensormap_manager import TensorMapManagerSm90
 from quack.tile_scheduler import RasterOrderOption, TileSchedulerArguments, VarlenMTileSchedulerArguments
-from quack.utils import make_acc_tensor_mn_view, predicate_k, sm90_get_smem_load_op
 
 from .tile_scheduler import SonicMoETileScheduler, SonicMoEVarlenMTileScheduler
 
@@ -93,6 +92,7 @@ class HopperWgmma_MoE_kernel:
         is_normal_act: bool = False,
         is_glu: bool = False,
         is_A_gather: bool = False,
+        is_varlen_K_grouped_gemm: bool = False,
         is_scatter_idx_prefetched: bool = False,
         epi_tile_size: int = 32,
         initial_d_epi_stage: int = 4,
@@ -591,8 +591,6 @@ class HopperWgmma_MoE_kernel:
                     mA_cur_copy = cute.make_tensor(tPrAptr, ((copy_elems_per_thr_load, 1), 1))
 
                     cute.copy(A_g2s_thr_copy, mA_cur_copy, tAsA[None, None, i])
-                else:
-                    tAsA[None, None, i].fill(0.0)
 
             else:
                 MIdx = tmAIdx[i]
@@ -1787,7 +1785,7 @@ class HopperWgmma_MoE_kernel:
                         tAsA = A_g2s_thr_copy.partition_D(sA)
                         tAcA = A_g2s_thr_copy.partition_D(cA)
 
-                        tApA = cute.make_fragment(
+                        tApA = cute.make_rmem_tensor(
                             cute.make_layout(
                                 (
                                     tAgA.shape[0][1],
@@ -2550,7 +2548,7 @@ class HopperWgmma_MoE_kernel:
                         for c in cutlass.range_constexpr(cute.size(y1, mode=[1])):
                             col_sum = col_sum + y1[r, c]
 
-                        col_sum = warp_reduce(col_sum, operator.add, width=4)
+                        col_sum = cute.arch.warp_reduction(col_sum, operator.add, threads_in_group=4)
 
                         M_idx_raw = tile_M_offset + M_tile_idx
                         if tidx % 4 == 0 and M_idx_raw < TIdx_next_group:

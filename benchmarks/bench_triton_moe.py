@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import argparse
 from triton.testing import do_bench
 from rich import print
@@ -9,13 +10,15 @@ from triton_kernels.tensor import make_ragged_tensor_metadata
 from triton_kernels.reduce import reduce
 
 
+
+
+
 def run_mlp_single_gpu(x_bf16, x_fp8,
                        wg, bg,
-                       w1, b1, act1,
-                       w2, b2,
+                       w1, act1,
+                       w2,
                        n_expts_act, pc):
     # gate matrix multiplication
-  
     l = matmul(x_bf16, wg, bg, precision_config=pc)
     # topk (no all_gather needed for single GPU)
     l_active = topk(l, n_expts_act, apply_softmax=True, all_gather=False, symm_mem_pool=None)
@@ -25,19 +28,22 @@ def run_mlp_single_gpu(x_bf16, x_fp8,
     combine_indx = l_active.mask_metadata.col_sorted_indx
     # ragged tensor metadata
     x_metadata = make_ragged_tensor_metadata(expt_sizes, dispatch_indx.shape[0])
-    # gather tokens by expert order (col_sorted_indx // K gives token index)
-    y = x_fp8[combine_indx // n_expts_act]
-    # first matmul + swiglu
-    y = matmul(y, w1, b1, a_ragged_metadata=x_metadata, precision_config=pc, fused_activation=act1)
+    # first matmul + swiglu (fused gather via gather_indx)
+    gather_indx = combine_indx // n_expts_act
+    y = matmul(x_fp8, w1, None, a_ragged_metadata=x_metadata,
+               gather_indx=gather_indx, precision_config=pc, fused_activation=act1)
     # second matmul
-    y = matmul(y, w2, b2, a_ragged_metadata=x_metadata, precision_config=pc)
-    # reorder from expert-sorted to token-sorted order
-    z = y[dispatch_indx]
-    # weighted average of expert outputs
+    y = matmul(y, w2, None, a_ragged_metadata=x_metadata, scatter_indx=combine_indx, precision_config=pc)
+    # scatter_indx=combine_indx maps expert-sorted results back to original [T*K] order
+    z = y
+    # build softmax scale in original (token-grouped) order
+    # Must use .expand() so the H-dim stride is 0, which tells the
+    # triton reduce kernel to broadcast (it checks stride == 0).
     z = z.view(-1, n_expts_act, z.shape[-1])
-    z, _ = reduce(z, dim=1)
+    scale = l_active.vals.unsqueeze(-1).expand_as(z)  # stride: (K,1,0)
+    # weighted average of expert outputs
+    z, _ = reduce(z, dim=1, scale=scale)
     return z
-
 
 def run(args):
     n = args.n
@@ -48,12 +54,10 @@ def run(args):
     def make_weight(*shape):
         w = torch.randn(shape, device=dev, dtype=torch.bfloat16)
         return w.transpose(-1, -2).contiguous().transpose(-1, -2)
-    wg = make_weight(H, E)
-    w1 = make_weight(E, H, 2 * I)
-    w2 = make_weight(E, I, H)
-    bg = torch.randn((E,), device=dev)
-    b1 = torch.randn((E, 2 * I), device=dev)
-    b2 = torch.randn((E, H), device=dev)
+    wg = make_weight(H, E) 
+    w1 = make_weight(E, H, 2 * I) 
+    w2 = make_weight(E, I, H) 
+    bg = torch.randn((E,), device=dev) 
     pc = PrecisionConfig()
 
     # -- init activation --
@@ -63,30 +67,32 @@ def run(args):
     # -- matmul fusion --
     act1 = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2), (1.0, 1.0))
 
+    print(f"[bold]Config: T={T}, H={H}, I={I}, E={E}, K={K}[/bold]")
+
+
+    # -- benchmark (uncomment to enable) --
     def test_forward():
-        run_mlp_single_gpu(x_bf16, x_fp8,
+       run_mlp_single_gpu(x_bf16, x_fp8,
                            wg, bg,
-                           w1, b1, act1,
-                           w2, b2,
+                           w1, act1,
+                           w2,
                            K, pc)
-
-    print(f"T {T}, I {I}, H {H}, E {E}, K {K}")
+    
     forward_time = do_bench(test_forward, warmup=5, rep=n)
-
     flops = 6 * T * I * H * K
     tflops = flops / (forward_time / 1e3) / 1e12
     print(f"[bold green]\[Forward][/bold green] Average time: {forward_time:.3f} ms, TFLOPS: {tflops:.1f}")
 
 
 if __name__ == "__main__":
-    # python bench_triton_moe.py
+    # python bench_triton_moe_v1.py
     torch.cuda.set_device(0)
     parser = argparse.ArgumentParser()
     parser.add_argument("--n", type=int, default=100)
     parser.add_argument("--T", type=int, default=40960)
-    parser.add_argument("--K", type=int, default=4)
+    parser.add_argument("--K", type=int, default=8)
     parser.add_argument("--E", type=int, default=64)
-    parser.add_argument("--H", type=int, default=768)
-    parser.add_argument("--I", type=int, default=512)
+    parser.add_argument("--H", type=int, default=2880)
+    parser.add_argument("--I", type=int, default=2880)
     args = parser.parse_args()
     run(args)

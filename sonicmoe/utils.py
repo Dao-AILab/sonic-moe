@@ -4,8 +4,11 @@
 
 from typing import Any, Callable
 
+import cutlass
+import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import dsl_user_op
 from torch.utils._pytree import tree_map
 
 
@@ -41,6 +44,23 @@ def get_powers_of_2(start: int, end: int) -> list[int]:
         n = n << 1
 
     return output
+
+
+@dsl_user_op
+def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
+    flat_stride = cute.flatten_to_tuple(tensor.stride)
+    assert len(flat_coord_i64) == len(flat_stride), "Coordinate and stride must have the same length"
+    offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
+    assert isinstance(tensor.iterator, cute.Pointer)
+    # HACK: we assume that applying the offset does not change the pointer alignment
+    new_ptr = cute.make_ptr(
+        tensor.element_type,
+        tensor.iterator.toint() + offset * tensor.element_type.width // 8,
+        tensor.memspace,
+        assumed_align=tensor.iterator.max_alignment,
+    )
+    return cute.make_tensor(new_ptr, tensor.layout)
 
 
 def divide_if_divisible(dividend: int, divisor: int, msg: str = "") -> int:
