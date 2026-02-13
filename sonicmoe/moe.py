@@ -2,11 +2,12 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
-from typing import Callable
+from typing import Callable, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 
 from .count_cumsum import count_cumsum
 from .enums import ActivationType, KernelBackendMoE, is_glu
@@ -174,10 +175,20 @@ class MoE(nn.Module):
         activation_function: ActivationType,
         add_bias: bool,
         std: float,
+        rank: int = 0, 
+        ep_size: int = 0,
+        ep_group: Union[None, dist.ProcessGroup] = None,
+        ep_buffer = None,
+        ep_config = None,
     ) -> None:
         super().__init__()
 
-        self.num_experts = num_experts
+        self.rank = rank
+        self.enable_expert_parallel = ep_size > 1
+        self.ep_size = ep_size if ep_size > 0 else 1
+        self.ep_group = ep_group
+
+        self.num_experts = num_experts // self.ep_size
         self.top_k = num_experts_per_tok
 
         self.hidden_size = hidden_size
@@ -187,8 +198,12 @@ class MoE(nn.Module):
 
         self.activation_function = activation_function
 
+        if self.ep_size > 1:
+            with torch.no_grad():
+                dist.broadcast(self.router.weight.data, src=0)
+
         self.c_fc = Experts(
-            num_experts=num_experts,
+            num_experts=self.num_experts,
             in_features=self.hidden_size,
             out_features=2 * self.intermediate_size if is_glu(activation_function) else self.intermediate_size,
             add_bias=add_bias,
@@ -196,7 +211,7 @@ class MoE(nn.Module):
         )
 
         self.c_proj = Experts(
-            num_experts=num_experts,
+            num_experts=self.num_experts,
             in_features=self.intermediate_size,
             out_features=self.hidden_size,
             add_bias=add_bias,
@@ -205,21 +220,31 @@ class MoE(nn.Module):
 
         self.stream_id = torch.cuda.current_stream().cuda_stream
 
+        assert(not (self.enable_expert_parallel and ep_buffer == None))
+        assert(not (self.enable_expert_parallel and ep_config == None))  
+        assert(not (self.enable_expert_parallel and ep_group == None))   
+            
+        self.deep_ep_buffer = ep_buffer
+        self.deep_ep_config = ep_config
+
+            
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         kernel_backend_moe: KernelBackendMoE = KernelBackendMoE.sonicmoe,
         is_inference_mode: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert (self.ep_size <= 1 or kernel_backend_moe == KernelBackendMoE.sonicmoe), "Expert parallel only surport sonicmoe KernelBackendMoE.backend."
         original_shape = hidden_states.shape
 
         # hidden_states -> (batch_size, query_length, hidden_size)
         hidden_states = hidden_states.view(-1, self.hidden_size)
-
+        
         if kernel_backend_moe == KernelBackendMoE.sonicmoe:
             hidden_states, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
                 hidden_states,
-                self.router.weight,
+                self.router.weight.to(torch.float32),
                 self.c_fc.weight.permute(1, 2, 0),
                 self.c_fc.bias,
                 self.c_proj.weight.permute(1, 2, 0),
@@ -228,6 +253,11 @@ class MoE(nn.Module):
                 self.stream_id,
                 self.activation_function,
                 is_inference_mode or not self.training,
+                self.rank,
+                self.ep_size,
+                self.ep_group,
+                self.deep_ep_buffer,
+                self.deep_ep_config
             )
         else:
             # hidden_states -> (total_q, hidden_size)
@@ -247,6 +277,15 @@ class MoE(nn.Module):
         hidden_states = hidden_states.view(original_shape)
 
         # hidden_states -> (batch_size, query_length, hidden_size)
+
+        if self.ep_size > 1:
+            gathered_router_logits = [torch.zeros_like(router_logits) for _ in range(self.ep_size)]
+            dist.all_gather(gathered_router_logits, router_logits, group=self.ep_group)
+            router_logits = torch.cat(gathered_router_logits, dim=0)
+
+            gathered_expert_frequency = [torch.zeros_like(expert_frequency) for _ in range(self.ep_size)]
+            dist.all_gather(gathered_expert_frequency, expert_frequency, group=self.ep_group)
+            expert_frequency = torch.cat(gathered_expert_frequency, dim=0)
 
         aux_loss = self._compute_switch_loss(
             logits=router_logits,
@@ -369,3 +408,9 @@ class MoE(nn.Module):
             x, indices = x.topk(self.top_k, dim=-1)
 
         return x, indices
+
+    def sync_router_grad(self):
+        if self.ep_size > 1 and self.ep_group is not None:
+            router_grad = self.router.weight.grad.data.to(torch.float32)
+            dist.all_reduce(router_grad, op=dist.ReduceOp.SUM, group=self.ep_group)
+            self.router.weight.grad.copy_(router_grad.to(self.router.weight.grad.dtype))
