@@ -142,8 +142,8 @@ class GemmDGatedMixin(GemmActMixin):
         tDrColVecReduce = None
         if const_expr(params.mColVecReduce is not None):
             colvec_mma_layout = cute.make_layout(self.cta_tile_shape_mnk[:2], stride=(1, 0))
-            tDrColVec_layout = partition_for_epilogue_fn(cute.make_fragment(colvec_mma_layout, Float32)).layout
-            tDrColVecReduce = cute.make_fragment(tDrColVec_layout, Float32)
+            tDrColVec_layout = partition_for_epilogue_fn(cute.make_rmem_tensor(colvec_mma_layout, Float32)).layout
+            tDrColVecReduce = cute.make_rmem_tensor(tDrColVec_layout, Float32)
             cute.filter_zeros(tDrColVecReduce).fill(0.0)
         return (*epi_tensors, tDrColVecReduce)
 
@@ -173,9 +173,9 @@ class GemmDGatedMixin(GemmActMixin):
         tRS_rXY_f16x2 = cute.recast_tensor(tRS_rC, implicit_dtype)
         tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_f16x2.layout, Float32)
         tRS_rXY_f32x2.store(tRS_rXY_f16x2.load().to(Float32))
-        tRS_rdXY_f32x2 = cute.make_fragment_like(tRS_rXY_f32x2, Float32)
-        tRS_rOut = cute.make_fragment_like(tRS_rD, Float32)
-        tRS_rD_scaled = cute.make_fragment_like(tRS_rD)
+        tRS_rdXY_f32x2 = cute.make_rmem_tensor_like(tRS_rXY_f32x2, Float32)
+        tRS_rOut = cute.make_rmem_tensor_like(tRS_rD, Float32)
+        tRS_rD_scaled = cute.make_rmem_tensor_like(tRS_rD)
         if const_expr(tDrColVec is not None):  # Scale D by colvec
             if const_expr(self.arch < 100):
                 tRS_rD_scaled.store(tRS_rD.load() * tDrColVec.load().to(tRS_rD.element_type))
@@ -249,7 +249,7 @@ class GemmDGatedMixin(GemmActMixin):
         tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, implicit_dtype)
         tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(implicit_dtype))
         tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
-        tRS_rOut_cvt = cute.make_fragment_like(tRS_rOut, self.postact_dtype)
+        tRS_rOut_cvt = cute.make_rmem_tensor_like(tRS_rOut, self.postact_dtype)
         tRS_rOut_cvt.store(tRS_rOut.load().to(self.postact_dtype))
         return tRS_rOut_cvt
 
