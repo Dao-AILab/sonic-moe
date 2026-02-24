@@ -295,8 +295,10 @@ class GemmDGatedMixin(GemmActMixin):
                 gColVec = cute.local_tile(mColVec, (tile_M,), (tile_coord_mnkl[0],))
                 limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M)
                 tDcCV = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
-                tDrColVecReduce_m = utils.convert_layout_zero_stride(tDrColVecReduce, tDrColVecReduce.layout)[None, 0]
-                tDcCV_m = utils.convert_layout_zero_stride(tDcCV, tDrColVecReduce.layout)[None, 0]
+                tDrColVecReduce_m = layout_utils.convert_layout_zero_stride(tDrColVecReduce, tDrColVecReduce.layout)[
+                    None, 0
+                ]
+                tDcCV_m = layout_utils.convert_layout_zero_stride(tDcCV, tDrColVecReduce.layout)[None, 0]
                 if tDcCV_m[0][1] == 0:
                     for m in cutlass.range(cute.size(tDcCV_m, mode=[0])):
                         row_idx = tDcCV_m[m][0]

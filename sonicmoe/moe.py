@@ -216,7 +216,7 @@ class MoE(nn.Module):
         # hidden_states -> (batch_size, query_length, hidden_size)
         hidden_states = hidden_states.view(-1, self.hidden_size)
 
-        if kernel_backend_moe == KernelBackendMoE.sonicmoe:
+        if kernel_backend_moe == KernelBackendMoE.sonicmoe and self.num_experts <= 32768:
             hidden_states, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
                 hidden_states,
                 self.router.weight,
@@ -248,11 +248,14 @@ class MoE(nn.Module):
 
         # hidden_states -> (batch_size, query_length, hidden_size)
 
-        aux_loss = self._compute_switch_loss(
-            logits=router_logits,
-            probs=F.softmax(router_logits, dim=-1, dtype=torch.float32),
-            expert_frequency=expert_frequency,
-        )
+        if is_inference_mode:
+            aux_loss = None
+        else:
+            aux_loss = self._compute_switch_loss(
+                logits=router_logits,
+                probs=F.softmax(router_logits, dim=-1, dtype=torch.float32),
+                expert_frequency=expert_frequency,
+            )
 
         return hidden_states, aux_loss
 
