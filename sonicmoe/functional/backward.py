@@ -534,11 +534,13 @@ def _token_broadcast_backward(
     dx_reduced: torch.Tensor,
     dx_expanded: torch.Tensor,
     s_reverse_scatter_idx: torch.Tensor,
-    num_activated_expert_per_token_offset: torch.Tensor,
+    num_activated_expert_per_token_offset: Optional[torch.Tensor],
     varlen_K_max: int,
     H: int,
     is_varlen_K: bool,
 ) -> None:
+    if num_activated_expert_per_token_offset is None:
+        assert not is_varlen_K, "`num_activated_expert_per_token_offset` as None requires fixed top-K routing"
     token_gather_and_sum_varlen_K_triton(
         dx_expanded,
         None,
