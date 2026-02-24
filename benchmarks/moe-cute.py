@@ -237,7 +237,7 @@ def run(
 
     time.sleep(0.5)
 
-    # @torch.compile
+    @torch.compile
     def forward_only(is_inference_mode_enabled):
         o, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
             x,
@@ -272,7 +272,7 @@ def run(
 
     time.sleep(0.5)
 
-    # @torch.compile
+    @torch.compile
     def forward_and_backward():
         o, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
             x,

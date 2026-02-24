@@ -95,7 +95,7 @@ class GemmGatedMixin(GemmActMixin):
         GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC)
         tRS_rPostAct_layout = cute.recast_layout(2, 1, tRS_rD.layout)
         # If we don't have .shape here, the compiler generates local stores and loads
-        tRS_rPostAct = cute.make_fragment(tRS_rPostAct_layout.shape, self.acc_dtype)
+        tRS_rPostAct = cute.make_rmem_tensor(tRS_rPostAct_layout.shape, self.acc_dtype)
         if const_expr(self.arch < 100):
             for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
                 tRS_rPostAct[i] = params.act_fn(tRS_rD[2 * i], tRS_rD[2 * i + 1])
@@ -105,7 +105,7 @@ class GemmGatedMixin(GemmActMixin):
                     (tRS_rD[4 * i], tRS_rD[4 * i + 2]), (tRS_rD[4 * i + 1], tRS_rD[4 * i + 3])
                 )
         # Type conversion
-        tRS_rPostAct_out = cute.make_fragment_like(tRS_rPostAct, self.postact_dtype)
+        tRS_rPostAct_out = cute.make_rmem_tensor_like(tRS_rPostAct, self.postact_dtype)
         tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
         if const_expr(self.arch == 90):
             # Only need this if we're using STSM
