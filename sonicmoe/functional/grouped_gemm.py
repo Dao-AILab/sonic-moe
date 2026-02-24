@@ -503,6 +503,7 @@ class HopperWgmma_MoE_kernel:
         num_load_per_thread = const_expr(cute.size(tDcD0, mode=[1]))
 
         tmDIdx = cute.make_rmem_tensor((epi_tile_num * num_load_per_thread,), dtype=mDIdx.element_type)
+        tmDIdx = cute.make_rmem_tensor((epi_tile_num * num_load_per_thread,), dtype=mDIdx.element_type)
 
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
             tDcD_slice = D_r2g_thr_copy.partition_D(
@@ -1677,6 +1678,7 @@ class HopperWgmma_MoE_kernel:
 
         if warp_idx >= self.tma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_load)
+            cute.arch.setmaxregister_decrease(self.num_regs_load)
 
             prolog_loading_warp_ids = (
                 [const_expr(self.tma_warp_id + i) for i in range(self.num_load_A_threads // cute.arch.WARP_SIZE)]
@@ -1945,6 +1947,7 @@ class HopperWgmma_MoE_kernel:
 
         if warp_idx < self.tma_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_mma)
+            cute.arch.setmaxregister_increase(self.num_regs_mma)
             is_tma_warp = cutlass.Boolean(
                 (not self.pingpong and warp_idx == 0) or (self.pingpong and (warp_idx == 0 or warp_idx == 4))
             )
@@ -1982,6 +1985,7 @@ class HopperWgmma_MoE_kernel:
             tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sB))
 
             acc_shape = tiled_mma.partition_shape_C(cute.select(self.tile_shape_mnk, mode=[0, 1]))
+            acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
             acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
 
             if const_expr(self.pingpong):
@@ -2192,6 +2196,7 @@ class HopperWgmma_MoE_kernel:
                     tiled_copy_C_s2r = cute.make_tiled_copy_S(copy_atom_C_s2r, tiled_copy_C_atom)
                     thr_copy_C_s2r = tiled_copy_C_s2r.get_slice(tidx)
                     tSR_sC = thr_copy_C_s2r.partition_S(sC)
+                    tRS_rC = cute.make_rmem_tensor(tRS_rD_layout, self.c_dtype)
                     tRS_rC = cute.make_rmem_tensor(tRS_rD_layout, self.c_dtype)
                     tSR_rC = thr_copy_C_s2r.retile(tRS_rC)
                 else:
@@ -2480,6 +2485,7 @@ class HopperWgmma_MoE_kernel:
                     if const_expr(mDIdx_mnl is not None):
                         epilogue_barrier.arrive_and_wait()
                         tDsD = D_r2g_thr_copy.partition_S(sD[None, None, epi_buffer])
+                        tDrD = cute.make_rmem_tensor_like(tDsD)
                         tDrD = cute.make_rmem_tensor_like(tDsD)
                         cute.autovec_copy(tDsD, tDrD)
 
