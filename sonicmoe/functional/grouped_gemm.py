@@ -30,12 +30,11 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import argparse
 import enum
 import math
 import operator
 from functools import partial
-from typing import Callable, List, Optional, Tuple, Type, Union
+from typing import Callable, Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -49,15 +48,15 @@ from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+from quack.copy_utils import sm90_get_smem_load_op
 from quack.cute_dsl_utils import ParamsBase
+from quack.layout_utils import make_acc_tensor_mn_view
 
 # return PipelineStateWAdvance instead of PipelineState
 from quack.pipeline import PipelineTmaCpAsync, make_pipeline_state
-from quack.reduce import warp_reduce
 from quack.sm90_utils import partition_for_epilogue
 from quack.tensormap_manager import TensorMapManagerSm90
 from quack.tile_scheduler import RasterOrderOption, TileSchedulerArguments, VarlenMTileSchedulerArguments
-from quack.utils import make_acc_tensor_mn_view, predicate_k, sm90_get_smem_load_op
 
 from .tile_scheduler import SonicMoETileScheduler, SonicMoEVarlenMTileScheduler
 
@@ -472,7 +471,7 @@ class HopperWgmma_MoE_kernel:
         num_other_dim_per_load = const_expr(self.num_load_A_threads // threads_per_stride_1_dim)
 
         num_other_dim_per_thread = const_expr(other_tile // num_other_dim_per_load)
-        tmAIdx = cute.make_fragment((num_other_dim_per_thread,), dtype=mAIdx.element_type)
+        tmAIdx = cute.make_rmem_tensor((num_other_dim_per_load,), dtype=mAIdx.element_type)
 
         for i in cutlass.range_constexpr(num_other_dim_per_thread):
             other_dim_offset = const_expr(i * num_other_dim_per_load) + tidx // threads_per_stride_1_dim
@@ -504,7 +503,8 @@ class HopperWgmma_MoE_kernel:
         tDcD0 = D_r2g_thr_copy.partition_D(tcDgcD_flat_partition[None, None, *epi_tile_layout.get_hier_coord(0)])
         num_load_per_thread = const_expr(cute.size(tDcD0, mode=[1]))
 
-        tmDIdx = cute.make_fragment((epi_tile_num * num_load_per_thread,), dtype=mDIdx.element_type)
+        tmDIdx = cute.make_rmem_tensor((epi_tile_num * num_load_per_thread,), dtype=mDIdx.element_type)
+        tmDIdx = cute.make_rmem_tensor((epi_tile_num * num_load_per_thread,), dtype=mDIdx.element_type)
 
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
             tDcD_slice = D_r2g_thr_copy.partition_D(
@@ -592,8 +592,6 @@ class HopperWgmma_MoE_kernel:
                     mA_cur_copy = cute.make_tensor(tPrAptr, ((copy_elems_per_thr_load, 1), 1))
 
                     cute.copy(A_g2s_thr_copy, mA_cur_copy, tAsA[None, None, i])
-                else:
-                    tAsA[None, None, i].fill(0.0)
 
             else:
                 MIdx = tmAIdx[i]
@@ -1680,7 +1678,8 @@ class HopperWgmma_MoE_kernel:
         )
 
         if warp_idx >= self.tma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_load)
+            cute.arch.setmaxregister_decrease(self.num_regs_load)
+            cute.arch.setmaxregister_decrease(self.num_regs_load)
 
             prolog_loading_warp_ids = (
                 [const_expr(self.tma_warp_id + i) for i in range(self.num_load_A_threads // cute.arch.WARP_SIZE)]
@@ -1788,7 +1787,7 @@ class HopperWgmma_MoE_kernel:
                         tAsA = A_g2s_thr_copy.partition_D(sA)
                         tAcA = A_g2s_thr_copy.partition_D(cA)
 
-                        tApA = cute.make_fragment(
+                        tApA = cute.make_rmem_tensor(
                             cute.make_layout(
                                 (
                                     tAgA.shape[0][1],
@@ -1948,7 +1947,8 @@ class HopperWgmma_MoE_kernel:
                     tile_scheduler.producer_tail()
 
         if warp_idx < self.tma_warp_id:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_mma)
+            cute.arch.setmaxregister_increase(self.num_regs_mma)
+            cute.arch.setmaxregister_increase(self.num_regs_mma)
             is_tma_warp = cutlass.Boolean(
                 (not self.pingpong and warp_idx == 0) or (self.pingpong and (warp_idx == 0 or warp_idx == 4))
             )
@@ -1986,7 +1986,8 @@ class HopperWgmma_MoE_kernel:
             tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sB))
 
             acc_shape = tiled_mma.partition_shape_C(cute.select(self.tile_shape_mnk, mode=[0, 1]))
-            acc = cute.make_fragment(acc_shape, self.acc_dtype)
+            acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+            acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
 
             if const_expr(self.pingpong):
                 if warp_group_idx == 0:
@@ -2092,8 +2093,9 @@ class HopperWgmma_MoE_kernel:
 
                 peek_ab_full_status = cutlass.Boolean(True)
 
-                if k_tile_cnt == 0:
-                    acc.fill(0.0)
+                if const_expr(self.compute_weight_gradient):
+                    if k_tile_cnt == 0:
+                        acc.fill(0.0)
 
                 if k_tile_cnt > 0:
                     peek_ab_full_status = mainloop_pipeline.consumer_try_wait(mainloop_consumer_read_state)
@@ -2180,7 +2182,7 @@ class HopperWgmma_MoE_kernel:
                 # (R2S, R2S_M, R2S_N, PIPE_D)
                 tRS_sD = tiled_copy_D_r2s.get_slice(tidx).partition_D(sD)
                 tRS_rD_layout = cute.make_layout(tiled_copy_D_r2s.get_slice(tidx).partition_S(sD).shape[:3])
-                tRS_rD = cute.make_fragment(tRS_rD_layout, self.acc_dtype)
+                tRS_rD = cute.make_rmem_tensor(tRS_rD_layout, self.acc_dtype)
 
                 if const_expr(self.need_epilogue_load):
                     copy_atom_C = cute.make_copy_atom(
@@ -2195,7 +2197,8 @@ class HopperWgmma_MoE_kernel:
                     tiled_copy_C_s2r = cute.make_tiled_copy_S(copy_atom_C_s2r, tiled_copy_C_atom)
                     thr_copy_C_s2r = tiled_copy_C_s2r.get_slice(tidx)
                     tSR_sC = thr_copy_C_s2r.partition_S(sC)
-                    tRS_rC = cute.make_fragment(tRS_rD_layout, self.c_dtype)
+                    tRS_rC = cute.make_rmem_tensor(tRS_rD_layout, self.c_dtype)
+                    tRS_rC = cute.make_rmem_tensor(tRS_rD_layout, self.c_dtype)
                     tSR_rC = thr_copy_C_s2r.retile(tRS_rC)
                 else:
                     thr_copy_C_s2r, tSR_sC, tRS_rC, tSR_rC = None, None, None, None
@@ -2371,7 +2374,7 @@ class HopperWgmma_MoE_kernel:
                     cD = cute.make_identity_tensor((self.tile_M, self.tile_N))
                     tDcD = tiled_mma.get_slice(tidx).partition_C(cD)
                     tRS_rcD_retiled = tiled_copy_D_r2s.retile(tDcD)
-                    tRS_rcD = cute.make_fragment_like(tRS_rD, dtype=mS_scatter_idx.element_type)
+                    tRS_rcD = cute.make_rmem_tensor_like(tRS_rD, dtype=mS_scatter_idx.element_type)
 
                 if const_expr(self.need_epilogue_load):
                     # mC_mn = cute.domain_offset((mTokenoffset[batch_idx], 0), mC_mnl_tma)
@@ -2442,7 +2445,7 @@ class HopperWgmma_MoE_kernel:
                         sBias_retiled_and_grouped_epi = sBias_retiled_and_grouped[
                             None, None, None, epi_tile_layout.get_hier_coord(epi_idx)
                         ]
-                        rBias_retiled_epi_r = cute.make_fragment(
+                        rBias_retiled_epi_r = cute.make_rmem_tensor(
                             sBias_retiled_and_grouped_epi.layout, dtype=mBias_nl.element_type
                         )
                         cute.autovec_copy(
@@ -2453,20 +2456,20 @@ class HopperWgmma_MoE_kernel:
                             tRS_rD[epi_v] = tRS_rD[epi_v] + self.acc_dtype(rBias_retiled_epi_r[epi_v])
 
                     if const_expr(self.compute_dz_and_partial_ds_and_y1s):
-                        tRS_rD_out = cute.make_fragment_like(
+                        tRS_rD_out = cute.make_rmem_tensor_like(
                             tRS_rD, (cutlass.Float32 if const_expr(self.is_glu) else self.d_dtype)
                         )
-                        tRS_rY = cute.make_fragment_like(tRS_sY[None, None, None, 0], self.y_dtype)
+                        tRS_rY = cute.make_rmem_tensor_like(tRS_sY[None, None, None, 0], self.y_dtype)
                         self.compute_backward_activation(
                             tRS_rAcc, sS, tRS_rcD, tRS_rC, tRS_rD, tRS_rD_out, tRS_rY, epi_idx
                         )
 
                     elif const_expr(not (self.inference_mode and self.need_adhoc_epilogue_store)):
-                        tRS_rD_out = cute.make_fragment_like(tRS_rD, self.d_dtype)
+                        tRS_rD_out = cute.make_rmem_tensor_like(tRS_rD, self.d_dtype)
                         tRS_rD_out.store(tRS_rD.load().to(self.d_dtype))
 
                     if const_expr((self.is_glu or self.is_normal_act) and not self.compute_dz_and_partial_ds_and_y1s):
-                        tRS_rY = cute.make_fragment_like(tRS_sY[None, None, None, 0], self.y_dtype)
+                        tRS_rY = cute.make_rmem_tensor_like(tRS_sY[None, None, None, 0], self.y_dtype)
                         self.compute_activation(tRS_rD, tRS_rY)
 
                     # Copy from D registers to shared memory
@@ -2483,7 +2486,8 @@ class HopperWgmma_MoE_kernel:
                     if const_expr(mDIdx_mnl is not None):
                         epilogue_barrier.arrive_and_wait()
                         tDsD = D_r2g_thr_copy.partition_S(sD[None, None, epi_buffer])
-                        tDrD = cute.make_fragment_like(tDsD)
+                        tDrD = cute.make_rmem_tensor_like(tDsD)
+                        tDrD = cute.make_rmem_tensor_like(tDsD)
                         cute.autovec_copy(tDsD, tDrD)
 
                         tDcD_slice = D_r2g_thr_copy.partition_D(
@@ -2551,7 +2555,7 @@ class HopperWgmma_MoE_kernel:
                         for c in cutlass.range_constexpr(cute.size(y1, mode=[1])):
                             col_sum = col_sum + y1[r, c]
 
-                        col_sum = warp_reduce(col_sum, operator.add, width=4)
+                        col_sum = cute.arch.warp_reduction(col_sum, operator.add, threads_in_group=4)
 
                         M_idx_raw = tile_M_offset + M_tile_idx
                         if tidx % 4 == 0 and M_idx_raw < TIdx_next_group:

@@ -1,0 +1,1 @@
+The `bitmatrix.py` contains 3 functions adapted from the ![triton official example](https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/tensor_details/bitmatrix.py). We make some minor modifications to `_bitmatrix_metadata_compute_stage1` and `_bitmatrix_metadata_compute_stage2`.

@@ -14,6 +14,8 @@ from cutlass import const_expr
 from quack.sort.bitonic_sort import bitonic_topk
 from triton import next_power_of_2
 
+from sonicmoe.utils import domain_offset_i64
+
 
 class TopK_Softmax:
     def __init__(
@@ -100,7 +102,7 @@ class TopK_Softmax:
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
         # We use domain_offset_i64 to deal with tensors larger than 2^31 elements
-        mX = utils.domain_offset_i64((bidx * input_tiler_mn[0], 0), mX)
+        mX = domain_offset_i64((bidx * input_tiler_mn[0], 0), mX)
         gX = cute.local_tile(mX, input_tiler_mn, (0, 0))
         cX = cute.local_tile(idX, input_tiler_mn, (bidx, 0))
 
@@ -111,7 +113,7 @@ class TopK_Softmax:
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
 
         # allocate fragments for gmem->rmem
-        tXrX = cute.make_fragment_like(tXgX)
+        tXrX = cute.make_rmem_tensor_like(tXgX)
 
         is_even_N = const_expr(shape[1] == input_tiler_mn[1])
         tXpX = (
@@ -121,7 +123,7 @@ class TopK_Softmax:
         )
         if tXcX[0][0] < shape[0]:
             cute.copy(copy_atom_load_X, tXgX, tXrX, pred=tXpX)
-        tXrX_f32 = cute.make_fragment(tXrX.shape, cutlass.Float32)
+        tXrX_f32 = cute.make_rmem_tensor(tXrX.shape, cutlass.Float32)
         tXrX_f32.store(tXrX.load().to(cutlass.Float32))
 
         # Encode the indices into the bottom bits of values.
@@ -150,7 +152,7 @@ class TopK_Softmax:
 
         # Extract indices and clean values
         topk_vals_u32 = cute.recast_tensor(topk_vals, cutlass.Uint32)
-        topk_indices = cute.make_fragment(self.k, cutlass.Int32)
+        topk_indices = cute.make_rmem_tensor(self.k, cutlass.Int32)
         for i in cutlass.range_constexpr(self.k):
             # Extract the encoded index from the last log_N bits
             encoded_idx = topk_vals_u32[i] & idx_mask
@@ -174,7 +176,7 @@ class TopK_Softmax:
                 topk_vals[i] = topk_vals[i] / topk_exp_sum
 
         # Convert cleaned values to output type
-        topk_vals_out = cute.make_fragment_like(topk_indices, mValues.element_type)
+        topk_vals_out = cute.make_rmem_tensor_like(topk_indices, mValues.element_type)
         for i in cutlass.range_constexpr(self.k):
             topk_vals_out[i] = topk_vals[i].to(mValues.element_type)
 
