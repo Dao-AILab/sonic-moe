@@ -17,7 +17,7 @@ try:
     from xma.modules.moe import scattered_experts
 
     _IS_XMA_AVAILABLE = True
-except:
+except ImportError:
     _IS_XMA_AVAILABLE = False
 
 
