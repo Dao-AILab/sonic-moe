@@ -2,7 +2,7 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .count_cumsum import count_cumsum
 from .enums import KernelBackendMoE

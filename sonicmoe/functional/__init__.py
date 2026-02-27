@@ -6,11 +6,10 @@ import os
 
 import torch
 import torch.nn.functional as F
-from quack.gemm_interface import gemm
+from quack.gemm_interface import gemm, gemm_dgated, gemm_gated
 
 from ..count_cumsum import count_cumsum
 from ..enums import ActivationType, is_glu
-from ..quack_utils import gemm_dgated, gemm_gated
 from .backward import (
     _down_projection_backward_act,
     _down_projection_backward_weight,
@@ -99,7 +98,6 @@ class _UpProjection(torch.autograd.Function):
         expert_frequency_offset: torch.Tensor,
         total_expert_freq: int,
         K: int,
-        stream_id: int,
         x_gather_idx: torch.Tensor,
         s_scatter_idx: torch.Tensor,
         s_reverse_scatter_idx: torch.Tensor,
@@ -115,34 +113,25 @@ class _UpProjection(torch.autograd.Function):
             I //= 2
         TK = total_expert_freq
 
-        if is_using_quack_gemm():
-            assert not torch.compiler.is_compiling()
-            assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
-            z, y1 = gemm_gated(
-                x,
-                w1.permute(2, 1, 0),
-                activation="swiglu",
-                cu_seqlens_m=expert_frequency_offset,
-                A_idx=x_gather_idx,
-                dynamic_scheduler=False,
-            )
-        else:
-            z = torch.empty(TK, (2 * I if is_glu_activation else I), dtype=x.dtype, device=x.device)
-            y1 = torch.empty(TK, I, dtype=x.dtype, device=x.device)
-            _up_projection_forward(
-                x=x,
-                w1=w1,
-                z=z,
-                y1=y1,
-                b1=b1,
-                expert_frequency_offset=expert_frequency_offset,
-                expert_schedule_order=None,
-                x_gather_idx=x_gather_idx,
-                stream_id=stream_id,
-                activation_type=activation_type.value,
-                is_glu_activation=is_glu_activation,
-                is_inference_mode_enabled=is_inference_mode_enabled,
-            )
+        y1 = torch.empty(TK, I, dtype=x.dtype, device=x.device)
+        z = (
+            torch.empty(TK, (2 * I if is_glu_activation else I), dtype=x.dtype, device=x.device)
+            if (not is_inference_mode_enabled)
+            else None
+        )
+
+        _up_projection_forward(
+            x=x,
+            w1=w1,
+            z=z,
+            y1=y1,
+            b1=b1,
+            expert_frequency_offset=expert_frequency_offset,
+            x_gather_idx=x_gather_idx,
+            activation_type=activation_type.value,
+            is_glu_activation=is_glu_activation,
+            is_inference_mode_enabled=is_inference_mode_enabled,
+        )
 
         ctx.T = T
         ctx.TK = TK
@@ -152,7 +141,6 @@ class _UpProjection(torch.autograd.Function):
         ctx.I = I
         ctx.is_varlen_K = is_varlen_K
         ctx.is_glu_activation = is_glu_activation
-        ctx.stream_id = stream_id
 
         ctx.save_for_backward(
             x,
@@ -172,11 +160,6 @@ class _UpProjection(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, _: None, dz: torch.Tensor):
-        is_compiling = torch.compiler.is_compiling()
-
-        if not is_compiling:
-            assert _ is None
-
         T = ctx.T
         TK = ctx.TK
         E = ctx.E
@@ -184,7 +167,6 @@ class _UpProjection(torch.autograd.Function):
         H = ctx.H
         is_glu_activation = ctx.is_glu_activation
         is_varlen_K = ctx.is_varlen_K
-        stream_id = ctx.stream_id
 
         (
             x,
@@ -197,48 +179,27 @@ class _UpProjection(torch.autograd.Function):
             num_activated_expert_per_token_offset,
         ) = ctx.saved_tensors
 
+        dx_expanded = torch.empty(TK, H, dtype=dz.dtype, device=dz.device)
         dw1 = torch.empty_like(w1)
         db1 = None if b1 is None else torch.empty_like(b1)
 
-        if is_using_quack_gemm():
-            assert not is_compiling
+        _up_projection_backward_act(
+            w1=w1,
+            dx_expanded=dx_expanded,
+            dz=dz,
+            db1=db1,
+            expert_frequency_offset=expert_frequency_offset,
+            is_glu_activation=is_glu_activation,
+        )
 
-            gemm(
-                x.T,
-                dz,
-                out=dw1.permute(2, 1, 0),
-                cu_seqlens_k=expert_frequency_offset,
-                A_idx=x_gather_idx,
-                batch_idx_permute=None,
-                dynamic_scheduler=False,
-            )
-            dx_expanded = gemm(dz, w1.permute(2, 0, 1), cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False)
-        else:
-            dx_expanded = torch.empty(TK, H, dtype=dz.dtype, device=dz.device)
-
-            _up_projection_backward_act(
-                w1=w1,
-                dx_expanded=dx_expanded,
-                dz=dz,
-                db1=db1,
-                expert_frequency_offset=expert_frequency_offset,
-                expert_schedule_order=None,
-                x_gather_idx=x_gather_idx,
-                s_scatter_idx=s_scatter_idx,
-                is_glu_activation=is_glu_activation,
-                stream_id=stream_id,
-            )
-
-            _up_projection_backward_weight(
-                x=x,
-                dw1=dw1,
-                dz=dz,
-                expert_frequency_offset=expert_frequency_offset,
-                expert_schedule_order=None,
-                x_gather_idx=x_gather_idx,
-                is_glu_activation=is_glu_activation,
-                stream_id=stream_id,
-            )
+        _up_projection_backward_weight(
+            x=x,
+            dw1=dw1,
+            dz=dz,
+            expert_frequency_offset=expert_frequency_offset,
+            x_gather_idx=x_gather_idx,
+            is_glu_activation=is_glu_activation,
+        )
 
         dx_reduced = torch.empty(T, H, dtype=dz.dtype, device=dz.device)
 
@@ -267,7 +228,6 @@ class _DownProjection(torch.autograd.Function):
         expert_frequency_offset: torch.Tensor,
         T: int,
         K: int,
-        stream_id: int,
         x_gather_idx: torch.Tensor,
         s_scatter_idx: torch.Tensor,
         s_reverse_scatter_idx: torch.Tensor,
@@ -278,26 +238,18 @@ class _DownProjection(torch.autograd.Function):
         TK = y1.size(0)
         H, I, E = w2.shape
 
-        if is_using_quack_gemm():
-            assert not torch.compiler.is_compiling()
+        y2 = torch.empty(TK, H, dtype=y1.dtype, device=y1.device)
 
-            assert b2 is None
-            y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
-        else:
-            y2 = torch.empty(TK, H, dtype=y1.dtype, device=y1.device)
-            _down_projection_forward(
-                w2=w2,
-                y1=y1,
-                y2=y2,
-                b2=b2,
-                expert_frequency_offset=expert_frequency_offset,
-                expert_schedule_order=None,
-                x_gather_idx=x_gather_idx,
-                stream_id=stream_id,
-            )
+        _down_projection_forward(
+            w2=w2,
+            y1=y1,
+            y2=y2,
+            b2=b2,
+            expert_frequency_offset=expert_frequency_offset,
+        )
 
-        o = torch.empty(T, H, device=z.device, dtype=z.dtype)
-        topk_scores = topk_scores.flatten()
+        o = torch.empty(T, H, device=y1.device, dtype=y1.dtype)
+        topk_scores = topk_scores.view(-1)
 
         _router_forward(
             y2=y2,
@@ -314,7 +266,6 @@ class _DownProjection(torch.autograd.Function):
         ctx.K = K
         ctx.is_varlen_K = is_varlen_K
         ctx.activation_type = activation_type
-        ctx.stream_id = stream_id
 
         ctx.save_for_backward(
             z,
@@ -324,7 +275,6 @@ class _DownProjection(torch.autograd.Function):
             expert_frequency_offset,
             x_gather_idx,
             s_scatter_idx,
-            s_reverse_scatter_idx,
         )
 
         return o
@@ -333,7 +283,6 @@ class _DownProjection(torch.autograd.Function):
     def backward(ctx, dout: torch.Tensor):
         T = ctx.T
         K = ctx.K
-        stream_id = ctx.stream_id
         is_varlen_K = ctx.is_varlen_K
         activation_type = ctx.activation_type
 
@@ -345,78 +294,41 @@ class _DownProjection(torch.autograd.Function):
             expert_frequency_offset,
             x_gather_idx,
             s_scatter_idx,
-            s_reverse_scatter_idx,
         ) = ctx.saved_tensors
 
         dw2 = torch.empty_like(w2)
         db2 = None if b2 is None else torch.empty_like(b2)
         dz = torch.empty_like(z)
 
-        if is_using_quack_gemm():
-            assert not torch.compiler.is_compiling()
-            assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
+        I = w2.size(1)
+        TK = x_gather_idx.size(0)
 
-            s = topk_scores[s_scatter_idx]
-            _, y1s, ds = gemm_dgated(
-                dout,
-                w2.permute(2, 0, 1),
-                PreAct=z,
-                activation="swiglu",
-                dx_out=dz,
-                colvec_scale=s,
-                colvec_reduce=True,
-                cu_seqlens_m=expert_frequency_offset,
-                A_idx=x_gather_idx,
-                dynamic_scheduler=False,
-            )
-            gemm(
-                dout.T,
-                y1s,
-                out=dw2.permute(2, 0, 1),
-                cu_seqlens_k=expert_frequency_offset,
-                A_idx=x_gather_idx,
-                batch_idx_permute=None,
-                dynamic_scheduler=False,
-            )
+        y1s = torch.empty(TK, I, dtype=z.dtype, device=z.device)
+        ds = torch.empty_like(topk_scores)
 
-            ds = ds[s_reverse_scatter_idx]
-        else:
-            ds = torch.empty_like(topk_scores)
+        _down_projection_backward_act(
+            dout=dout,
+            z=z,
+            w2=w2,
+            dz=dz,
+            ds=ds,
+            b2=b2,
+            db2=db2,
+            y1s=y1s,
+            topk_scores=topk_scores,
+            expert_frequency_offset=expert_frequency_offset,
+            x_gather_idx=x_gather_idx,
+            s_scatter_idx=s_scatter_idx,
+            activation_type=activation_type.value,
+        )
 
-            I = w2.size(1)
-            TK = x_gather_idx.size(0)
-
-            y1s = torch.empty(TK, I, dtype=z.dtype, device=z.device)
-            is_glu_activation = is_glu(activation_type)
-
-            _down_projection_backward_act(
-                dout=dout,
-                z=z,
-                w2=w2,
-                dz=dz,
-                ds=ds,
-                b2=b2,
-                db2=db2,
-                y1s=y1s,
-                topk_scores=topk_scores,
-                expert_frequency_offset=expert_frequency_offset,
-                expert_schedule_order=None,
-                x_gather_idx=x_gather_idx,
-                s_scatter_idx=s_scatter_idx,
-                is_glu_activation=is_glu_activation,
-                activation_type=activation_type.value,
-                stream_id=stream_id,
-            )
-
-            _down_projection_backward_weight(
-                dout=dout,
-                y1s=y1s,
-                dw2=dw2,
-                expert_frequency_offset=expert_frequency_offset,
-                expert_schedule_order=None,
-                x_gather_idx=x_gather_idx,
-                stream_id=stream_id,
-            )
+        _down_projection_backward_weight(
+            dout=dout,
+            y1s=y1s,
+            dw2=dw2,
+            expert_frequency_offset=expert_frequency_offset,
+            x_gather_idx=x_gather_idx,
+        )
 
         # TC top-K routing
         if not is_varlen_K:
@@ -444,23 +356,35 @@ def moe_TC_softmax_topk_layer(
     router_logits = F.linear(x, router_w)
     topk_scores, topk_indices = TC_Softmax_Topk_Router_Function.apply(router_logits, E, K)
 
-    (expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx) = (
-        TC_topk_router_metadata_triton(topk_indices, E)
-    )
+    T, K = topk_indices.size()
+    TK = T * K
+    device = topk_indices.device
 
-    T = x.size(0)
+    s_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    expert_frequency = torch.empty(E, dtype=torch.int32, device=device)
+    expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
+    x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
+
+    TC_topk_router_metadata_triton(
+        topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
+    )
 
     if type(activation_type) == str:
         activation_type = ActivationType(activation_type)
+
+    if is_using_quack_gemm():
+        assert not torch.compiler.is_compiling()
+        assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
+        assert b1 is None and b2 is None
 
     y1, z = _UpProjection.apply(
         x,
         w1,
         b1,
         expert_frequency_offset,
-        T * K,
+        TK,
         K,
-        stream_id,
         x_gather_idx,
         s_scatter_idx,
         s_reverse_scatter_idx,
@@ -479,7 +403,6 @@ def moe_TC_softmax_topk_layer(
         expert_frequency_offset,
         T,
         K,
-        stream_id,
         x_gather_idx,
         s_scatter_idx,
         s_reverse_scatter_idx,
@@ -530,6 +453,11 @@ def moe_general_routing_inputs(
         num_activated_expert_per_token_offset,
     ) = general_routing_router_metadata(router_scores, token_indices, expert_indices, T, E)
 
+    if is_using_quack_gemm():
+        assert not torch.compiler.is_compiling()
+        assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
+        assert b1 is None and b2 is None
+
     y1, z = _UpProjection.apply(
         x,
         w1,
@@ -537,7 +465,6 @@ def moe_general_routing_inputs(
         expert_frequency_offset,
         TK,
         None,  # K, not needed
-        stream_id,
         x_gather_idx,
         s_scatter_idx,
         s_reverse_scatter_idx,
@@ -556,7 +483,6 @@ def moe_general_routing_inputs(
         expert_frequency_offset,
         T,
         None,  # K, not needed
-        stream_id,
         x_gather_idx,
         s_scatter_idx,
         s_reverse_scatter_idx,

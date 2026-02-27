@@ -9,15 +9,10 @@ import cutlass.cute as cute
 import torch
 import triton
 import triton.language as tl
+from quack.gemm_interface import gemm, gemm_dgated
 
-from ..enums import LIBRARY_NAME, TENSORMAP, ActivationType
-from ..utils import ceil_divide, convert_torch_tensor_to_cute_tensor, get_powers_of_2
-from .moe_config import (
-    HopperWgmma_MoE_Down_proj_ActGrad_Bwd,
-    HopperWgmma_MoE_Down_proj_WeightGrad_Bwd,
-    HopperWgmma_MoE_Up_proj_ActGrad_Bwd,
-    HopperWgmma_MoE_Up_proj_WeightGrad_Bwd,
-)
+from ..enums import LIBRARY_NAME
+from ..utils import get_powers_of_2
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 
 
@@ -168,30 +163,6 @@ def db1_kernel(
         tl.store(db1_ptr + Eidx * I + i_offsets, db1_acc, mask=i_mask)
 
 
-@triton.jit
-def _colsum_smallN_kernel(
-    y_ptr,  # *mut  T, shape [M]
-    x_ptr,  # *const T, shape [M, N]
-    stride_xm: tl.constexpr,
-    stride_xn: tl.constexpr,  # strides of X
-    stride_y: tl.constexpr,  # stride of Y (usually 1)
-    N: tl.constexpr,  # sizes
-    BLOCK_N: tl.constexpr,  # tile size along N
-):
-    row = tl.program_id(0)
-
-    # assume BLOCK_N >= N
-    offs = tl.arange(0, BLOCK_N)
-    mask = offs < N
-    # Load a tile from the row; cast to fp32 for the reduction
-    x = tl.load(x_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0).to(tl.float32)
-    # Reduce this tile to a scalar and add
-    acc = tl.sum(x, axis=0)
-
-    # Store the row-sum (cast back to y dtype)
-    tl.store(y_ptr + row * stride_y, acc)
-
-
 @torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_backward_act", mutates_args={"dx_expanded", "db1"})
 def _up_projection_backward_act(
     w1: torch.Tensor,
@@ -199,63 +170,17 @@ def _up_projection_backward_act(
     dz: torch.Tensor,
     db1: torch.Tensor | None,
     expert_frequency_offset: torch.Tensor,
-    expert_schedule_order: torch.Tensor | None,
-    x_gather_idx: torch.Tensor,
-    s_scatter_idx: torch.Tensor,
     is_glu_activation: bool,
-    stream_id: int,
 ) -> None:
     I, H, E = w1.size()
     if is_glu_activation:
         I //= 2
 
+    gemm(dz, w1.permute(2, 0, 1), cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False, out=dx_expanded)
+
     # db1 computation
     if db1 is not None:
         db1_kernel[(E,)](dz, db1, expert_frequency_offset, (2 * I if is_glu_activation else I), E)
-
-    mE_offset = convert_torch_tensor_to_cute_tensor(expert_frequency_offset, (0,), 0, 4, 1, stream=stream_id)
-    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1, stream=stream_id)
-    mS_scatter = convert_torch_tensor_to_cute_tensor(s_scatter_idx, (0,), 0, 4, 1, stream=stream_id)
-    mDz = convert_torch_tensor_to_cute_tensor(dz, (0, 1), 1, 16, 8, stream=stream_id)
-    mDx_expanded = convert_torch_tensor_to_cute_tensor(dx_expanded, (0, 1), 1, 16, 8, stream=stream_id)
-    mW1_trans = convert_torch_tensor_to_cute_tensor(w1.permute(1, 0, 2), (2, 1, 0), 0, 16, 8, stream=stream_id)
-
-    if expert_schedule_order is None:
-        mE_permute_order = None
-    else:
-        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
-    current_stream = cuda.CUstream(stream_id)
-
-    compile_dx_key = ("dx", E, H, I, is_glu_activation, dx_expanded.dtype)
-    if compile_dx_key not in _up_projection_backward_act.compile_cache:
-        dx_module = HopperWgmma_MoE_Up_proj_ActGrad_Bwd(E, H, I, is_glu_activation)
-        tensormaps = [dx_module.module.generate_tensormap(None, None, None) for _ in range(2)]
-        _up_projection_backward_act.compile_cache[compile_dx_key] = cute.compile(
-            dx_module,
-            mDz,
-            mW1_trans,
-            mDx_expanded,
-            mE_offset,
-            mX_gather,
-            mS_scatter,
-            tensormaps,
-            mE_permute_order,
-            current_stream,
-        )
-        _up_projection_backward_act.compile_cache[f"dx-{TENSORMAP}"] = tensormaps
-
-    dx_tensormaps = _up_projection_backward_act.compile_cache[f"dx-{TENSORMAP}"]
-    _up_projection_backward_act.compile_cache[compile_dx_key](
-        mDz,
-        mW1_trans,
-        mDx_expanded,
-        mE_offset,
-        mX_gather,
-        mS_scatter,
-        dx_tensormaps,
-        mE_permute_order,
-        current_stream,
-    )
 
 
 _up_projection_backward_act.compile_cache = {}
@@ -267,57 +192,21 @@ def _up_projection_backward_weight(
     dw1: torch.Tensor,
     dz: torch.Tensor,
     expert_frequency_offset: torch.Tensor,
-    expert_schedule_order: torch.Tensor | None,
     x_gather_idx: torch.Tensor,
     is_glu_activation: bool,
-    stream_id: int,
 ) -> None:
     I, H, E = dw1.size()
     if is_glu_activation:
         I //= 2
 
-    x = x.detach()
-
-    mDz_trans = convert_torch_tensor_to_cute_tensor(dz.T, (1, 0), 0, 16, 8, stream=stream_id)
-    mDw1_trans = convert_torch_tensor_to_cute_tensor(dw1.permute(1, 0, 2), (2, 1, 0), 0, 16, 8, stream=stream_id)
-
-    mX_trans = convert_torch_tensor_to_cute_tensor(x.T, (1, 0), 0, 16, 8, stream=stream_id)
-    mE_offset = convert_torch_tensor_to_cute_tensor(expert_frequency_offset, (0,), 0, 4, 1, stream=stream_id)
-    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1, stream=stream_id)
-
-    if expert_schedule_order is None:
-        mE_permute_order = None
-    else:
-        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
-    current_stream = cuda.CUstream(stream_id)
-
-    compile_dw1_key = ("dw1", E, H, I, is_glu_activation, x.dtype)
-    if compile_dw1_key not in _up_projection_backward_weight.compile_cache:
-        dw1_module = HopperWgmma_MoE_Up_proj_WeightGrad_Bwd(E, H, I, is_glu_activation)
-        tensormaps = [dw1_module.module.generate_tensormap(None, None, None) for _ in range(1)]
-        _up_projection_backward_weight.compile_cache[compile_dw1_key] = cute.compile(
-            dw1_module,
-            mX_trans,
-            mDz_trans,
-            mDw1_trans,
-            mE_offset,
-            mX_gather,
-            tensormaps,
-            mE_permute_order,
-            current_stream,
-        )
-        _up_projection_backward_weight.compile_cache[f"dw1-{TENSORMAP}"] = tensormaps
-
-    dw1_tensormaps = _up_projection_backward_weight.compile_cache[f"dw1-{TENSORMAP}"]
-    _up_projection_backward_weight.compile_cache[compile_dw1_key](
-        mX_trans,
-        mDz_trans,
-        mDw1_trans,
-        mE_offset,
-        mX_gather,
-        dw1_tensormaps,
-        mE_permute_order,
-        current_stream,
+    gemm(
+        x.T,
+        dz,
+        out=dw1.permute(2, 1, 0),
+        cu_seqlens_k=expert_frequency_offset,
+        A_idx=x_gather_idx,
+        batch_idx_permute=None,
+        dynamic_scheduler=False,
     )
 
 
@@ -332,148 +221,35 @@ def _down_projection_backward_act(
     dz: torch.Tensor,
     ds: torch.Tensor,
     b2: torch.Tensor | None,
-    db2: torch.Tensor | None,
+    db2: torch.Tensor | None,  # add impl later
     y1s: torch.Tensor,
     topk_scores: torch.Tensor,
     expert_frequency_offset: torch.Tensor,
-    expert_schedule_order: torch.Tensor | None,
     x_gather_idx: torch.Tensor,
     s_scatter_idx: torch.Tensor,
-    is_glu_activation: bool,
     activation_type: str,
-    stream_id: int,
 ) -> None:
-    H, I, E = w2.size()
-    TK = x_gather_idx.size(0)
+    assert activation_type in (
+        "swiglu",
+        "geglu",
+    ), f"QuACK gemm_gated only supports glu activations, got {activation_type}"
+    assert b2 is None, f"QuACK gemm_gated does not support bias yet. We will add it later."
 
-    dout = dout.detach()
-    w2 = w2.detach()
-    topk_scores = topk_scores.detach()
-
-    mDout = convert_torch_tensor_to_cute_tensor(dout, (0, 1), 1, 16, 8, stream=stream_id)
-    mW2_trans = convert_torch_tensor_to_cute_tensor(w2.permute(1, 0, 2), (2, 1, 0), 0, 16, 8, stream=stream_id)
-    mS = convert_torch_tensor_to_cute_tensor(topk_scores, (0,), 0, 4, 1, stream=stream_id)
-    if is_glu_activation:
-        mDz_kernel_input = convert_torch_tensor_to_cute_tensor(
-            dz.view(torch.float32), (0, 1), 1, 16, 8, stream=stream_id
-        )
-        mZ_kernel_input = convert_torch_tensor_to_cute_tensor(
-            z.view(torch.float32), (0, 1), 1, 16, 8, stream=stream_id
-        )
-    else:
-        mDz_kernel_input = convert_torch_tensor_to_cute_tensor(dz.detach(), (0, 1), 1, 16, 8, stream=stream_id)
-        mZ_kernel_input = convert_torch_tensor_to_cute_tensor(z.detach(), (0, 1), 1, 16, 8, stream=stream_id)
-
-    mY1S = convert_torch_tensor_to_cute_tensor(y1s, (0, 1), 1, 16, 8, stream=stream_id)
-    mE_offset = convert_torch_tensor_to_cute_tensor(expert_frequency_offset, (0,), 0, 4, 1, stream=stream_id)
-    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1, stream=stream_id)
-    mS_scatter = convert_torch_tensor_to_cute_tensor(s_scatter_idx, (0,), 0, 4, 1, stream=stream_id)
-
-    if expert_schedule_order is None:
-        mE_permute_order = None
-    else:
-        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
-    current_stream = cuda.CUstream(stream_id)
-    ds_partial = None
-
-    compile_dz_key = ("dz", E, H, I, z.dtype, activation_type)
-    if compile_dz_key not in _down_projection_backward_act.compile_cache:
-        # I don't know why but this sync appears to fix a mysterious initialization bug??
-        torch.cuda.synchronize()
-        dz_module = HopperWgmma_MoE_Down_proj_ActGrad_Bwd(E, H, I, ActivationType(activation_type))
-        tensormaps = [dz_module.module.generate_tensormap(None, None, None) for _ in range(3)]
-
-        ds_partial_N = max(ceil_divide(I, dz_module.module.tile_shape_mnk[1]), 1)
-        ds_partial = torch.empty(TK, ds_partial_N, dtype=torch.float32, device=topk_scores.device)
-        mDS_partial = convert_torch_tensor_to_cute_tensor(ds_partial, (0, 1), 1, 4, 1, stream=stream_id)
-
-        _down_projection_backward_act.compile_cache["ds_partial_N"] = ds_partial_N
-        _down_projection_backward_act.compile_cache[compile_dz_key] = cute.compile(
-            dz_module,
-            mDout,
-            mW2_trans,
-            mZ_kernel_input,
-            mDz_kernel_input,
-            mY1S,
-            mS,
-            mDS_partial,
-            mE_offset,
-            mX_gather,
-            mS_scatter,
-            tensormaps,
-            mE_permute_order,
-            current_stream,
-        )
-        _down_projection_backward_act.compile_cache[f"dz-{TENSORMAP}"] = tensormaps
-
-    if ds_partial is None:
-        ds_partial_N = _down_projection_backward_act.compile_cache["ds_partial_N"]
-        ds_partial = torch.empty(TK, ds_partial_N, dtype=torch.float32, device=topk_scores.device)
-        mDS_partial = convert_torch_tensor_to_cute_tensor(ds_partial, (0, 1), 1, 4, 1, stream=stream_id)
-
-    dz_tensormaps = _down_projection_backward_act.compile_cache[f"dz-{TENSORMAP}"]
-    _down_projection_backward_act.compile_cache[compile_dz_key](
-        mDout,
-        mW2_trans,
-        mZ_kernel_input,
-        mDz_kernel_input,
-        mY1S,
-        mS,
-        mDS_partial,
-        mE_offset,
-        mX_gather,
-        mS_scatter,
-        dz_tensormaps,
-        mE_permute_order,
-        current_stream,
+    s = topk_scores[s_scatter_idx]
+    _, _, ds_scattered = gemm_dgated(
+        dout,
+        w2.permute(2, 0, 1),
+        PreAct=z,
+        activation=activation_type,
+        dx_out=dz,
+        postact_out=y1s,
+        colvec_scale=s,
+        colvec_reduce=True,
+        cu_seqlens_m=expert_frequency_offset,
+        A_idx=x_gather_idx,
+        dynamic_scheduler=False,
     )
-
-    if db2 is None:
-        # we don't need to update ds
-        if ds_partial.size(1) == 1:
-            ds.copy_(ds_partial.view(-1).to(dtype=ds.dtype))
-        elif ds_partial.size(1) <= 32:
-            ds.copy_(ds_partial.sum(dim=-1, dtype=ds.dtype))
-        else:
-            M, N = ds_partial.size()
-
-            _colsum_smallN_kernel[M,](
-                y_ptr=ds,
-                x_ptr=ds_partial,
-                stride_xm=ds_partial.stride(0),
-                stride_xn=ds_partial.stride(1),
-                stride_y=1,
-                N=N,
-                BLOCK_N=triton.next_power_of_2(N),
-            )
-    else:
-        # db2 and ds update
-        BLOCK_H = min(triton.next_power_of_2(H), 2048)
-        NUM_H_BLOCKS = triton.cdiv(H, BLOCK_H)
-
-        new_ds_partial = torch.empty(TK, NUM_H_BLOCKS, device=ds.device, dtype=torch.float32)
-
-        db2_and_ds_kernel[(E, NUM_H_BLOCKS)](
-            dout,
-            topk_scores,
-            new_ds_partial,
-            ds_partial,
-            b2,
-            db2,
-            x_gather_idx,
-            s_scatter_idx,
-            expert_frequency_offset,
-            H,
-            E,
-            ds_partial_N,
-            BLOCK_H=BLOCK_H,
-            BLOCK_OLD_DS_PARTIAL_N=triton.next_power_of_2(ds_partial_N),
-        )
-
-        if NUM_H_BLOCKS == 1:
-            ds.copy_(new_ds_partial.view(-1).to(dtype=ds.dtype))
-        else:
-            ds.copy_(new_ds_partial.sum(dim=-1, dtype=ds.dtype))
+    ds[s_scatter_idx] = ds_scattered
 
 
 _down_projection_backward_act.compile_cache = {}
@@ -485,44 +261,16 @@ def _down_projection_backward_weight(
     y1s: torch.Tensor,
     dw2: torch.Tensor,
     expert_frequency_offset: torch.Tensor,
-    expert_schedule_order: torch.Tensor | None,
     x_gather_idx: torch.Tensor,
-    stream_id: int,
 ) -> None:
-    H, I, E = dw2.size()
-
-    mDout_trans = convert_torch_tensor_to_cute_tensor(dout.T, (1, 0), 0, 16, 8, stream=stream_id)
-    mDw2 = convert_torch_tensor_to_cute_tensor(dw2, (2, 0, 1), 1, 16, 8, stream=stream_id)
-    mY1S_trans = convert_torch_tensor_to_cute_tensor(y1s.T, (1, 0), 0, 16, 8, stream=stream_id)
-    mE_offset = convert_torch_tensor_to_cute_tensor(expert_frequency_offset, (0,), 0, 4, 1, stream=stream_id)
-    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1, stream=stream_id)
-
-    if expert_schedule_order is None:
-        mE_permute_order = None
-    else:
-        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
-    current_stream = cuda.CUstream(stream_id)
-
-    compile_dw2_key = ("dw2", E, H, I, dw2.dtype)
-    if compile_dw2_key not in _down_projection_backward_weight.compile_cache:
-        dw2_module = HopperWgmma_MoE_Down_proj_WeightGrad_Bwd(E, H, I)
-        tensormaps = [dw2_module.module.generate_tensormap(None, None, None) for _ in range(1)]
-        _down_projection_backward_weight.compile_cache[compile_dw2_key] = cute.compile(
-            dw2_module,
-            mDout_trans,
-            mY1S_trans,
-            mDw2,
-            mE_offset,
-            mX_gather,
-            tensormaps,
-            mE_permute_order,
-            current_stream,
-        )
-        _down_projection_backward_weight.compile_cache[f"dw2-{TENSORMAP}"] = tensormaps
-
-    dw2_tensormaps = _down_projection_backward_weight.compile_cache[f"dw2-{TENSORMAP}"]
-    _down_projection_backward_weight.compile_cache[compile_dw2_key](
-        mDout_trans, mY1S_trans, mDw2, mE_offset, mX_gather, dw2_tensormaps, mE_permute_order, current_stream
+    gemm(
+        dout.T,
+        y1s,
+        out=dw2.permute(2, 0, 1),
+        cu_seqlens_k=expert_frequency_offset,
+        A_idx=x_gather_idx,
+        batch_idx_permute=None,
+        dynamic_scheduler=False,
     )
 
 
