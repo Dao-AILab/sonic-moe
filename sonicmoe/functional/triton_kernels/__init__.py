@@ -60,9 +60,25 @@ def _compute_col_partial_sum_kernel(
     )
 
 
+@torch.library.custom_op(
+    f"triton_kernels::TC_topk_router_metadata",
+    mutates_args={
+        "expert_frequency",
+        "expert_frequency_offset",
+        "x_gather_idx",
+        "s_scatter_idx",
+        "s_reverse_scatter_idx",
+    },
+)
 def TC_topk_router_metadata_triton(
-    topk_router_indices: torch.Tensor, E: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    topk_router_indices: torch.Tensor,
+    E: int,
+    expert_frequency: torch.Tensor,
+    expert_frequency_offset: torch.Tensor,
+    x_gather_idx: torch.Tensor,
+    s_scatter_idx: torch.Tensor,
+    s_reverse_scatter_idx: torch.Tensor,
+) -> None:
     T, K = topk_router_indices.size()
     TK = T * K
     device = topk_router_indices.device
@@ -87,7 +103,8 @@ def TC_topk_router_metadata_triton(
         K=K,
         E_POW2=E_POW2,
     )
-    expert_frequency = col_partial_sum_trans.sum(dim=1, dtype=torch.int32)
+
+    expert_frequency.copy_(col_partial_sum_trans.sum(dim=1, dtype=torch.int32))
     col_partial_sum = col_partial_sum_trans.T  # [n_tiles, E]
 
     # ── Kernel 2: stage1 ─────────────────────────────────────────────────────
@@ -95,10 +112,6 @@ def TC_topk_router_metadata_triton(
     #   counts to exclusive prefix sums over tiles in-place.
     # - For pid == E: write exclusive cumsum of expert_freq_offset into
     #   expert_freq_off[0:E] (= col_offs, a view into expert_freq_off).
-    s_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
-    s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
-    expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
-    x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
 
     _bitmatrix_metadata_compute_stage1[(E + 2,)](
         expert_frequency,
@@ -126,5 +139,3 @@ def TC_topk_router_metadata_triton(
         TOKENS_PER_BLOCK=TOKENS_PER_BLOCK,
         K=K,
     )
-
-    return (expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx)
