@@ -468,12 +468,12 @@ def moe_TC_softmax_topk_layer(
     assert ((b1 is None) and (b2 is None)) or ((b1 is not None) and (b2 is not None)), (
         "b1 and b2 has to be None or not None at the same time!"
     )
-    if bias is None:
+    if mod is not None:
+        topk_indices, topk_scores, router_logits = mod(x)
+        expert_frequency, expert_frequency_offset = count_cumsum(topk_indices.view(-1), router_w.size(0), do_cumsum=True)
+    elif bias is None:
         router_logits = F.linear(x, router_w)
         topk_scores, topk_indices = TC_Softmax_Topk_Router_Function.apply(router_logits, router_w.size(0), K)
-        expert_frequency, expert_frequency_offset = count_cumsum(topk_indices.view(-1), router_w.size(0), do_cumsum=True)
-    elif mod is not None:
-        topk_indices, topk_scores, router_logits = mod(x)
         expert_frequency, expert_frequency_offset = count_cumsum(topk_indices.view(-1), router_w.size(0), do_cumsum=True)
     else:
         router_logits = F.linear(x, router_w)
