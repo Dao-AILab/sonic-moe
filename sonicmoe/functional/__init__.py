@@ -44,7 +44,7 @@ def general_routing_router_metadata(
     if T % 4 == 0 and T <= 50000:
         _, num_activated_expert_per_token_offset = count_cumsum(sorted_selected_T, T, do_cumsum=True)
     else:
-        num_activated_expert_per_token_offset = torch.bincount(sorted_selected_T, minlength=T).cumsum(0).int()
+        num_activated_expert_per_token_offset = torch.histc(sorted_selected_T.to(torch.float32), bins=T, min=-0.5, max=T - 0.5).cumsum(0).int()
 
     num_activated_expert_per_token_offset = torch.cat(
         [torch.zeros(1, dtype=torch.int32, device=device), num_activated_expert_per_token_offset]
