@@ -20,44 +20,8 @@ from .backward import (
     _up_projection_backward_weight,
 )
 from .forward import _down_projection_forward, _router_forward, _softmax_topk_fwd, _up_projection_forward
-from .triton_kernels import TC_topk_router_metadata_triton
+from .triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
 from .utils import enable_quack_gemm, is_using_quack_gemm
-
-
-def general_routing_router_metadata(
-    router_scores_selected: torch.Tensor, sorted_selected_T: torch.Tensor, selected_E: torch.Tensor, T: int, E: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-
-    device = router_scores_selected.device
-
-    expert_frequency, expert_frequency_offset = count_cumsum(selected_E, E, do_cumsum=True)
-    expert_frequency_offset = torch.cat([torch.zeros(1, dtype=torch.int32, device=device), expert_frequency_offset])
-
-    s_scatter_idx = selected_E.argsort().int()
-    s_reverse_scatter_idx = torch.empty_like(s_scatter_idx)
-    s_reverse_scatter_idx[s_scatter_idx] = torch.arange(
-        s_scatter_idx.size(0), device=s_scatter_idx.device, dtype=s_scatter_idx.dtype
-    )
-
-    x_gather_idx = sorted_selected_T[s_scatter_idx]
-
-    if T % 4 == 0 and T <= 50000:
-        _, num_activated_expert_per_token_offset = count_cumsum(sorted_selected_T, T, do_cumsum=True)
-    else:
-        num_activated_expert_per_token_offset = torch.bincount(sorted_selected_T, minlength=T).cumsum(0).int()
-
-    num_activated_expert_per_token_offset = torch.cat(
-        [torch.zeros(1, dtype=torch.int32, device=device), num_activated_expert_per_token_offset]
-    )
-
-    return (
-        expert_frequency,
-        expert_frequency_offset,
-        x_gather_idx,
-        s_scatter_idx,
-        s_reverse_scatter_idx,
-        num_activated_expert_per_token_offset,
-    )
 
 
 class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
@@ -531,14 +495,27 @@ def moe_general_routing_inputs(
     T = x.size(0)
     TK = router_scores.size(0)
     E = w2.size(-1)
-    (
+    device = router_scores.device
+
+    s_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    expert_frequency = torch.empty(E, dtype=torch.int32, device=device)
+    expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
+    x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    num_activated_expert_per_token_offset = torch.empty(T + 1, dtype=torch.int32, device=device)
+
+    general_routing_router_metadata_triton(
+        token_indices,
+        expert_indices,
+        T,
+        E,
         expert_frequency,
         expert_frequency_offset,
         x_gather_idx,
         s_scatter_idx,
         s_reverse_scatter_idx,
         num_activated_expert_per_token_offset,
-    ) = general_routing_router_metadata(router_scores, token_indices, expert_indices, T, E)
+    )
 
     y1, z = _UpProjection.apply(
         x,
