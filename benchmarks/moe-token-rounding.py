@@ -15,7 +15,7 @@ from triton.testing import do_bench
 
 from sonicmoe import MoE
 from sonicmoe.enums import ActivationType
-from sonicmoe.functional import count_cumsum, moe_general_routing_inputs
+from sonicmoe.functional import moe_general_routing_inputs
 
 
 @torch.autocast(device_type="cuda", dtype=torch.float32)
@@ -151,7 +151,7 @@ def forward_token_choice_rounding(
     # first sorting, similar to TC
     topk_values, topk_indices = router_scores.topk(K, dim=-1)
 
-    expert_freq = count_cumsum(topk_indices.view(-1), E, do_cumsum=True)[0]
+    expert_freq = torch.bincount(topk_indices.view(-1), minlength=E).int()
     expert_freq_rounded_up = (torch.ceil(expert_freq / Mtile) * Mtile).type(torch.int32)
     expert_freq_rounded_down = expert_freq // Mtile * Mtile
 

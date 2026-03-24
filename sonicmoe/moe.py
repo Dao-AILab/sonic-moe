@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .count_cumsum import count_cumsum
 from .enums import ActivationType, KernelBackendMoE, is_glu
 from .functional import moe_TC_softmax_topk_layer
 
@@ -303,13 +302,8 @@ class MoE(nn.Module):
         with torch.no_grad():
             sorted_expert_idxs, sorted_scattered_idxs = selected_experts.sort()
 
-        is_num_experts_multiple_of_4 = self.num_experts % 4 == 0
-
-        if is_num_experts_multiple_of_4:
-            expert_frequency, expert_offsets = count_cumsum(selected_experts, self.num_experts, do_cumsum=True)
-        else:
-            expert_frequency = selected_experts.bincount(minlength=self.num_experts).to(torch.int32)
-            expert_offsets = expert_frequency.cumsum(-1).to(torch.int32)
+        expert_frequency = selected_experts.bincount(minlength=self.num_experts).to(torch.int32)
+        expert_offsets = expert_frequency.cumsum(-1).to(torch.int32)
 
         act_func = {
             ActivationType.SWIGLU: _swiglu,

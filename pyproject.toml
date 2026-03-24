@@ -10,7 +10,6 @@ dependencies = [
     "nvidia-cutlass-dsl==4.4.0",
     "torch>=2.7.1,<=2.9.1",
     "quack-kernels==0.2.5",
-    "ninja"
 ]
 
 [project.optional-dependencies]

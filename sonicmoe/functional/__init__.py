@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 from quack.gemm_interface import gemm
 
-from ..count_cumsum import count_cumsum
 from ..enums import ActivationType, is_glu
 from ..quack_utils import gemm_dgated, gemm_gated
 from .backward import (
