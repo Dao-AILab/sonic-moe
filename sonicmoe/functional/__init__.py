@@ -108,6 +108,7 @@ class _UpProjection(torch.autograd.Function):
         activation_type: ActivationType,
         is_inference_mode_enabled: bool,
     ) -> torch.Tensor:
+        torch.cuda.synchronize()
         T, H = x.shape
         I, H, E = w1.shape
         is_glu_activation = is_glu(activation_type)
@@ -172,6 +173,7 @@ class _UpProjection(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, _: None, dz: torch.Tensor):
+        torch.cuda.synchronize()
         is_compiling = torch.compiler.is_compiling()
 
         if not is_compiling:
@@ -275,6 +277,7 @@ class _DownProjection(torch.autograd.Function):
         is_varlen_K: bool,
         activation_type: ActivationType,
     ) -> torch.Tensor:
+        torch.cuda.synchronize()
         TK = y1.size(0)
         H, I, E = w2.shape
 
@@ -331,6 +334,7 @@ class _DownProjection(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
+        torch.cuda.synchronize()
         T = ctx.T
         K = ctx.K
         stream_id = ctx.stream_id
