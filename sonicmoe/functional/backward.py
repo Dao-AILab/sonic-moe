@@ -413,6 +413,7 @@ def _down_projection_backward_act(
         mDS_partial = convert_torch_tensor_to_cute_tensor(ds_partial, (0, 1), 1, 4, 1, stream=stream_id)
 
     dz_tensormaps = _down_projection_backward_act.compile_cache[f"dz-{TENSORMAP}"]
+    torch.cuda.synchronize()
     _down_projection_backward_act.compile_cache[compile_dz_key](
         mDout,
         mW2_trans,
