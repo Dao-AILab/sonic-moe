@@ -18,6 +18,13 @@ from .grouped_gemm import HopperWgmma_MoE_kernel
 
 LIBRARY_NAME = "cutedsl_kernels"
 
+# Number of SMs to reserve for concurrent work (e.g. NCCL communication kernels
+# running on a separate stream when using FSDP).  Persistent kernels assume all
+# launched CTAs are simultaneously active; if NCCL occupies some SMs the tile
+# scheduler can deadlock.  Subtracting headroom from max_active_clusters shrinks
+# the grid so the persistent kernel no longer needs every SM.
+SM_HEADROOM = 24
+
 
 def ceil_div(a: int, b: int):
     return int(math.ceil(a / b))
@@ -304,9 +311,9 @@ class HopperWgmma_MoE_Down_proj_ActGrad_Bwd:
             epi_tile_size=dz_partial_ds_config.epi_tile_size,
             initial_d_epi_stage=dz_partial_ds_config.initial_d_epi_stage,
         )
-        self.max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
+        self.max_active_clusters = max(1, cutlass.utils.HardwareInfo().get_max_active_clusters(
             dz_partial_ds_config.cluster_shape_mnk[0] * dz_partial_ds_config.cluster_shape_mnk[1]
-        )
+        ) - SM_HEADROOM)
 
     @cute.jit
     def __call__(
@@ -392,9 +399,9 @@ class HopperWgmma_MoE_Down_proj_WeightGrad_Bwd:
             epi_tile_size=dw2_config.epi_tile_size,
             initial_d_epi_stage=dw2_config.initial_d_epi_stage,
         )
-        self.max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
+        self.max_active_clusters = max(1, cutlass.utils.HardwareInfo().get_max_active_clusters(
             dw2_config.cluster_shape_mnk[0] * dw2_config.cluster_shape_mnk[1]
-        )
+        ) - SM_HEADROOM)
 
     @cute.jit
     def __call__(self, mDout_trans, mY1S_trans, mDw2, mE_offset, mX_gather, tensormaps, mE_permute_order, stream):
@@ -469,9 +476,9 @@ class HopperWgmma_MoE_Up_proj_ActGrad_Bwd:
             epi_tile_size=dx_config.epi_tile_size,
         )
 
-        self.max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
+        self.max_active_clusters = max(1, cutlass.utils.HardwareInfo().get_max_active_clusters(
             dx_config.cluster_shape_mnk[0] * dx_config.cluster_shape_mnk[1]
-        )
+        ) - SM_HEADROOM)
         self.current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     @cute.jit
@@ -550,9 +557,9 @@ class HopperWgmma_MoE_Up_proj_WeightGrad_Bwd:
             epi_tile_size=dw1_config.epi_tile_size,
         )
 
-        self.max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
+        self.max_active_clusters = max(1, cutlass.utils.HardwareInfo().get_max_active_clusters(
             dw1_config.cluster_shape_mnk[0] * dw1_config.cluster_shape_mnk[1]
-        )
+        ) - SM_HEADROOM)
 
     @cute.jit
     def __call__(self, mX_trans, mDz_trans, mDw1_trans, mE_offset, mX_gather, tensormaps, mE_permute_order, stream):
