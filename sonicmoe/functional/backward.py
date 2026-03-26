@@ -380,6 +380,7 @@ def _down_projection_backward_act(
     compile_dz_key = ("dz", E, H, I, z.dtype, activation_type)
     if compile_dz_key not in _down_projection_backward_act.compile_cache:
         # I don't know why but this sync appears to fix a mysterious initialization bug??
+        torch.cuda.synchronize()
         dz_module = HopperWgmma_MoE_Down_proj_ActGrad_Bwd(E, H, I, ActivationType(activation_type))
         tensormaps = [dz_module.module.generate_tensormap(None, None, None) for _ in range(3)]
 
