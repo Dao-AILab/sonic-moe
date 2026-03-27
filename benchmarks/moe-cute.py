@@ -3,6 +3,7 @@
 # ********************************************************************************
 
 import argparse
+import os
 import random
 import time
 from typing import Tuple, Type
@@ -16,6 +17,9 @@ from triton.testing import do_bench
 from sonicmoe import MoE
 from sonicmoe.enums import ActivationType, is_glu
 from sonicmoe.functional import moe_TC_softmax_topk_layer
+
+
+os.environ["QUACK_PRINT_AUTOTUNING"] = "1"
 
 
 def swiglu(x: torch.Tensor) -> torch.Tensor:

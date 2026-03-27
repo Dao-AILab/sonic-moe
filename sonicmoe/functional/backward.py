@@ -136,8 +136,8 @@ def db1_kernel(
 ):
     Eidx = tl.program_id(0)  # expert id
 
-    E_count_start = tl.load(expert_offset_ptr + Eidx)
-    E_count_end = tl.load(expert_offset_ptr + Eidx + 1)
+    E_count_start = tl.load(expert_offset_ptr + Eidx).to(tl.int64)
+    E_count_end = tl.load(expert_offset_ptr + Eidx + 1).to(tl.int64)
     n_tokens = E_count_end - E_count_start
 
     NUM_I_BLOCKS: tl.constexpr = triton.cdiv(I, BLOCK_I)
@@ -160,7 +160,8 @@ def db1_kernel(
 
             db1_acc += tl.sum(dz, axis=0)  # Sum over BLOCK_TK dimension
 
-        tl.store(db1_ptr + Eidx * I + i_offsets, db1_acc, mask=i_mask)
+        db1_offsets = Eidx.to(tl.int64) * I + i_offsets
+        tl.store(db1_ptr + db1_offsets, db1_acc, mask=i_mask)
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_backward_act", mutates_args={"dx_expanded", "db1"})
