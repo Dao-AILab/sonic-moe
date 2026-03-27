@@ -66,7 +66,6 @@ def _up_projection_forward(
         "swiglu",
         "geglu",
     ), f"QuACK gemm_gated only supports glu activations, got {activation_type}"
-    assert b1 is None, f"QuACK gemm_gated does not support bias yet. We will add it later."
     gemm_gated(
         x,
         w1.permute(2, 1, 0),
@@ -76,6 +75,7 @@ def _up_projection_forward(
         preact_out=z,
         postact_out=y1,
         store_preact=(not is_inference_mode_enabled),
+        bias=b1,
     )
 
 
@@ -90,8 +90,7 @@ def _down_projection_forward(
     b2: torch.Tensor | None,
     expert_frequency_offset: torch.Tensor,
 ) -> None:
-    assert b2 is None, f"QuACK gemm_gated does not support bias yet. We will add it later."
-    gemm(y1, w2.permute(2, 1, 0), out=y2, cu_seqlens_m=expert_frequency_offset)
+    gemm(y1, w2.permute(2, 1, 0), out=y2, cu_seqlens_m=expert_frequency_offset, bias=b2)
 
 
 _down_projection_forward.compile_cache = {}

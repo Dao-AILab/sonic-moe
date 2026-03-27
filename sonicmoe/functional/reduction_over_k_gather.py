@@ -11,9 +11,6 @@ import triton.language as tl
 from ..utils import get_powers_of_2
 
 
-### This triton impl is equivalent as the cute-dsl impl shown above,
-# and also achieves similar memory bandwidth on H100 for large K and H.
-# However, for small K and H, this impl is better by autotuning so we use it as the default.
 def _get_triton_autotune_configs() -> list[triton.Config]:
     configs = []
     for BLOCK_H in get_powers_of_2(256, 4096):

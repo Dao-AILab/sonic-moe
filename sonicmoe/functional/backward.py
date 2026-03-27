@@ -136,8 +136,8 @@ def db1_kernel(
 ):
     Eidx = tl.program_id(0)  # expert id
 
-    E_count_start = tl.load(expert_offset_ptr + Eidx)
-    E_count_end = tl.load(expert_offset_ptr + Eidx + 1)
+    E_count_start = tl.load(expert_offset_ptr + Eidx).to(tl.int64)
+    E_count_end = tl.load(expert_offset_ptr + Eidx + 1).to(tl.int64)
     n_tokens = E_count_end - E_count_start
 
     NUM_I_BLOCKS: tl.constexpr = triton.cdiv(I, BLOCK_I)
@@ -160,7 +160,8 @@ def db1_kernel(
 
             db1_acc += tl.sum(dz, axis=0)  # Sum over BLOCK_TK dimension
 
-        tl.store(db1_ptr + Eidx * I + i_offsets, db1_acc, mask=i_mask)
+        db1_offsets = Eidx.to(tl.int64) * I + i_offsets
+        tl.store(db1_ptr + db1_offsets, db1_acc, mask=i_mask)
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_backward_act", mutates_args={"dx_expanded", "db1"})
@@ -233,7 +234,6 @@ def _down_projection_backward_act(
         "swiglu",
         "geglu",
     ), f"QuACK gemm_gated only supports glu activations, got {activation_type}"
-    assert b2 is None, f"QuACK gemm_gated does not support bias yet. We will add it later."
 
     s = topk_scores[s_scatter_idx]
     _, _, ds_scattered = gemm_dgated(
@@ -250,6 +250,42 @@ def _down_projection_backward_act(
         dynamic_scheduler=False,
     )
     ds[s_scatter_idx] = ds_scattered
+
+    if db2 is None:
+        ds[s_scatter_idx] = ds_scattered
+    else:
+        H = w2.size(0)
+        E = expert_frequency_offset.size(0) - 1
+        TK = x_gather_idx.size(0)
+
+        old_ds_partial = torch.empty(TK, 1, device=ds_scattered.device, dtype=ds_scattered.dtype)
+        old_ds_partial[s_scatter_idx, 0] = ds_scattered
+
+        BLOCK_H = min(triton.next_power_of_2(H), 2048)
+        NUM_H_BLOCKS = triton.cdiv(H, BLOCK_H)
+        new_ds_partial = torch.empty(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
+
+        db2_and_ds_kernel[(E, NUM_H_BLOCKS)](
+            dout,
+            topk_scores,
+            new_ds_partial,
+            old_ds_partial,
+            b2,
+            db2,
+            x_gather_idx,
+            s_scatter_idx,
+            expert_frequency_offset,
+            H,
+            E,
+            1,  # OLD_DS_PARTIAL_N = 1
+            BLOCK_H=BLOCK_H,
+            BLOCK_OLD_DS_PARTIAL_N=1,
+        )
+
+        if NUM_H_BLOCKS == 1:
+            ds.copy_(new_ds_partial.view(-1).to(dtype=ds.dtype))
+        else:
+            ds.copy_(new_ds_partial.sum(dim=-1, dtype=ds.dtype))
 
 
 _down_projection_backward_act.compile_cache = {}

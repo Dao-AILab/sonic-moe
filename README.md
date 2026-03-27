@@ -5,7 +5,7 @@ Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # SonicMoE: Accelerating MoE with IO and Tile-aware Optimizations
 [![arXiv](https://img.shields.io/badge/arXiv-2512.14080-b31b1b.svg)](https://arxiv.org/abs/2512.14080)
 
-**SonicMoE** is a simple but blazing-fast Mixture-of-Experts (MoE) implementation optimized for NVIDIA Hopper and Blackwell (beta stage) architecture GPUs. It mainly leverages [CuTeDSL](https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) and [Triton](https://triton-lang.org/main/getting-started/tutorials/index.html) to deliver state-of-the-art performance through IO-aware optimizations. These 2 figures provide an overview of activation memory usage and training throughput. 
+**SonicMoE** is a simple but blazing-fast Mixture-of-Experts (MoE) implementation optimized for NVIDIA Hopper and Blackwell architecture GPUs. It mainly leverages [CuTeDSL](https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) and [Triton](https://triton-lang.org/main/getting-started/tutorials/index.html) to deliver state-of-the-art performance through IO-aware optimizations. These 2 figures provide an overview of activation memory usage and training throughput on Hopper GPUs (H100) and Blackwell GPUs (B300). SonicMoE heavily adopts the GEMM kernel designs on the [QuACK](https://github.com/Dao-AILab/quack/tree/main) repository which is further inspired by [CUTLASS](https://github.com/Dao-AILab/quack/tree/main).
 
 ![image](./assets/mem.png)
 ![image](./assets/tput.png)
@@ -14,9 +14,9 @@ Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 
 ### Prerequisites
 
-- NVIDIA Hopper GPUs (H100, H200, etc.), Blackwell GPUs (GB200, B200). **For B300, please manually upgrade the triton version to 3.6.0**. We need to manually set environment variable `USE_QUACK_GEMM=1` to use the Blackwell kernels.
+- NVIDIA Hopper GPUs (H100, H200, etc.), Blackwell GPUs (GB200, B200, B300). **For B300 GPUs, please manually upgrade the triton version to 3.6.0 after installing PyTorch**. 
 - CUDA 12.9+ (13.0+ for B300 GPUs)
-- Python 3.12+
+- Python 3.12+ recommended
 - PyTorch 2.7+ (2.9.1 recommended)
 
 ### Install from pip
@@ -72,14 +72,9 @@ make test
 ```
 
 ### Example usage
-- SonicMoE with TC top-K choice routing (SwiGLU activation) on Hopper GPUs
+- SonicMoE with TC top-K choice routing (SwiGLU activation) on Hopper and Blackwell GPUs
 ```python
 python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --activation swiglu
-```
-
-- SonicMoE with TC top-K token-choice routing (SwiGLU activation) on Blackwell GPUs. **This feature is currently in beta and supports only SwiGLU.** Full Blackwell kernel coverage will be available in the next release.
-```python
-USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --activation swiglu
 ```
 
 - SonicMoE with token rounding routing (SwiGLU activation)

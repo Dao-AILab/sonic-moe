@@ -20,7 +20,6 @@ from .backward import (
 )
 from .forward import _down_projection_forward, _router_forward, _softmax_topk_fwd, _up_projection_forward
 from .triton_kernels import TC_topk_router_metadata_triton
-from .utils import enable_quack_gemm, is_using_quack_gemm
 
 
 def general_routing_router_metadata(
@@ -373,10 +372,8 @@ def moe_TC_softmax_topk_layer(
     if type(activation_type) == str:
         activation_type = ActivationType(activation_type)
 
-    if is_using_quack_gemm():
-        assert not torch.compiler.is_compiling()
-        assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
-        assert b1 is None and b2 is None
+    assert not torch.compiler.is_compiling()
+    assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
     y1, z = _UpProjection.apply(
         x,
@@ -453,10 +450,8 @@ def moe_general_routing_inputs(
         num_activated_expert_per_token_offset,
     ) = general_routing_router_metadata(router_scores, token_indices, expert_indices, T, E)
 
-    if is_using_quack_gemm():
-        assert not torch.compiler.is_compiling()
-        assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
-        assert b1 is None and b2 is None
+    assert not torch.compiler.is_compiling()
+    assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
     y1, z = _UpProjection.apply(
         x,
