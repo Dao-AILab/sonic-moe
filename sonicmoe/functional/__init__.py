@@ -70,6 +70,7 @@ class _UpProjection(torch.autograd.Function):
         is_varlen_K: bool,
         activation_type: ActivationType,
         is_inference_mode_enabled: bool,
+        is_concatenated_gate_up: bool = False,
     ) -> torch.Tensor:
         T, H = x.shape
         I, H, E = w1.shape
@@ -105,6 +106,7 @@ class _UpProjection(torch.autograd.Function):
                 activation_type=activation_type.value,
                 is_glu_activation=is_glu_activation,
                 is_inference_mode_enabled=is_inference_mode_enabled,
+                is_concatenated_gate_up=is_concatenated_gate_up,
             )
 
         ctx.T = T
@@ -115,6 +117,7 @@ class _UpProjection(torch.autograd.Function):
         ctx.I = I
         ctx.is_varlen_K = is_varlen_K
         ctx.is_glu_activation = is_glu_activation
+        ctx.is_concatenated_gate_up = is_concatenated_gate_up
         ctx.stream_id = stream_id
 
         ctx.save_for_backward(
@@ -146,6 +149,7 @@ class _UpProjection(torch.autograd.Function):
         K = ctx.K
         H = ctx.H
         is_glu_activation = ctx.is_glu_activation
+        is_concatenated_gate_up = ctx.is_concatenated_gate_up
         is_varlen_K = ctx.is_varlen_K
         stream_id = ctx.stream_id
 
@@ -190,6 +194,7 @@ class _UpProjection(torch.autograd.Function):
                 s_scatter_idx=s_scatter_idx,
                 is_glu_activation=is_glu_activation,
                 stream_id=stream_id,
+                is_concatenated_gate_up=is_concatenated_gate_up,
             )
 
             _up_projection_backward_weight(
@@ -201,6 +206,7 @@ class _UpProjection(torch.autograd.Function):
                 x_gather_idx=x_gather_idx,
                 is_glu_activation=is_glu_activation,
                 stream_id=stream_id,
+                is_concatenated_gate_up=is_concatenated_gate_up,
             )
 
         dx_reduced = torch.empty(T, H, dtype=dz.dtype, device=dz.device)
@@ -215,7 +221,7 @@ class _UpProjection(torch.autograd.Function):
             is_varlen_K=is_varlen_K,
         )
 
-        return dx_reduced, dw1, db1, *[None] * 12
+        return dx_reduced, dw1, db1, *[None] * 13
 
 
 class _DownProjection(torch.autograd.Function):
@@ -486,6 +492,7 @@ def moe_general_routing_inputs(
     stream_id: int,
     activation_type: ActivationType,
     is_inference_mode_enabled: bool = False,
+    is_concatenated_gate_up: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
@@ -531,6 +538,7 @@ def moe_general_routing_inputs(
         True,  # is_varlen_K
         activation_type,
         is_inference_mode_enabled,
+        is_concatenated_gate_up,
     )
 
     o = _DownProjection.apply(

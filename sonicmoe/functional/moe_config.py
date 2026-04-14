@@ -37,8 +37,9 @@ class HopperGEMMConfig:
 
 
 class HopperWgmma_MoE_Up_proj_Fwd:
-    def __init__(self, E: int, H: int, I: int, activation_type: ActivationType, inference_mode=False):
+    def __init__(self, E: int, H: int, I: int, activation_type: ActivationType, inference_mode=False, is_concatenated_gate_up: bool = False):
         super().__init__()
+        self.is_concatenated_gate_up = is_concatenated_gate_up
         is_glu_activation = is_glu(activation_type)
         if is_glu_activation:
             assert (
@@ -127,6 +128,15 @@ class HopperWgmma_MoE_Up_proj_Fwd:
     def __call__(
         self, mX, mW1, mZ, mY1, mB1, mE_offset, mX_gather, mD_tensormap, mY1_tensormap, mE_permute_order, stream
     ):
+        if const_expr(self.is_concatenated_gate_up):
+            half_N = mW1.shape[0] // 2
+            mW1 = cute.make_tensor(
+                mW1.iterator,
+                cute.make_layout(
+                    ((2, half_N), mW1.shape[1], mW1.shape[2]),
+                    stride=((half_N * mW1.stride[0], mW1.stride[0]), mW1.stride[1], mW1.stride[2]),
+                ),
+            )
         return self.module(
             mX,
             mW1,
@@ -424,7 +434,8 @@ class HopperWgmma_MoE_Down_proj_WeightGrad_Bwd:
 
 
 class HopperWgmma_MoE_Up_proj_ActGrad_Bwd:
-    def __init__(self, E: int, H: int, I: int, is_glu_activation: bool):
+    def __init__(self, E: int, H: int, I: int, is_glu_activation: bool, is_concatenated_gate_up: bool = False):
+        self.is_concatenated_gate_up = is_concatenated_gate_up
         super().__init__()
         if is_glu_activation:
             assert (
@@ -478,6 +489,15 @@ class HopperWgmma_MoE_Up_proj_ActGrad_Bwd:
     def __call__(
         self, mDz, mW1_trans, mDx_expanded, mE_offset, mX_gather, mS_scatter, tensormaps, mE_permute_order, stream
     ):
+        if const_expr(self.is_concatenated_gate_up):
+            half_N = mW1_trans.shape[1] // 2
+            mW1_trans = cute.make_tensor(
+                mW1_trans.iterator,
+                cute.make_layout(
+                    (mW1_trans.shape[0], (2, half_N), mW1_trans.shape[2]),
+                    stride=(mW1_trans.stride[0], (half_N * mW1_trans.stride[1], mW1_trans.stride[1]), mW1_trans.stride[2]),
+                ),
+            )
         return self.module(
             mDz,
             mW1_trans,
@@ -504,7 +524,8 @@ class HopperWgmma_MoE_Up_proj_ActGrad_Bwd:
 
 
 class HopperWgmma_MoE_Up_proj_WeightGrad_Bwd:
-    def __init__(self, E: int, H: int, I: int, is_glu_activation: bool):
+    def __init__(self, E: int, H: int, I: int, is_glu_activation: bool, is_concatenated_gate_up: bool = False):
+        self.is_concatenated_gate_up = is_concatenated_gate_up
         super().__init__()
         if is_glu_activation:
             assert (
@@ -556,6 +577,15 @@ class HopperWgmma_MoE_Up_proj_WeightGrad_Bwd:
 
     @cute.jit
     def __call__(self, mX_trans, mDz_trans, mDw1_trans, mE_offset, mX_gather, tensormaps, mE_permute_order, stream):
+        if const_expr(self.is_concatenated_gate_up):
+            half_N = mDw1_trans.shape[1] // 2
+            mDw1_trans = cute.make_tensor(
+                mDw1_trans.iterator,
+                cute.make_layout(
+                    (mDw1_trans.shape[0], (2, half_N), mDw1_trans.shape[2]),
+                    stride=(mDw1_trans.stride[0], (half_N * mDw1_trans.stride[1], mDw1_trans.stride[1]), mDw1_trans.stride[2]),
+                ),
+            )
         return self.module(
             mX_trans,
             mDz_trans,
