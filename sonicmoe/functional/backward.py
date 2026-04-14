@@ -230,8 +230,7 @@ def _up_projection_backward_act(
 
     compile_dx_key = ("dx", E, H, I, is_glu_activation, dx_expanded.dtype, is_concatenated_gate_up)
     if compile_dx_key not in _up_projection_backward_act.compile_cache:
-        dx_module = HopperWgmma_MoE_Up_proj_ActGrad_Bwd(E, H, I, is_glu_activation,
-                                                         is_concatenated_gate_up=is_concatenated_gate_up)
+        dx_module = HopperWgmma_MoE_Up_proj_ActGrad_Bwd(E, H, I, is_glu_activation, is_concatenated_gate_up=is_concatenated_gate_up)
         tensormaps = [dx_module.module.generate_tensormap(None, None, None) for _ in range(2)]
         _up_projection_backward_act.compile_cache[compile_dx_key] = cute.compile(
             dx_module,
@@ -297,8 +296,7 @@ def _up_projection_backward_weight(
 
     compile_dw1_key = ("dw1", E, H, I, is_glu_activation, x.dtype, is_concatenated_gate_up)
     if compile_dw1_key not in _up_projection_backward_weight.compile_cache:
-        dw1_module = HopperWgmma_MoE_Up_proj_WeightGrad_Bwd(E, H, I, is_glu_activation,
-                                                              is_concatenated_gate_up=is_concatenated_gate_up)
+        dw1_module = HopperWgmma_MoE_Up_proj_WeightGrad_Bwd(E, H, I, is_glu_activation, is_concatenated_gate_up=is_concatenated_gate_up)
         tensormaps = [dw1_module.module.generate_tensormap(None, None, None) for _ in range(1)]
         _up_projection_backward_weight.compile_cache[compile_dw1_key] = cute.compile(
             dw1_module,
