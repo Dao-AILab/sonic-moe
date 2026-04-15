@@ -145,6 +145,18 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         default=False,
     )
+    parser.add_argument(
+        "--softmax_then_topk",
+        action="store_true",
+        default=False,
+        help="Use softmax-then-topk routing (Qwen3/DeepSeek style) instead of topk-then-softmax",
+    )
+    parser.add_argument(
+        "--norm_topk_probs",
+        action="store_true",
+        default=False,
+        help="Renormalize topk probs to sum to 1 (only for softmax-then-topk)",
+    )
     args = parser.parse_args()
 
     if len(args.thiek) != 5:
@@ -166,6 +178,8 @@ def run(
     skip_test: Type[bool],
     add_bias: Type[bool],
     activation: Type[str],
+    is_topk_then_softmax: bool = True,
+    norm_topk_probs: bool = False,
     **kwargs,
 ):
     torch_dtype = {cutlass.BFloat16: torch.bfloat16, cutlass.Float16: torch.float16}[dtype]
@@ -174,7 +188,8 @@ def run(
     # Unpack parameters
     T, H, I, E, K = thiek
     TK = T * K
-    print(f"T {T}, I {I}, H {H}, E {E}, K {K}")
+    routing_mode = "topk_then_softmax" if is_topk_then_softmax else f"softmax_then_topk (norm={norm_topk_probs})"
+    print(f"T {T}, I {I}, H {H}, E {E}, K {K}, routing: {routing_mode}")
 
     random.seed(1111)
     torch.manual_seed(1111)
@@ -207,7 +222,17 @@ def run(
     # # Ref check
     if not skip_test:
         o, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
-            x, router_w, w1.permute(1, 2, 0), b1, w2.permute(1, 2, 0), b2, moe.top_k, moe.stream_id, activation
+            x,
+            router_w,
+            w1.permute(1, 2, 0),
+            b1,
+            w2.permute(1, 2, 0),
+            b2,
+            moe.top_k,
+            moe.stream_id,
+            activation,
+            is_topk_then_softmax=is_topk_then_softmax,
+            norm_topk_probs=norm_topk_probs,
         )
         if add_bias:
             dx, dw1, db1, dw2, db2, drouter_w = torch.autograd.grad(
@@ -217,8 +242,15 @@ def run(
             dx, dw1, dw2, drouter_w = torch.autograd.grad(o, [x, w1, w2, router_w], grad_outputs=dout)
 
         logits = F.linear(x, router_w)
-        ref_topk_logits, ref_topk_experts = logits.topk(K, dim=-1)
-        ref_topk_scores = ref_topk_logits.softmax(dim=-1, dtype=torch.float32)
+
+        if is_topk_then_softmax:
+            ref_topk_logits, ref_topk_experts = logits.topk(K, dim=-1)
+            ref_topk_scores = ref_topk_logits.softmax(dim=-1, dtype=torch.float32)
+        else:
+            ref_probs = logits.softmax(dim=-1, dtype=torch.float32)
+            ref_topk_scores, ref_topk_experts = ref_probs.topk(K, dim=-1)
+            if norm_topk_probs:
+                ref_topk_scores = ref_topk_scores / ref_topk_scores.sum(dim=-1, keepdim=True)
 
         ref_topk_expert_idx, ref_s_scatter_idx = ref_topk_experts.flatten().sort()
         ref_topk_expert_idx, ref_s_scatter_idx = ref_topk_expert_idx.int(), ref_s_scatter_idx.int()
@@ -308,6 +340,8 @@ def run(
         moe.stream_id,
         activation,
         True,
+        is_topk_then_softmax=is_topk_then_softmax,
+        norm_topk_probs=norm_topk_probs,
     )
 
     cuda_graph = torch.cuda.CUDAGraph()
@@ -332,6 +366,8 @@ def run(
                 moe.stream_id,
                 activation,
                 True,
+                is_topk_then_softmax=is_topk_then_softmax,
+                norm_topk_probs=norm_topk_probs,
             )
 
     moe.stream_id = old_stream_id  # restore
@@ -356,6 +392,8 @@ def run(
             moe.stream_id,
             activation,
             True,
+            is_topk_then_softmax=is_topk_then_softmax,
+            norm_topk_probs=norm_topk_probs,
         )
         return o
 
@@ -377,6 +415,8 @@ def run(
             moe.stream_id,
             activation,
             False,
+            is_topk_then_softmax=is_topk_then_softmax,
+            norm_topk_probs=norm_topk_probs,
         )
         return o
 
@@ -408,6 +448,8 @@ def run(
             moe.stream_id,
             activation,
             False,
+            is_topk_then_softmax=is_topk_then_softmax,
+            norm_topk_probs=norm_topk_probs,
         )
         o.backward(dout, retain_graph=True)
         x.grad = w1.grad = w2.grad = router_w.grad = None
@@ -428,5 +470,13 @@ def run(
 
 if __name__ == "__main__":
     args = parse_arguments()
-    run(args.thiek, args.dtype, args.skip_test, args.add_bias, args.activation)
+    run(
+        args.thiek,
+        args.dtype,
+        args.skip_test,
+        args.add_bias,
+        args.activation,
+        is_topk_then_softmax=(not args.softmax_then_topk),
+        norm_topk_probs=args.norm_topk_probs,
+    )
     print("PASS")

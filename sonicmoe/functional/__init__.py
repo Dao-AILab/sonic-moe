@@ -12,42 +12,64 @@ from ..enums import ActivationType, is_glu
 from .backward import (
     _down_projection_backward_act,
     _down_projection_backward_weight,
-    _softmax_topk_bwd,
     _token_broadcast_backward,
+    _topk_softmax_bwd,
     _up_projection_backward_act,
     _up_projection_backward_weight,
 )
-from .forward import _down_projection_forward, _router_forward, _softmax_topk_fwd, _up_projection_forward
+from .forward import _down_projection_forward, _router_forward, _topk_softmax_fwd, _up_projection_forward
 from .triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
 
 
 class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, router_logits: torch.Tensor, E: int, K: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        ctx, router_logits: torch.Tensor, E: int, K: int, is_topk_then_softmax: bool, norm_topk_probs: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         T = router_logits.size(0)
 
-        # change this to router_logits.dtype (bfloat16) increase another 5 tflops at fwd at the cost of numerical accuracy
         topk_router_score = torch.empty(T, K, dtype=torch.float32, device=router_logits.device)
         topk_router_indices = torch.empty(T, K, dtype=torch.int32, device=router_logits.device)
 
-        _softmax_topk_fwd(router_logits, topk_router_score, topk_router_indices, E, K)
+        _topk_softmax_fwd(
+            router_logits,
+            topk_router_score,
+            topk_router_indices,
+            E,
+            K,
+            is_topk_then_softmax=is_topk_then_softmax,
+            norm_topk_probs=norm_topk_probs,
+        )
 
-        ctx.save_for_backward(topk_router_score, topk_router_indices)
+        # Save router_logits for softmax→topk backward (recompute full softmax).
+        # For topk→softmax it's unused but save unconditionally for simplicity.
+        ctx.save_for_backward(topk_router_score, topk_router_indices, router_logits)
         ctx.E = E
         ctx.dtype = router_logits.dtype
+        ctx.is_topk_then_softmax = is_topk_then_softmax
+        ctx.norm_topk_probs = norm_topk_probs
 
         return topk_router_score, topk_router_indices
 
     @staticmethod
-    def backward(ctx, dtopk_score: torch.Tensor, _: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def backward(ctx, dtopk_score: torch.Tensor, _: torch.Tensor):
         T, K = dtopk_score.size()
-
-        topk_router_score, topk_router_indices = ctx.saved_tensors
+        topk_router_score, topk_router_indices, router_logits = ctx.saved_tensors
         dlogits = torch.zeros(T, ctx.E, dtype=ctx.dtype, device=topk_router_score.device)
 
-        _softmax_topk_bwd(dlogits, None, dtopk_score, topk_router_score, topk_router_indices, K)
+        _topk_softmax_bwd(
+            dlogits,
+            None,
+            dtopk_score,
+            topk_router_score,
+            topk_router_indices,
+            K,
+            router_logits=router_logits,
+            is_topk_then_softmax=ctx.is_topk_then_softmax,
+            norm_topk_probs=ctx.norm_topk_probs,
+        )
 
-        return dlogits, None, None
+        return dlogits, None, None, None, None
 
 
 class _UpProjection(torch.autograd.Function):
@@ -64,7 +86,7 @@ class _UpProjection(torch.autograd.Function):
         s_scatter_idx: torch.Tensor,
         s_reverse_scatter_idx: torch.Tensor,
         num_activated_expert_per_token_offset: torch.Tensor,
-        is_varlen_K: bool,
+        is_each_token_has_variable_activated_experts: bool,
         activation_type: ActivationType,
         is_inference_mode_enabled: bool,
     ) -> torch.Tensor:
@@ -75,8 +97,8 @@ class _UpProjection(torch.autograd.Function):
             I //= 2
         TK = total_expert_freq
 
-        y1 = torch.empty(TK, I, dtype=x.dtype, device=x.device)
-        z = (
+        a = torch.empty(TK, I, dtype=x.dtype, device=x.device)
+        h = (
             torch.empty(TK, (2 * I if is_glu_activation else I), dtype=x.dtype, device=x.device)
             if (not is_inference_mode_enabled)
             else None
@@ -85,13 +107,12 @@ class _UpProjection(torch.autograd.Function):
         _up_projection_forward(
             x=x,
             w1=w1,
-            z=z,
-            y1=y1,
+            h=h,
+            a=a,
             b1=b1,
             expert_frequency_offset=expert_frequency_offset,
             x_gather_idx=x_gather_idx,
             activation_type=activation_type.value,
-            is_glu_activation=is_glu_activation,
             is_inference_mode_enabled=is_inference_mode_enabled,
         )
 
@@ -101,7 +122,7 @@ class _UpProjection(torch.autograd.Function):
         ctx.K = K
         ctx.H = H
         ctx.I = I
-        ctx.is_varlen_K = is_varlen_K
+        ctx.is_each_token_has_variable_activated_experts = is_each_token_has_variable_activated_experts
         ctx.is_glu_activation = is_glu_activation
 
         ctx.save_for_backward(
@@ -115,20 +136,20 @@ class _UpProjection(torch.autograd.Function):
             num_activated_expert_per_token_offset,
         )
 
-        ctx.mark_non_differentiable(y1)
+        ctx.mark_non_differentiable(a)
         ctx.set_materialize_grads(False)
 
-        return y1, z
+        return a, h
 
     @staticmethod
-    def backward(ctx, _: None, dz: torch.Tensor):
+    def backward(ctx, _: None, dh: torch.Tensor):
         T = ctx.T
         TK = ctx.TK
         E = ctx.E
         K = ctx.K
         H = ctx.H
         is_glu_activation = ctx.is_glu_activation
-        is_varlen_K = ctx.is_varlen_K
+        is_each_token_has_variable_activated_experts = ctx.is_each_token_has_variable_activated_experts
 
         (
             x,
@@ -141,14 +162,14 @@ class _UpProjection(torch.autograd.Function):
             num_activated_expert_per_token_offset,
         ) = ctx.saved_tensors
 
-        dx_expanded = torch.empty(TK, H, dtype=dz.dtype, device=dz.device)
+        dx_expanded = torch.empty(TK, H, dtype=dh.dtype, device=dh.device)
         dw1 = torch.empty_like(w1)
         db1 = None if b1 is None else torch.empty_like(b1)
 
         _up_projection_backward_act(
             w1=w1,
             dx_expanded=dx_expanded,
-            dz=dz,
+            dh=dh,
             db1=db1,
             expert_frequency_offset=expert_frequency_offset,
             is_glu_activation=is_glu_activation,
@@ -157,22 +178,22 @@ class _UpProjection(torch.autograd.Function):
         _up_projection_backward_weight(
             x=x,
             dw1=dw1,
-            dz=dz,
+            dh=dh,
             expert_frequency_offset=expert_frequency_offset,
             x_gather_idx=x_gather_idx,
             is_glu_activation=is_glu_activation,
         )
 
-        dx_reduced = torch.empty(T, H, dtype=dz.dtype, device=dz.device)
+        dx_reduced = torch.empty(T, H, dtype=dh.dtype, device=dh.device)
 
         _token_broadcast_backward(
             dx_reduced=dx_reduced,
             dx_expanded=dx_expanded,
             s_reverse_scatter_idx=s_reverse_scatter_idx,
             num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
-            varlen_K_max=(E if is_varlen_K else K),
+            varlen_K_max=(E if is_each_token_has_variable_activated_experts else K),
             H=H,
-            is_varlen_K=is_varlen_K,
+            is_varlen_K=is_each_token_has_variable_activated_experts,
         )
 
         return dx_reduced, dw1, db1, *[None] * 12
@@ -182,8 +203,8 @@ class _DownProjection(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        y1: torch.Tensor,
-        z: torch.Tensor,
+        a: torch.Tensor,
+        h: torch.Tensor,
         w2: torch.Tensor,
         b2: torch.Tensor | None,
         topk_scores: torch.Tensor,
@@ -197,24 +218,24 @@ class _DownProjection(torch.autograd.Function):
         is_varlen_K: bool,
         activation_type: ActivationType,
     ) -> torch.Tensor:
-        TK = y1.size(0)
+        TK = a.size(0)
         H, I, E = w2.shape
 
-        y2 = torch.empty(TK, H, dtype=y1.dtype, device=y1.device)
+        y = torch.empty(TK, H, dtype=a.dtype, device=a.device)
 
         _down_projection_forward(
             w2=w2,
-            y1=y1,
-            y2=y2,
+            a=a,
+            y=y,
             b2=b2,
             expert_frequency_offset=expert_frequency_offset,
         )
 
-        o = torch.empty(T, H, device=y1.device, dtype=y1.dtype)
+        o = torch.empty(T, H, device=a.device, dtype=a.dtype)
         topk_scores = topk_scores.view(-1)
 
         _router_forward(
-            y2=y2,
+            y=y,
             o=o,
             topk_scores=topk_scores,
             s_reverse_scatter_idx=s_reverse_scatter_idx,
@@ -230,7 +251,7 @@ class _DownProjection(torch.autograd.Function):
         ctx.activation_type = activation_type
 
         ctx.save_for_backward(
-            z,
+            h,
             w2,
             b2,
             topk_scores,
@@ -249,7 +270,7 @@ class _DownProjection(torch.autograd.Function):
         activation_type = ctx.activation_type
 
         (
-            z,
+            h,
             w2,
             b2,
             topk_scores,
@@ -260,23 +281,23 @@ class _DownProjection(torch.autograd.Function):
 
         dw2 = torch.empty_like(w2)
         db2 = None if b2 is None else torch.empty_like(b2)
-        dz = torch.empty_like(z)
+        dh = torch.empty_like(h)
 
         I = w2.size(1)
         TK = x_gather_idx.size(0)
 
-        y1s = torch.empty(TK, I, dtype=z.dtype, device=z.device)
+        a_prime = torch.empty(TK, I, dtype=h.dtype, device=h.device)
         ds = torch.empty_like(topk_scores)
 
         _down_projection_backward_act(
             dout=dout,
-            z=z,
+            h=h,
             w2=w2,
-            dz=dz,
+            dh=dh,
             ds=ds,
             b2=b2,
             db2=db2,
-            y1s=y1s,
+            a_prime=a_prime,
             topk_scores=topk_scores,
             expert_frequency_offset=expert_frequency_offset,
             x_gather_idx=x_gather_idx,
@@ -286,7 +307,7 @@ class _DownProjection(torch.autograd.Function):
 
         _down_projection_backward_weight(
             dout=dout,
-            y1s=y1s,
+            a_prime=a_prime,
             dw2=dw2,
             expert_frequency_offset=expert_frequency_offset,
             x_gather_idx=x_gather_idx,
@@ -296,7 +317,7 @@ class _DownProjection(torch.autograd.Function):
         if not is_varlen_K:
             ds = ds.view(T, K)
 
-        return None, dz, dw2, db2, ds, *[None] * 10
+        return None, dh, dw2, db2, ds, *[None] * 10
 
 
 def moe_TC_softmax_topk_layer(
@@ -310,13 +331,17 @@ def moe_TC_softmax_topk_layer(
     stream_id: int,
     activation_type: ActivationType | str = ActivationType.SWIGLU,
     is_inference_mode_enabled: bool = False,
+    is_topk_then_softmax: bool = True,
+    norm_topk_probs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
     ), "b1 and b2 has to be None or not None at the same time!"
     E = router_w.size(0)
     router_logits = F.linear(x, router_w)
-    topk_scores, topk_indices = TC_Softmax_Topk_Router_Function.apply(router_logits, E, K)
+    topk_scores, topk_indices = TC_Softmax_Topk_Router_Function.apply(
+        router_logits, E, K, is_topk_then_softmax, norm_topk_probs
+    )
 
     T, K = topk_indices.size()
     TK = T * K
@@ -338,7 +363,7 @@ def moe_TC_softmax_topk_layer(
     assert not torch.compiler.is_compiling()
     assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
-    y1, z = _UpProjection.apply(
+    a, h = _UpProjection.apply(
         x,
         w1,
         b1,
@@ -349,14 +374,14 @@ def moe_TC_softmax_topk_layer(
         s_scatter_idx,
         s_reverse_scatter_idx,
         None,
-        False,  # is_varlen_K
+        False,  # is_each_token_has_variable_activated_expert
         activation_type,
         is_inference_mode_enabled,
     )
 
     o = _DownProjection.apply(
-        y1,
-        z,
+        a,
+        h,
         w2,
         b2,
         topk_scores,
@@ -367,7 +392,7 @@ def moe_TC_softmax_topk_layer(
         s_scatter_idx,
         s_reverse_scatter_idx,
         None,
-        False,  # is_varlen_K
+        False,  # is_each_token_has_variable_activated_expert
         activation_type,
     )
 
@@ -406,6 +431,9 @@ def moe_general_routing_inputs(
     E = w2.size(-1)
     device = router_scores.device
 
+    if router_scores.dtype != torch.float32:
+        router_scores = router_scores.float()
+
     s_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
     s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
     expert_frequency = torch.empty(E, dtype=torch.int32, device=device)
@@ -429,7 +457,7 @@ def moe_general_routing_inputs(
     assert not torch.compiler.is_compiling()
     assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
-    y1, z = _UpProjection.apply(
+    a, h = _UpProjection.apply(
         x,
         w1,
         b1,
@@ -440,14 +468,14 @@ def moe_general_routing_inputs(
         s_scatter_idx,
         s_reverse_scatter_idx,
         num_activated_expert_per_token_offset,
-        True,  # is_varlen_K
+        True,  # is_each_token_has_variable_activated_expert
         activation_type,
         is_inference_mode_enabled,
     )
 
     o = _DownProjection.apply(
-        y1,
-        z,
+        a,
+        h,
         w2,
         b2,
         router_scores,
@@ -458,7 +486,7 @@ def moe_general_routing_inputs(
         s_scatter_idx,
         s_reverse_scatter_idx,
         num_activated_expert_per_token_offset,
-        True,  # is_varlen_K
+        True,  # is_each_token_has_variable_activated_expert
         activation_type,
     )
 

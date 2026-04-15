@@ -168,7 +168,7 @@ def db1_kernel(
 def _up_projection_backward_act(
     w1: torch.Tensor,
     dx_expanded: torch.Tensor,
-    dz: torch.Tensor,
+    dh: torch.Tensor,
     db1: torch.Tensor | None,
     expert_frequency_offset: torch.Tensor,
     is_glu_activation: bool,
@@ -177,11 +177,11 @@ def _up_projection_backward_act(
     if is_glu_activation:
         I //= 2
 
-    gemm(dz, w1.permute(2, 0, 1), cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False, out=dx_expanded)
+    gemm(dh, w1.permute(2, 0, 1), cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False, out=dx_expanded)
 
     # db1 computation
     if db1 is not None:
-        db1_kernel[(E,)](dz, db1, expert_frequency_offset, (2 * I if is_glu_activation else I), E)
+        db1_kernel[(E,)](dh, db1, expert_frequency_offset, (2 * I if is_glu_activation else I), E)
 
 
 _up_projection_backward_act.compile_cache = {}
@@ -191,7 +191,7 @@ _up_projection_backward_act.compile_cache = {}
 def _up_projection_backward_weight(
     x: torch.Tensor,
     dw1: torch.Tensor,
-    dz: torch.Tensor,
+    dh: torch.Tensor,
     expert_frequency_offset: torch.Tensor,
     x_gather_idx: torch.Tensor,
     is_glu_activation: bool,
@@ -202,7 +202,7 @@ def _up_projection_backward_weight(
 
     gemm(
         x.T,
-        dz,
+        dh,
         out=dw1.permute(2, 1, 0),
         cu_seqlens_k=expert_frequency_offset,
         A_idx=x_gather_idx,
@@ -214,16 +214,16 @@ def _up_projection_backward_weight(
 _up_projection_backward_weight.compile_cache = {}
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_down_projection_backward_act", mutates_args={"dz", "ds", "db2", "y1s"})
+@torch.library.custom_op(f"{LIBRARY_NAME}::_down_projection_backward_act", mutates_args={"dh", "ds", "db2", "a_prime"})
 def _down_projection_backward_act(
     dout: torch.Tensor,
-    z: torch.Tensor,
+    h: torch.Tensor,
     w2: torch.Tensor,
-    dz: torch.Tensor,
+    dh: torch.Tensor,
     ds: torch.Tensor,
     b2: torch.Tensor | None,
     db2: torch.Tensor | None,  # add impl later
-    y1s: torch.Tensor,
+    a_prime: torch.Tensor,
     topk_scores: torch.Tensor,
     expert_frequency_offset: torch.Tensor,
     x_gather_idx: torch.Tensor,
@@ -239,10 +239,10 @@ def _down_projection_backward_act(
     _, _, ds_scattered = gemm_dgated(
         dout,
         w2.permute(2, 0, 1),
-        PreAct=z,
+        PreAct=h,
         activation=activation_type,
-        dx_out=dz,
-        postact_out=y1s,
+        dx_out=dh,
+        postact_out=a_prime,
         colvec_scale=s,
         colvec_reduce=True,
         cu_seqlens_m=expert_frequency_offset,
@@ -294,14 +294,14 @@ _down_projection_backward_act.compile_cache = {}
 @torch.library.custom_op(f"{LIBRARY_NAME}::_down_projection_backward_weight", mutates_args={"dw2"})
 def _down_projection_backward_weight(
     dout: torch.Tensor,
-    y1s: torch.Tensor,
+    a_prime: torch.Tensor,
     dw2: torch.Tensor,
     expert_frequency_offset: torch.Tensor,
     x_gather_idx: torch.Tensor,
 ) -> None:
     gemm(
         dout.T,
-        y1s,
+        a_prime,
         out=dw2.permute(2, 0, 1),
         cu_seqlens_k=expert_frequency_offset,
         A_idx=x_gather_idx,
@@ -379,35 +379,181 @@ def _softmax_bwd_scatter_small_kernel(
     tl.store(dlogits_full_ptr + indices, add_vals, mask=k_mask)
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_softmax_topk_bwd", mutates_args={"dlogits_full"})
-def _softmax_topk_bwd(
+# =============================================================================
+# Add this kernel BEFORE the existing _topk_softmax_bwd wrapper in backward.py
+# =============================================================================
+
+
+@triton.jit
+def _softmax_then_topk_bwd_kernel(
+    logits_ptr,  # (T, N) saved router logits
+    dlogits_ptr,  # (T, N) output gradient
+    dscore_ptr,  # (T, K) upstream gradient
+    idx_ptr,  # (T, K) selected indices (int32)
+    score_ptr,  # (T, K) forward scores (only used for renorm)
+    stride_lm: tl.constexpr,
+    stride_ln: tl.constexpr,
+    stride_dm: tl.constexpr,
+    stride_dn: tl.constexpr,
+    stride_sm: tl.constexpr,
+    stride_sn: tl.constexpr,
+    stride_im: tl.constexpr,
+    stride_ik: tl.constexpr,
+    stride_scm: tl.constexpr,
+    stride_scn: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    norm_topk_probs: tl.constexpr,
+):
+    """
+    Full softmax→topk backward over ALL N indices.
+
+    Forward: logits → p = softmax(logits) → [raw, idx] = topk(p, K)
+             → scores = raw / sum(raw)  (if norm_topk_probs)
+
+    Backward:
+      1. Recompute p = softmax(logits) over all N
+      2. If renorm: dp_sel = (dscore - dot_s) / S
+         Else:      dp_sel = dscore
+      3. dot = Σ dp_sel_j * p_sel_j
+      4. Scatter dp_sel into N-wide dp (zero at non-selected)
+      5. dlogits = p * (dp - dot)  for all N
+    """
+    row = tl.program_id(axis=0)
+
+    # --- Recompute softmax over all N ---
+    n_offs = tl.arange(0, BLOCK_N)
+    n_mask = n_offs < N
+    logits = tl.load(
+        logits_ptr + row * stride_lm + n_offs * stride_ln,
+        mask=n_mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    row_max = tl.max(logits, axis=0)
+    exp_vals = tl.exp(logits - row_max)
+    row_sum = tl.sum(exp_vals, axis=0)
+    p = exp_vals / row_sum  # (BLOCK_N,)
+
+    # --- Load K selected indices and upstream gradient ---
+    k_offs = tl.arange(0, BLOCK_K)
+    k_mask = k_offs < K
+    idx = tl.load(
+        idx_ptr + row * stride_im + k_offs * stride_ik,
+        mask=k_mask,
+        other=0,
+    ).to(tl.int32)
+    g_sel = tl.load(
+        dscore_ptr + row * stride_sm + k_offs * stride_sn,
+        mask=k_mask,
+        other=0,
+    ).to(tl.float32)
+
+    # p at selected indices (gather from global mem; can't index register tensor)
+    sel_logits = tl.load(
+        logits_ptr + row * stride_lm + idx * stride_ln,
+        mask=k_mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    p_sel = tl.exp(sel_logits - row_max) / row_sum  # (BLOCK_K,)
+
+    # --- Backward through optional renormalization ---
+    if norm_topk_probs:
+        scores = tl.load(
+            score_ptr + row * stride_scm + k_offs * stride_scn,
+            mask=k_mask,
+            other=0,
+        ).to(tl.float32)
+        dot_s = tl.sum(g_sel * scores, axis=0)
+        S = tl.sum(p_sel, axis=0)
+        dp_sel = (g_sel - dot_s) / S
+    else:
+        dp_sel = g_sel
+
+    # dot = Σ dp_sel_j * p_sel_j
+    dot = tl.sum(dp_sel * p_sel, axis=0)
+
+    # --- Scatter dp_sel into N-wide dp ---
+    # dp[i] = dp_sel[k] if i == idx[k], else 0
+    # Loop over K (unrolled at compile time since K is constexpr)
+    dp = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for k_iter in tl.static_range(K):
+        cur_dp = tl.sum(tl.where(k_offs == k_iter, dp_sel, 0.0))
+        cur_idx = tl.sum(tl.where(k_offs == k_iter, idx, 0))
+        dp = tl.where(n_offs == cur_idx, cur_dp, dp)
+
+    # --- dlogits = p * (dp - dot) for all N ---
+    dlogits = p * (dp - dot)
+    tl.store(
+        dlogits_ptr + row * stride_dm + n_offs * stride_dn,
+        dlogits,
+        mask=n_mask,
+    )
+
+
+@torch.library.custom_op(f"{LIBRARY_NAME}::_topk_softmax_bwd", mutates_args={"dlogits_full"})
+def _topk_softmax_bwd(
     dlogits_full: torch.Tensor,
     dlogits: Optional[torch.Tensor],
     dtopk_score: torch.Tensor,
     topk_router_score: torch.Tensor,
     topk_router_indices: torch.Tensor,
     K: int,
+    router_logits: Optional[torch.Tensor] = None,
+    is_topk_then_softmax: bool = True,
+    norm_topk_probs: bool = False,
 ) -> None:
     T = dtopk_score.shape[0]
 
-    _softmax_bwd_scatter_small_kernel[T,](
-        dlogits,
-        dlogits_full,
-        topk_router_score,
-        dtopk_score,
-        topk_router_indices,
-        dlogits_full.stride(0),
-        dlogits_full.stride(1),
-        topk_router_score.stride(0),
-        topk_router_score.stride(1),
-        dtopk_score.stride(0),
-        dtopk_score.stride(1),
-        topk_router_indices.stride(0),
-        topk_router_indices.stride(1),
-        K,
-        triton.next_power_of_2(K),
-        (dlogits is None),
-    )
+    if is_topk_then_softmax:
+        # Exact: non-selected gradient is truly zero.
+        # Use the fast scatter-only kernel.
+        _softmax_bwd_scatter_small_kernel[T,](
+            dlogits,
+            dlogits_full,
+            topk_router_score,
+            dtopk_score,
+            topk_router_indices,
+            dlogits_full.stride(0),
+            dlogits_full.stride(1),
+            topk_router_score.stride(0),
+            topk_router_score.stride(1),
+            dtopk_score.stride(0),
+            dtopk_score.stride(1),
+            topk_router_indices.stride(0),
+            topk_router_indices.stride(1),
+            K,
+            triton.next_power_of_2(K),
+            (dlogits is None),
+        )
+    else:
+        # softmax→topk: non-selected gradient is -p_i * dot, NOT zero.
+        # Must recompute full softmax for the complete Jacobian.
+        assert router_logits is not None, "router_logits required for softmax→topk backward"
+        N = router_logits.shape[1]
+        _softmax_then_topk_bwd_kernel[T,](
+            router_logits,
+            dlogits_full,
+            dtopk_score,
+            topk_router_indices,
+            topk_router_score,
+            router_logits.stride(0),
+            router_logits.stride(1),
+            dlogits_full.stride(0),
+            dlogits_full.stride(1),
+            dtopk_score.stride(0),
+            dtopk_score.stride(1),
+            topk_router_indices.stride(0),
+            topk_router_indices.stride(1),
+            topk_router_score.stride(0),
+            topk_router_score.stride(1),
+            N,
+            K,
+            triton.next_power_of_2(N),
+            triton.next_power_of_2(K),
+            norm_topk_probs,
+        )
 
 
 @triton.jit
