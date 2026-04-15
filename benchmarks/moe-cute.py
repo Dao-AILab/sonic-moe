@@ -4,31 +4,27 @@
 
 import argparse
 import itertools
-import os
 import random
 import time
 from functools import partial
 from typing import Tuple, Type
 
 import cutlass
+
+# ─────────────── Monkey-patch: reduce SM100 autotuning ───────────────
+# !!!!!!!!!! The following code is to accelerate the autotuning process in QuACK and IS REMOVABLE (does not affect correctness) !!!!!!!!!!
+import quack.gemm_config as _gc
 import torch
 import torch.nn.functional as F
+from quack.autotuner import AutotuneConfig
+from quack.gemm_config import GemmConfig
+from quack.gemm_interface import gemm_dgated_tuned, gemm_gated_tuned, gemm_tuned
 from rich import print as print0
 from triton.testing import do_bench
 
 from sonicmoe import MoE
 from sonicmoe.enums import ActivationType, is_glu
 from sonicmoe.functional import moe_TC_softmax_topk_layer
-
-
-os.environ["QUACK_PRINT_AUTOTUNING"] = "1"
-
-# ─────────────── Monkey-patch: reduce SM100 autotuning ───────────────
-# !!!!!!!!!! The following code is to accelerate the autotuning process in QuACK and IS REMOVABLE (does not affect correctness) !!!!!!!!!!
-import quack.gemm_config as _gc
-from quack.autotuner import AutotuneConfig
-from quack.gemm_config import GemmConfig
-from quack.gemm_interface import gemm_dgated_tuned, gemm_gated_tuned, gemm_tuned
 
 
 def _fast_sm100_configs(epilogue=None):
