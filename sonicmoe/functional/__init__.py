@@ -54,17 +54,19 @@ class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dtopk_score: torch.Tensor, _: torch.Tensor):
         T, K = dtopk_score.size()
+        E = ctx.E
         topk_router_score, topk_router_indices, router_logits = ctx.saved_tensors
         dlogits = torch.zeros(T, ctx.E, dtype=ctx.dtype, device=topk_router_score.device)
 
         _topk_softmax_bwd(
+            router_logits,
             dlogits,
             None,
             dtopk_score,
             topk_router_score,
             topk_router_indices,
+            E,
             K,
-            router_logits=router_logits,
             is_topk_then_softmax=ctx.is_topk_then_softmax,
             norm_topk_probs=ctx.norm_topk_probs,
         )

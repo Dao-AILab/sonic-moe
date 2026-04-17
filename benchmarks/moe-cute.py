@@ -28,7 +28,7 @@ from sonicmoe.functional import moe_TC_softmax_topk_layer
 
 
 def _fast_sm100_configs(epilogue=None):
-    tile_n_vals = [128, 160, 192, 224, 256]
+    tile_n_vals = [128, 160, 192, 256]
     tile_mn_cluster_vals = (
         [(128, tile_n, (1, 2)) for tile_n in tile_n_vals]
         + [(128, tile_n, (2, 1)) for tile_n in tile_n_vals]
@@ -149,7 +149,7 @@ def parse_arguments() -> argparse.Namespace:
         "--softmax_then_topk",
         action="store_true",
         default=False,
-        help="Use softmax-then-topk routing (Qwen3/DeepSeek style) instead of topk-then-softmax",
+        help="Use softmax-then-topk routing (Qwen3 style) instead of topk-then-softmax",
     )
     parser.add_argument(
         "--norm_topk_probs",
@@ -337,7 +337,7 @@ def run(
         w2.permute(1, 2, 0),
         b2,
         moe.top_k,
-        moe.stream_id,
+        None,  # current code doesn't need stream id at all. Keep it here for legacy reason
         activation,
         True,
         is_topk_then_softmax=is_topk_then_softmax,
@@ -347,10 +347,6 @@ def run(
     cuda_graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-
-    # Redirect CuTe kernels to capture stream
-    old_stream_id = moe.stream_id
-    moe.stream_id = stream.cuda_stream
 
     # ── Inference mode, Forward only (with cudagraphs) ──
     with torch.cuda.stream(stream):
@@ -363,14 +359,12 @@ def run(
                 w2.permute(1, 2, 0),
                 b2,
                 moe.top_k,
-                moe.stream_id,
+                None,  # current code doesn't need stream id at all. Keep it here for legacy reason
                 activation,
                 True,
                 is_topk_then_softmax=is_topk_then_softmax,
                 norm_topk_probs=norm_topk_probs,
             )
-
-    moe.stream_id = old_stream_id  # restore
 
     fwd_timing = do_bench(lambda: cuda_graph.replay(), warmup=warmup, rep=repeats)
     tflops = flops / (fwd_timing * 1e9)
@@ -389,7 +383,7 @@ def run(
             w2.permute(1, 2, 0),
             b2,
             moe.top_k,
-            moe.stream_id,
+            None,
             activation,
             True,
             is_topk_then_softmax=is_topk_then_softmax,
@@ -412,7 +406,7 @@ def run(
             w2.permute(1, 2, 0),
             b2,
             moe.top_k,
-            moe.stream_id,
+            None,
             activation,
             False,
             is_topk_then_softmax=is_topk_then_softmax,
@@ -445,7 +439,7 @@ def run(
             w2.permute(1, 2, 0),
             b2,
             moe.top_k,
-            moe.stream_id,
+            None,
             activation,
             False,
             is_topk_then_softmax=is_topk_then_softmax,

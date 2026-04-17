@@ -392,7 +392,7 @@ def _softmax_then_topk_bwd_kernel(
     idx_ptr,  # (T, K) selected indices (int32)
     score_ptr,  # (T, K) forward scores (only used for renorm)
     stride_lm: tl.constexpr,
-    stride_ln: tl.constexpr,
+    stride_le: tl.constexpr,
     stride_dm: tl.constexpr,
     stride_dn: tl.constexpr,
     stride_sm: tl.constexpr,
@@ -401,40 +401,37 @@ def _softmax_then_topk_bwd_kernel(
     stride_ik: tl.constexpr,
     stride_scm: tl.constexpr,
     stride_scn: tl.constexpr,
-    N: tl.constexpr,
+    E: tl.constexpr,
     K: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    BLOCK_E: tl.constexpr,
     BLOCK_K: tl.constexpr,
     norm_topk_probs: tl.constexpr,
 ):
     """
-    Full softmax→topk backward over ALL N indices.
+    Full softmax→topk backward over ALL E indices.
 
     Forward: logits → p = softmax(logits) → [raw, idx] = topk(p, K)
              → scores = raw / sum(raw)  (if norm_topk_probs)
 
     Backward:
-      1. Recompute p = softmax(logits) over all N
+      1. Recompute p = softmax(logits) over all E
       2. If renorm: dp_sel = (dscore - dot_s) / S
          Else:      dp_sel = dscore
       3. dot = Σ dp_sel_j * p_sel_j
-      4. Scatter dp_sel into N-wide dp (zero at non-selected)
-      5. dlogits = p * (dp - dot)  for all N
+      4. Scatter dp_sel into E-wide dp (zero at non-selected)
+      5. dlogits = p * (dp - dot)  for all E
     """
     row = tl.program_id(axis=0)
 
-    # --- Recompute softmax over all N ---
-    n_offs = tl.arange(0, BLOCK_N)
-    n_mask = n_offs < N
-    logits = tl.load(
-        logits_ptr + row * stride_lm + n_offs * stride_ln,
-        mask=n_mask,
-        other=-float("inf"),
-    ).to(tl.float32)
+    e_offs = tl.arange(0, BLOCK_E)
+    e_mask = e_offs < E
+    logits = tl.load(logits_ptr + row * stride_lm + e_offs * stride_le, mask=e_mask, other=-float("inf")).to(
+        tl.float32
+    )
     row_max = tl.max(logits, axis=0)
     exp_vals = tl.exp(logits - row_max)
     row_sum = tl.sum(exp_vals, axis=0)
-    p = exp_vals / row_sum  # (BLOCK_N,)
+    p = exp_vals / row_sum  # (BLOCK_E,)
 
     # --- Load K selected indices and upstream gradient ---
     k_offs = tl.arange(0, BLOCK_K)
@@ -452,7 +449,7 @@ def _softmax_then_topk_bwd_kernel(
 
     # p at selected indices (gather from global mem; can't index register tensor)
     sel_logits = tl.load(
-        logits_ptr + row * stride_lm + idx * stride_ln,
+        logits_ptr + row * stride_lm + idx * stride_le,
         mask=k_mask,
         other=-float("inf"),
     ).to(tl.float32)
@@ -477,30 +474,31 @@ def _softmax_then_topk_bwd_kernel(
     # --- Scatter dp_sel into N-wide dp ---
     # dp[i] = dp_sel[k] if i == idx[k], else 0
     # Loop over K (unrolled at compile time since K is constexpr)
-    dp = tl.zeros([BLOCK_N], dtype=tl.float32)
+    dp = tl.zeros([BLOCK_E], dtype=tl.float32)
     for k_iter in tl.static_range(K):
         cur_dp = tl.sum(tl.where(k_offs == k_iter, dp_sel, 0.0))
         cur_idx = tl.sum(tl.where(k_offs == k_iter, idx, 0))
-        dp = tl.where(n_offs == cur_idx, cur_dp, dp)
+        dp = tl.where(e_offs == cur_idx, cur_dp, dp)
 
-    # --- dlogits = p * (dp - dot) for all N ---
+    # --- dlogits = p * (dp - dot) for all E ---
     dlogits = p * (dp - dot)
     tl.store(
-        dlogits_ptr + row * stride_dm + n_offs * stride_dn,
+        dlogits_ptr + row * stride_dm + e_offs * stride_dn,
         dlogits,
-        mask=n_mask,
+        mask=e_mask,
     )
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_topk_softmax_bwd", mutates_args={"dlogits_full"})
 def _topk_softmax_bwd(
+    router_logits: torch.Tensor,
     dlogits_full: torch.Tensor,
     dlogits: Optional[torch.Tensor],
     dtopk_score: torch.Tensor,
     topk_router_score: torch.Tensor,
     topk_router_indices: torch.Tensor,
+    E: int,
     K: int,
-    router_logits: Optional[torch.Tensor] = None,
     is_topk_then_softmax: bool = True,
     norm_topk_probs: bool = False,
 ) -> None:
@@ -530,8 +528,6 @@ def _topk_softmax_bwd(
     else:
         # softmax→topk: non-selected gradient is -p_i * dot, NOT zero.
         # Must recompute full softmax for the complete Jacobian.
-        assert router_logits is not None, "router_logits required for softmax→topk backward"
-        N = router_logits.shape[1]
         _softmax_then_topk_bwd_kernel[T,](
             router_logits,
             dlogits_full,
@@ -548,9 +544,9 @@ def _topk_softmax_bwd(
             topk_router_indices.stride(1),
             topk_router_score.stride(0),
             topk_router_score.stride(1),
-            N,
+            E,
             K,
-            triton.next_power_of_2(N),
+            triton.next_power_of_2(E),
             triton.next_power_of_2(K),
             norm_topk_probs,
         )

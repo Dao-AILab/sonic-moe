@@ -82,7 +82,7 @@ quack.autotuner.Autotuner.__call__ = _patched_call
 
 
 def _fast_sm100_configs(epilogue=None):
-    tile_n_vals = [128, 160, 192, 224, 256]
+    tile_n_vals = [128, 160, 192, 256]
     tile_mn_cluster_vals = (
         [(128, tile_n, (1, 2)) for tile_n in tile_n_vals]
         + [(128, tile_n, (2, 1)) for tile_n in tile_n_vals]
@@ -213,7 +213,7 @@ def parse_arguments() -> argparse.Namespace:
     return args
 
 
-def our_e2e_fwd_bwd_call(x, router_scores, token_indices, expert_indices, w1, b1, w2, b2, E, stream_id, dout):
+def our_e2e_fwd_bwd_call(x, router_scores, token_indices, expert_indices, w1, b1, w2, b2, E, dout):
     o, _ = moe_general_routing_inputs(
         x,
         router_scores,
@@ -224,7 +224,7 @@ def our_e2e_fwd_bwd_call(x, router_scores, token_indices, expert_indices, w1, b1
         w2,
         b2,
         E,
-        stream_id,
+        None,
         ActivationType.SWIGLU,
         False,
     )
@@ -232,7 +232,7 @@ def our_e2e_fwd_bwd_call(x, router_scores, token_indices, expert_indices, w1, b1
     router_scores.grad = x.grad = w1.grad = w2.grad = None
 
 
-def our_fwd_call(x, router_scores, token_indices, expert_indices, w1, b1, w2, b2, E, stream_id):
+def our_fwd_call(x, router_scores, token_indices, expert_indices, w1, b1, w2, b2, E):
     return moe_general_routing_inputs(
         x,
         router_scores,
@@ -243,7 +243,7 @@ def our_fwd_call(x, router_scores, token_indices, expert_indices, w1, b1, w2, b2
         w2,
         b2,
         E,
-        stream_id,
+        None,
         ActivationType.SWIGLU,
         False,
     )
@@ -367,8 +367,6 @@ def run(
     b1, b2 = moe.c_fc.bias, moe.c_proj.bias
     router_w = moe.router.weight
 
-    stream_id = moe.stream_id
-
     if add_bias:
         torch.nn.init.normal_(b1, 0, 0.01)
         torch.nn.init.normal_(b2, 0, 0.01)
@@ -399,7 +397,7 @@ def run(
             w2.permute(1, 2, 0),
             b2,
             E,
-            stream_id,
+            None,
             ActivationType.SWIGLU,
             False,
         )
@@ -490,7 +488,6 @@ def run(
             w2.permute(1, 2, 0),
             b2,
             E,
-            stream_id,
             dout,
         )
 
@@ -507,7 +504,6 @@ def run(
                 w2.permute(1, 2, 0),
                 b2,
                 E,
-                stream_id,
             ),
             warmup=10,
             rep=rep,
@@ -530,7 +526,6 @@ def run(
                 w2.permute(1, 2, 0),
                 b2,
                 E,
-                stream_id,
                 dout,
             ),
             warmup=10,
