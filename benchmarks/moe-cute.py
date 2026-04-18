@@ -77,15 +77,21 @@ gemm_dgated_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_confi
 # ─────────────── Monkey-patch ends ───────────────
 
 
-def swiglu(x: torch.Tensor) -> torch.Tensor:
-    u = x[..., 1::2]
-    g = x[..., ::2]
+def swiglu(x: torch.Tensor, concat_layout: bool = False) -> torch.Tensor:
+    if concat_layout:
+        I = x.shape[-1] // 2
+        g, u = x[..., :I], x[..., I:]
+    else:
+        u, g = x[..., 1::2], x[..., ::2]
     return u * F.silu(g)
 
 
-def geglu(x: torch.Tensor) -> torch.Tensor:
-    u = x[..., 1::2]
-    g = x[..., ::2]
+def geglu(x: torch.Tensor, concat_layout: bool = False) -> torch.Tensor:
+    if concat_layout:
+        I = x.shape[-1] // 2
+        g, u = x[..., :I], x[..., I:]
+    else:
+        u, g = x[..., 1::2], x[..., ::2]
     return F.gelu(g.float()).to(dtype=g.dtype) * u
 
 
@@ -93,9 +99,12 @@ def gelu(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x.float()).to(dtype=x.dtype)
 
 
-def reglu(x: torch.Tensor) -> torch.Tensor:
-    u = x[..., 1::2]
-    g = x[..., ::2]
+def reglu(x: torch.Tensor, concat_layout: bool = False) -> torch.Tensor:
+    if concat_layout:
+        I = x.shape[-1] // 2
+        g, u = x[..., :I], x[..., I:]
+    else:
+        u, g = x[..., 1::2], x[..., ::2]
     return (F.relu(g.float()) * u).to(dtype=g.dtype)
 
 
@@ -157,6 +166,12 @@ def parse_arguments() -> argparse.Namespace:
         default=False,
         help="Renormalize topk probs to sum to 1 (only for softmax-then-topk)",
     )
+    parser.add_argument(
+        "--concat_layout",
+        action="store_true",
+        default=False,
+        help="Use concat [gate; up] weight layout instead of interleaved",
+    )
     args = parser.parse_args()
 
     if len(args.thiek) != 5:
@@ -180,6 +195,7 @@ def run(
     activation: Type[str],
     is_softmax_over_topk: bool = True,
     norm_topk_probs: bool = False,
+    concat_layout: bool = False,
     **kwargs,
 ):
     torch_dtype = {cutlass.BFloat16: torch.bfloat16, cutlass.Float16: torch.float16}[dtype]
@@ -189,7 +205,8 @@ def run(
     T, H, I, E, K = thiek
     TK = T * K
     routing_mode = "softmax_over_topk" if is_softmax_over_topk else f"topk_over_softmax (norm={norm_topk_probs})"
-    print(f"T {T}, I {I}, H {H}, E {E}, K {K}, routing: {routing_mode}")
+    layout_mode = "concat [gate; up]" if concat_layout else "interleaved [g0, u0, g1, u1, ...]"
+    print(f"T {T}, I {I}, H {H}, E {E}, K {K}, routing: {routing_mode}, w1 layout: {layout_mode}")
 
     random.seed(1111)
     torch.manual_seed(1111)
@@ -233,6 +250,7 @@ def run(
             activation,
             is_softmax_over_topk=is_softmax_over_topk,
             norm_topk_probs=norm_topk_probs,
+            concat_layout=concat_layout,
         )
         if add_bias:
             dx, dw1, db1, dw2, db2, drouter_w = torch.autograd.grad(
@@ -277,7 +295,7 @@ def run(
 
                 if T_idx.numel() > 0:
                     w1_out = F.linear(x[T_idx, :], w1[i, :, :].squeeze(), bias=(b1[i] if add_bias else None))
-                    w1_out = act_func(w1_out)
+                    w1_out = act_func(w1_out, concat_layout=concat_layout) if is_glu(activation) else act_func(w1_out)
 
                     w2_out = F.linear(w1_out, w2[i, :, :].squeeze(), bias=(b2[i] if add_bias else None))
 
@@ -342,6 +360,7 @@ def run(
         True,
         is_softmax_over_topk=is_softmax_over_topk,
         norm_topk_probs=norm_topk_probs,
+        concat_layout=concat_layout,
     )
 
     cuda_graph = torch.cuda.CUDAGraph()
@@ -364,6 +383,7 @@ def run(
                 True,
                 is_softmax_over_topk=is_softmax_over_topk,
                 norm_topk_probs=norm_topk_probs,
+                concat_layout=concat_layout,
             )
 
     fwd_timing = do_bench(lambda: cuda_graph.replay(), warmup=warmup, rep=repeats)
@@ -388,6 +408,7 @@ def run(
             True,
             is_softmax_over_topk=is_softmax_over_topk,
             norm_topk_probs=norm_topk_probs,
+            concat_layout=concat_layout,
         )
         return o
 
@@ -411,6 +432,7 @@ def run(
             False,
             is_softmax_over_topk=is_softmax_over_topk,
             norm_topk_probs=norm_topk_probs,
+            concat_layout=concat_layout,
         )
         return o
 
@@ -444,6 +466,7 @@ def run(
             False,
             is_softmax_over_topk=is_softmax_over_topk,
             norm_topk_probs=norm_topk_probs,
+            concat_layout=concat_layout,
         )
         o.backward(dout, retain_graph=True)
         x.grad = w1.grad = w2.grad = router_w.grad = None
@@ -472,5 +495,6 @@ if __name__ == "__main__":
         args.activation,
         is_softmax_over_topk=(not args.topk_over_softmax),
         norm_topk_probs=args.norm_topk_probs,
+        concat_layout=args.concat_layout,
     )
     print("PASS")

@@ -142,6 +142,7 @@ def ref_moe_token_rounding(
     w2: torch.Tensor,
     b2: torch.Tensor | None,
     E,
+    concat_layout: bool = False,
 ):
     T, D = x.shape  # # B, L, # total expert
 
@@ -154,7 +155,11 @@ def ref_moe_token_rounding(
         if T_idx.numel() > 0:
 
             w1_out = F.linear(x[T_idx, :], w1[i, :, :].squeeze(), bias=(b1[i] if b1 is not None else None))
-            w1_out = F.silu(w1_out[:, ::2]) * w1_out[:, 1::2]
+            if concat_layout:
+                I = w1_out.shape[-1] // 2
+                w1_out = F.silu(w1_out[:, :I]) * w1_out[:, I:]
+            else:
+                w1_out = F.silu(w1_out[:, ::2]) * w1_out[:, 1::2]
 
             w2_out = F.linear(w1_out, w2[i, :, :].squeeze(), bias=(b2[i] if b2 is not None else None))
 
@@ -205,6 +210,12 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         default=False,
     )
+    parser.add_argument(
+        "--concat_layout",
+        action="store_true",
+        default=False,
+        help="Use concat [gate; up] weight layout instead of interleaved",
+    )
     args = parser.parse_args()
 
     if len(args.thiekq) != 6:
@@ -213,7 +224,9 @@ def parse_arguments() -> argparse.Namespace:
     return args
 
 
-def our_e2e_fwd_bwd_call(x, router_scores, token_indices, expert_indices, w1, b1, w2, b2, E, dout):
+def our_e2e_fwd_bwd_call(
+    x, router_scores, token_indices, expert_indices, w1, b1, w2, b2, E, dout, concat_layout=False
+):
     o, _ = moe_general_routing_inputs(
         x,
         router_scores,
@@ -227,12 +240,13 @@ def our_e2e_fwd_bwd_call(x, router_scores, token_indices, expert_indices, w1, b1
         None,
         ActivationType.SWIGLU,
         False,
+        concat_layout=concat_layout,
     )
     torch.autograd.grad(o, [x, router_scores, w1, w2], dout, retain_graph=True)
     router_scores.grad = x.grad = w1.grad = w2.grad = None
 
 
-def our_fwd_call(x, router_scores, token_indices, expert_indices, w1, b1, w2, b2, E):
+def our_fwd_call(x, router_scores, token_indices, expert_indices, w1, b1, w2, b2, E, concat_layout=False):
     return moe_general_routing_inputs(
         x,
         router_scores,
@@ -246,6 +260,7 @@ def our_fwd_call(x, router_scores, token_indices, expert_indices, w1, b1, w2, b2
         None,
         ActivationType.SWIGLU,
         False,
+        concat_layout=concat_layout,
     )
 
 
@@ -324,6 +339,7 @@ def run(
     routing: str,
     skip_test: Type[bool],
     add_bias: Type[bool],
+    concat_layout: bool = False,
     **kwargs,
 ):
 
@@ -400,6 +416,7 @@ def run(
             None,
             ActivationType.SWIGLU,
             False,
+            concat_layout=concat_layout,
         )
         if add_bias:
             dx, dw1, db1, dw2, db2, drouter_w = torch.autograd.grad(
@@ -418,6 +435,7 @@ def run(
             w2,
             b2,
             E,
+            concat_layout=concat_layout,
         )
         ref_expert_frequency = expert_indices.view(-1).bincount(minlength=E)
 
@@ -489,6 +507,7 @@ def run(
             b2,
             E,
             dout,
+            concat_layout=concat_layout,
         )
 
         TK = router_scores.shape[0]
@@ -504,6 +523,7 @@ def run(
                 w2.permute(1, 2, 0),
                 b2,
                 E,
+                concat_layout=concat_layout,
             ),
             warmup=10,
             rep=rep,
@@ -527,6 +547,7 @@ def run(
                 b2,
                 E,
                 dout,
+                concat_layout=concat_layout,
             ),
             warmup=10,
             rep=rep,
@@ -561,5 +582,13 @@ def run(
 
 if __name__ == "__main__":
     args = parse_arguments()
-    run(args.thiekq, args.dtype, args.rep, args.routing, args.skip_test, args.add_bias)
+    run(
+        args.thiekq,
+        args.dtype,
+        args.rep,
+        args.routing,
+        args.skip_test,
+        args.add_bias,
+        concat_layout=args.concat_layout,
+    )
     print("PASS")

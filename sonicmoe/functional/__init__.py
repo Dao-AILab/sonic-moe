@@ -91,6 +91,7 @@ class _UpProjection(torch.autograd.Function):
         is_each_token_has_variable_activated_experts: bool,
         activation_type: ActivationType,
         is_inference_mode_enabled: bool,
+        concat_layout: bool = False,
     ) -> torch.Tensor:
         T, H = x.shape
         I, H, E = w1.shape
@@ -116,6 +117,7 @@ class _UpProjection(torch.autograd.Function):
             x_gather_idx=x_gather_idx,
             activation_type=activation_type.value,
             is_inference_mode_enabled=is_inference_mode_enabled,
+            concat_layout=concat_layout,
         )
 
         ctx.T = T
@@ -126,6 +128,7 @@ class _UpProjection(torch.autograd.Function):
         ctx.I = I
         ctx.is_each_token_has_variable_activated_experts = is_each_token_has_variable_activated_experts
         ctx.is_glu_activation = is_glu_activation
+        ctx.concat_layout = concat_layout
 
         ctx.save_for_backward(
             x,
@@ -152,6 +155,7 @@ class _UpProjection(torch.autograd.Function):
         H = ctx.H
         is_glu_activation = ctx.is_glu_activation
         is_each_token_has_variable_activated_experts = ctx.is_each_token_has_variable_activated_experts
+        concat_layout = ctx.concat_layout
 
         (
             x,
@@ -175,6 +179,7 @@ class _UpProjection(torch.autograd.Function):
             db1=db1,
             expert_frequency_offset=expert_frequency_offset,
             is_glu_activation=is_glu_activation,
+            concat_layout=concat_layout,
         )
 
         _up_projection_backward_weight(
@@ -184,6 +189,7 @@ class _UpProjection(torch.autograd.Function):
             expert_frequency_offset=expert_frequency_offset,
             x_gather_idx=x_gather_idx,
             is_glu_activation=is_glu_activation,
+            concat_layout=concat_layout,
         )
 
         dx_reduced = torch.empty(T, H, dtype=dh.dtype, device=dh.device)
@@ -198,7 +204,7 @@ class _UpProjection(torch.autograd.Function):
             is_varlen_K=is_each_token_has_variable_activated_experts,
         )
 
-        return dx_reduced, dw1, db1, *[None] * 12
+        return dx_reduced, dw1, db1, *[None] * 13
 
 
 class _DownProjection(torch.autograd.Function):
@@ -335,6 +341,7 @@ def moe_TC_softmax_topk_layer(
     is_inference_mode_enabled: bool = False,
     is_softmax_over_topk: bool = True,
     norm_topk_probs: bool = False,
+    concat_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
@@ -379,6 +386,7 @@ def moe_TC_softmax_topk_layer(
         False,  # is_each_token_has_variable_activated_expert
         activation_type,
         is_inference_mode_enabled,
+        concat_layout,
     )
 
     o = _DownProjection.apply(
@@ -403,7 +411,9 @@ def moe_TC_softmax_topk_layer(
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # Weight format requirements:
-# - w1_weight: Shape (2*I, H, E), stride order (2, 0, 1), must be interleaved [gate_row0, up_row0, gate_row1, up_row1, ...]
+# - w1_weight: Shape (2*I, H, E), stride order (2, 0, 1)
+#     concat_layout=False (default): interleaved [gate_row0, up_row0, gate_row1, up_row1, ...]
+#     concat_layout=True:            concatenated [gate_row0, ..., gate_row_{I-1}, up_row0, ..., up_row_{I-1}]
 # - w2_weight: Shape (H, I, E), stride order (2, 0, 1)
 
 
@@ -423,6 +433,7 @@ def moe_general_routing_inputs(
     stream_id: int,
     activation_type: ActivationType,
     is_inference_mode_enabled: bool = False,
+    concat_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
@@ -473,6 +484,7 @@ def moe_general_routing_inputs(
         True,  # is_each_token_has_variable_activated_expert
         activation_type,
         is_inference_mode_enabled,
+        concat_layout,
     )
 
     o = _DownProjection.apply(

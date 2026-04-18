@@ -126,28 +126,29 @@ def _prune_triton_autotune_config(configs, nargs, **kw):
 )
 @triton.jit
 def db1_kernel(
-    dz_ptr,  # (T, H)
-    db1_ptr,  # (E, H),
-    expert_offset_ptr,  # (E+1,), offsets in grouped layout
+    dh_ptr,  # (TK, I)  — always interleaved
+    db1_ptr,  # (E, I)
+    expert_offset_ptr,  # (E+1,)
     I: tl.constexpr,
     E: tl.constexpr,
-    BLOCK_I: tl.constexpr,  # Block size for H dimension
-    BLOCK_TK: tl.constexpr,  # Block size for token dimension
+    BLOCK_I: tl.constexpr,
+    BLOCK_TK: tl.constexpr,
+    CONCAT_LAYOUT: tl.constexpr = False,
 ):
-    Eidx = tl.program_id(0)  # expert id
+    Eidx = tl.program_id(0)
 
     E_count_start = tl.load(expert_offset_ptr + Eidx).to(tl.int64)
     E_count_end = tl.load(expert_offset_ptr + Eidx + 1).to(tl.int64)
     n_tokens = E_count_end - E_count_start
 
     NUM_I_BLOCKS: tl.constexpr = triton.cdiv(I, BLOCK_I)
+    I_HALF: tl.constexpr = I // 2
     for Iidx in tl.static_range(0, NUM_I_BLOCKS, 1):
         i_offsets = Iidx * BLOCK_I + tl.arange(0, BLOCK_I)
         i_mask = i_offsets < I
 
         db1_acc = tl.zeros([BLOCK_I], dtype=tl.float32)
 
-        # Process tokens in blocks of BLOCK_TK
         for block_start in tl.range(0, n_tokens, BLOCK_TK):
             # Token offsets within this block
             tk_offsets = block_start + tl.arange(0, BLOCK_TK)
@@ -156,11 +157,16 @@ def db1_kernel(
 
             dz_offsets = tk_grouped[:, None] * I + i_offsets[None, :]
             dz_mask = tk_mask[:, None] & i_mask[None, :]
-            dz = tl.load(dz_ptr + dz_offsets, mask=dz_mask, other=0.0).to(tl.float32)
+            dz = tl.load(dh_ptr + dz_offsets, mask=dz_mask, other=0.0).to(tl.float32)
 
-            db1_acc += tl.sum(dz, axis=0)  # Sum over BLOCK_TK dimension
+            db1_acc += tl.sum(dz, axis=0)
 
-        db1_offsets = Eidx.to(tl.int64) * I + i_offsets
+        # Write: remap interleaved → concat if needed
+        if CONCAT_LAYOUT:
+            out_offsets = i_offsets // 2 + (i_offsets % 2) * I_HALF
+        else:
+            out_offsets = i_offsets
+        db1_offsets = Eidx.to(tl.int64) * I + out_offsets
         tl.store(db1_ptr + db1_offsets, db1_acc, mask=i_mask)
 
 
@@ -172,16 +178,31 @@ def _up_projection_backward_act(
     db1: torch.Tensor | None,
     expert_frequency_offset: torch.Tensor,
     is_glu_activation: bool,
+    concat_layout: bool = False,
 ) -> None:
     I, H, E = w1.size()
     if is_glu_activation:
         I //= 2
 
-    gemm(dh, w1.permute(2, 0, 1), cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False, out=dx_expanded)
+    gemm(
+        dh,
+        w1.permute(2, 0, 1),
+        cu_seqlens_m=expert_frequency_offset,
+        dynamic_scheduler=False,
+        out=dx_expanded,
+        concat_layout=(("B",) if concat_layout else None),
+    )
 
     # db1 computation
     if db1 is not None:
-        db1_kernel[(E,)](dh, db1, expert_frequency_offset, (2 * I if is_glu_activation else I), E)
+        db1_kernel[(E,)](
+            dh,
+            db1,
+            expert_frequency_offset,
+            (2 * I if is_glu_activation else I),
+            E,
+            CONCAT_LAYOUT=concat_layout and is_glu_activation,
+        )
 
 
 _up_projection_backward_act.compile_cache = {}
@@ -195,6 +216,7 @@ def _up_projection_backward_weight(
     expert_frequency_offset: torch.Tensor,
     x_gather_idx: torch.Tensor,
     is_glu_activation: bool,
+    concat_layout: bool = False,
 ) -> None:
     I, H, E = dw1.size()
     if is_glu_activation:
@@ -208,6 +230,7 @@ def _up_projection_backward_weight(
         A_idx=x_gather_idx,
         batch_idx_permute=None,
         dynamic_scheduler=False,
+        concat_layout=(("out",) if concat_layout else None),
     )
 
 
@@ -377,11 +400,6 @@ def _softmax_over_topk_bwd_kernel(
     if not dlogits_is_none:
         add_vals += tl.load(dlogits_ptr + indices, mask=k_mask)
     tl.store(dlogits_full_ptr + indices, add_vals, mask=k_mask)
-
-
-# =============================================================================
-# Add this kernel BEFORE the existing _topk_softmax_bwd wrapper in backward.py
-# =============================================================================
 
 
 @triton.jit

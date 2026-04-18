@@ -73,6 +73,7 @@ def _up_projection_forward(
     x_gather_idx: torch.Tensor,
     activation_type: str,
     is_inference_mode_enabled: bool = False,
+    concat_layout: bool = False,
 ) -> None:
     assert activation_type in (
         "swiglu",
@@ -88,6 +89,7 @@ def _up_projection_forward(
         postact_out=a,
         store_preact=(not is_inference_mode_enabled),
         bias=b1,
+        concat_layout=(("B",) if concat_layout else None),
     )
 
 
