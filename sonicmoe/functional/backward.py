@@ -339,7 +339,7 @@ def _token_broadcast_backward(
 
 
 @triton.jit
-def _softmax_bwd_scatter_small_kernel(
+def _softmax_over_topk_bwd_kernel(
     dlogits_ptr,
     dlogits_full_ptr,
     score_ptr,
@@ -385,7 +385,7 @@ def _softmax_bwd_scatter_small_kernel(
 
 
 @triton.jit
-def _softmax_then_topk_bwd_kernel(
+def _topk_over_softmax_bwd_kernel(
     logits_ptr,  # (T, N) saved router logits
     dlogits_ptr,  # (T, N) output gradient
     dscore_ptr,  # (T, K) upstream gradient
@@ -408,7 +408,7 @@ def _softmax_then_topk_bwd_kernel(
     norm_topk_probs: tl.constexpr,
 ):
     """
-    Full softmax→topk backward over ALL E indices.
+    Full topk(softmax()) backward over ALL E indices.
 
     Forward: logits → p = softmax(logits) → [raw, idx] = topk(p, K)
              → scores = raw / sum(raw)  (if norm_topk_probs)
@@ -499,15 +499,14 @@ def _topk_softmax_bwd(
     topk_router_indices: torch.Tensor,
     E: int,
     K: int,
-    is_topk_then_softmax: bool = True,
+    is_softmax_over_topk: bool = True,
     norm_topk_probs: bool = False,
 ) -> None:
     T = dtopk_score.shape[0]
 
-    if is_topk_then_softmax:
-        # Exact: non-selected gradient is truly zero.
-        # Use the fast scatter-only kernel.
-        _softmax_bwd_scatter_small_kernel[T,](
+    if is_softmax_over_topk:
+        # non-selected gradient is zero.
+        _softmax_over_topk_bwd_kernel[T,](
             dlogits,
             dlogits_full,
             topk_router_score,
@@ -526,9 +525,9 @@ def _topk_softmax_bwd(
             (dlogits is None),
         )
     else:
-        # softmax→topk: non-selected gradient is -p_i * dot, NOT zero.
-        # Must recompute full softmax for the complete Jacobian.
-        _softmax_then_topk_bwd_kernel[T,](
+        # topk(softmax(.)): non-selected gradient is -p_i * dot, NOT zero.
+        # must recompute full softmax for the complete Jacobian.
+        _topk_over_softmax_bwd_kernel[T,](
             router_logits,
             dlogits_full,
             dtopk_score,

@@ -13,7 +13,7 @@ from quack.gemm_interface import gemm, gemm_gated
 
 from ..enums import LIBRARY_NAME
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
-from .topk import Softmax_Then_TopK, TopK_Then_Softmax
+from .topk import Softmax_Over_TopK, TopK_Over_Softmax
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_topk_fwd", mutates_args={"values", "indices"})
@@ -22,7 +22,7 @@ def _topk_fwd(
     k: int,
     values: torch.Tensor,
     indices: torch.Tensor,
-    is_topk_then_softmax: bool,
+    is_softmax_over_topk: bool,
     norm_topk_probs: bool,
 ) -> None:
     """Top-k forward pass.
@@ -42,16 +42,16 @@ def _topk_fwd(
 
     x_tensor, values_tensor, indices_tensor = [convert_from_dlpack(tensor) for tensor in (x, values, indices)]
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    if is_topk_then_softmax:
+    if is_softmax_over_topk:
         compile_key = (input_dtype, output_dtype, N, k, True)
     else:
         compile_key = (input_dtype, output_dtype, N, k, False, norm_topk_probs)
 
     if compile_key not in _topk_fwd.compile_cache:
-        if is_topk_then_softmax:
-            topk_op = TopK_Then_Softmax(input_dtype, output_dtype, N, k)
+        if is_softmax_over_topk:
+            topk_op = Softmax_Over_TopK(input_dtype, output_dtype, N, k)
         else:
-            topk_op = Softmax_Then_TopK(input_dtype, output_dtype, N, k, norm_topk_probs)
+            topk_op = TopK_Over_Softmax(input_dtype, output_dtype, N, k, norm_topk_probs)
 
         _topk_fwd.compile_cache[compile_key] = cute.compile(
             topk_op, x_tensor, values_tensor, indices_tensor, current_stream
@@ -160,7 +160,7 @@ def _topk_softmax_fwd(
     topk_router_indices: torch.Tensor,
     E: int,
     K: int,
-    is_topk_then_softmax: bool,
+    is_softmax_over_topk: bool,
     norm_topk_probs: bool,
 ) -> None:
     if E <= 4096 and K <= 16 and E % 8 == 0:
@@ -169,16 +169,13 @@ def _topk_softmax_fwd(
             K,
             topk_router_score,
             topk_router_indices,
-            is_topk_then_softmax=is_topk_then_softmax,
+            is_softmax_over_topk=is_softmax_over_topk,
             norm_topk_probs=norm_topk_probs,
         )
     else:
-        if is_topk_then_softmax:
+        if is_softmax_over_topk:
             topk_results = router_logits.topk(K, dim=-1)
-            if is_topk_then_softmax:
-                vals = topk_results.values.softmax(dim=-1, dtype=torch.float32)
-            else:
-                vals = topk_results.values.to(torch.float32)
+            vals = topk_results.values.softmax(dim=-1, dtype=torch.float32)
             topk_router_score.copy_(vals.to(topk_router_score.dtype))
             topk_router_indices.copy_(topk_results.indices.to(topk_router_indices.dtype))
         else:

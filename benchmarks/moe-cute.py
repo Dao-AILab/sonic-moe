@@ -146,10 +146,10 @@ def parse_arguments() -> argparse.Namespace:
         default=False,
     )
     parser.add_argument(
-        "--softmax_then_topk",
+        "--topk_over_softmax",
         action="store_true",
         default=False,
-        help="Use softmax-then-topk routing (Qwen3 style) instead of topk-then-softmax",
+        help="Use topk(softmax(.)) routing (Qwen3 style) instead of softmax(topk(.))",
     )
     parser.add_argument(
         "--norm_topk_probs",
@@ -178,7 +178,7 @@ def run(
     skip_test: Type[bool],
     add_bias: Type[bool],
     activation: Type[str],
-    is_topk_then_softmax: bool = True,
+    is_softmax_over_topk: bool = True,
     norm_topk_probs: bool = False,
     **kwargs,
 ):
@@ -188,7 +188,7 @@ def run(
     # Unpack parameters
     T, H, I, E, K = thiek
     TK = T * K
-    routing_mode = "topk_then_softmax" if is_topk_then_softmax else f"softmax_then_topk (norm={norm_topk_probs})"
+    routing_mode = "softmax_over_topk" if is_softmax_over_topk else f"topk_over_softmax (norm={norm_topk_probs})"
     print(f"T {T}, I {I}, H {H}, E {E}, K {K}, routing: {routing_mode}")
 
     random.seed(1111)
@@ -231,7 +231,7 @@ def run(
             moe.top_k,
             moe.stream_id,
             activation,
-            is_topk_then_softmax=is_topk_then_softmax,
+            is_softmax_over_topk=is_softmax_over_topk,
             norm_topk_probs=norm_topk_probs,
         )
         if add_bias:
@@ -243,7 +243,7 @@ def run(
 
         logits = F.linear(x, router_w)
 
-        if is_topk_then_softmax:
+        if is_softmax_over_topk:
             ref_topk_logits, ref_topk_experts = logits.topk(K, dim=-1)
             ref_topk_scores = ref_topk_logits.softmax(dim=-1, dtype=torch.float32)
         else:
@@ -340,7 +340,7 @@ def run(
         None,  # current code doesn't need stream id at all. Keep it here for legacy reason
         activation,
         True,
-        is_topk_then_softmax=is_topk_then_softmax,
+        is_softmax_over_topk=is_softmax_over_topk,
         norm_topk_probs=norm_topk_probs,
     )
 
@@ -362,7 +362,7 @@ def run(
                 None,  # current code doesn't need stream id at all. Keep it here for legacy reason
                 activation,
                 True,
-                is_topk_then_softmax=is_topk_then_softmax,
+                is_softmax_over_topk=is_softmax_over_topk,
                 norm_topk_probs=norm_topk_probs,
             )
 
@@ -386,7 +386,7 @@ def run(
             None,
             activation,
             True,
-            is_topk_then_softmax=is_topk_then_softmax,
+            is_softmax_over_topk=is_softmax_over_topk,
             norm_topk_probs=norm_topk_probs,
         )
         return o
@@ -409,7 +409,7 @@ def run(
             None,
             activation,
             False,
-            is_topk_then_softmax=is_topk_then_softmax,
+            is_softmax_over_topk=is_softmax_over_topk,
             norm_topk_probs=norm_topk_probs,
         )
         return o
@@ -442,7 +442,7 @@ def run(
             None,
             activation,
             False,
-            is_topk_then_softmax=is_topk_then_softmax,
+            is_softmax_over_topk=is_softmax_over_topk,
             norm_topk_probs=norm_topk_probs,
         )
         o.backward(dout, retain_graph=True)
@@ -470,7 +470,7 @@ if __name__ == "__main__":
         args.skip_test,
         args.add_bias,
         args.activation,
-        is_topk_then_softmax=(not args.softmax_then_topk),
+        is_softmax_over_topk=(not args.topk_over_softmax),
         norm_topk_probs=args.norm_topk_probs,
     )
     print("PASS")

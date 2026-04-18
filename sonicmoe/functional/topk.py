@@ -20,9 +20,9 @@ from sonicmoe.utils import domain_offset_i64
 
 
 class _TopKMode(Enum):
-    TOPK_THEN_SOFTMAX = "topk_then_softmax"  # most common choice: softmax(topk(x))
-    SOFTMAX_THEN_TOPK = "softmax_then_topk"  # Qwen3:              topk(softmax(x))
-    TOPK_NO_FUSION = "no_fusion"  # raw topk
+    SOFTMAX_OVER_TOPK = "softmax_over_topk"  # most common choice: softmax(topk(x))
+    TOPK_OVER_SOFTMAX = "topk_over_softmax"  # Qwen3:              topk(softmax(x))
+    TOPK_NO_FUSION = "topk"
 
 
 class _TopK:
@@ -51,7 +51,7 @@ class _TopK:
 
         self.mode = mode
         if norm_topk_prob:
-            assert mode == _TopKMode.SOFTMAX_THEN_TOPK, "`norm_topk_prob` only works with softmax-then-topk"
+            assert mode == _TopKMode.TOPK_OVER_SOFTMAX, "`norm_topk_prob` only works with softmax-then-topk"
 
         self.norm_topk_prob = norm_topk_prob
 
@@ -140,7 +140,7 @@ class _TopK:
         # ------------------------------------------------------------------
         # Softmax-then-TopK: full-row softmax → in-place log-prob transform.
         # ------------------------------------------------------------------
-        if const_expr(self.mode == _TopKMode.SOFTMAX_THEN_TOPK):
+        if const_expr(self.mode == _TopKMode.TOPK_OVER_SOFTMAX):
             if const_expr((not is_even_N) or (self.N != self.next_power_of_2_N)):
                 utils.fill_oob(tXrX_f32, tXpX, -tXrX_f32.element_type.inf)
 
@@ -234,7 +234,7 @@ class _TopK:
             topk_indices[i] = cutlass.Int32(col_idx & idx_mask)
 
         # TopK-then-Softmax
-        if const_expr(self.mode == _TopKMode.TOPK_THEN_SOFTMAX):
+        if const_expr(self.mode == _TopKMode.SOFTMAX_OVER_TOPK):
             topk_vals_max = -cutlass.Float32.inf
             for i in cutlass.range_constexpr(self.k):
                 topk_vals_max = cute.arch.fmax(topk_vals[i], topk_vals_max)
@@ -248,7 +248,7 @@ class _TopK:
                 topk_vals[i] = topk_vals[i] / topk_exp_sum
 
         # Softmax-then-TopK: recover probabilities from log-probs.
-        if const_expr(self.mode == _TopKMode.SOFTMAX_THEN_TOPK):
+        if const_expr(self.mode == _TopKMode.TOPK_OVER_SOFTMAX):
             for i in cutlass.range_constexpr(self.k):
                 topk_vals[i] = cute.math.exp(topk_vals[i])
 
@@ -278,7 +278,7 @@ class _TopK:
                 cute.autovec_copy(topk_indices_store[None, i], mIndices_store[None, i])
 
 
-class TopK_Then_Softmax(_TopK):
+class Softmax_Over_TopK(_TopK):
     """softmax(topk(x))"""
 
     def __init__(
@@ -288,7 +288,7 @@ class TopK_Then_Softmax(_TopK):
         N: int,
         k: int,
     ):
-        mode = _TopKMode.TOPK_THEN_SOFTMAX
+        mode = _TopKMode.SOFTMAX_OVER_TOPK
         super().__init__(
             input_dtype=input_dtype,
             output_dtype=output_dtype,
@@ -298,7 +298,7 @@ class TopK_Then_Softmax(_TopK):
         )
 
 
-class Softmax_Then_TopK(_TopK):
+class TopK_Over_Softmax(_TopK):
     """Qwen3: topk(softmax(x))
     When norm_topk_prob=True, renormalizes the K selected probabilities to sum to 1.
     """
@@ -316,7 +316,7 @@ class Softmax_Then_TopK(_TopK):
             output_dtype=output_dtype,
             N=N,
             k=k,
-            mode=_TopKMode.SOFTMAX_THEN_TOPK,
+            mode=_TopKMode.TOPK_OVER_SOFTMAX,
             norm_topk_prob=norm_topk_prob,
         )
 

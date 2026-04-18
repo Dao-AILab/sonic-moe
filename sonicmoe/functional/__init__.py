@@ -24,7 +24,7 @@ from .triton_kernels import TC_topk_router_metadata_triton, general_routing_rout
 class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, router_logits: torch.Tensor, E: int, K: int, is_topk_then_softmax: bool, norm_topk_probs: bool
+        ctx, router_logits: torch.Tensor, E: int, K: int, is_softmax_over_topk: bool, norm_topk_probs: bool
     ) -> tuple[torch.Tensor, torch.Tensor]:
         T = router_logits.size(0)
 
@@ -37,16 +37,16 @@ class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
             topk_router_indices,
             E,
             K,
-            is_topk_then_softmax=is_topk_then_softmax,
+            is_softmax_over_topk=is_softmax_over_topk,
             norm_topk_probs=norm_topk_probs,
         )
 
-        # Save router_logits for softmax→topk backward (recompute full softmax).
-        # For topk→softmax it's unused but save unconditionally for simplicity.
+        # Save router_logits for topk(softmax()) backward (recompute full softmax).
+        # For softmax(topk()) it's unused but save unconditionally for simplicity.
         ctx.save_for_backward(topk_router_score, topk_router_indices, router_logits)
         ctx.E = E
         ctx.dtype = router_logits.dtype
-        ctx.is_topk_then_softmax = is_topk_then_softmax
+        ctx.is_softmax_over_topk = is_softmax_over_topk
         ctx.norm_topk_probs = norm_topk_probs
 
         return topk_router_score, topk_router_indices
@@ -67,7 +67,7 @@ class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
             topk_router_indices,
             E,
             K,
-            is_topk_then_softmax=ctx.is_topk_then_softmax,
+            is_softmax_over_topk=ctx.is_softmax_over_topk,
             norm_topk_probs=ctx.norm_topk_probs,
         )
 
@@ -333,7 +333,7 @@ def moe_TC_softmax_topk_layer(
     stream_id: int,
     activation_type: ActivationType | str = ActivationType.SWIGLU,
     is_inference_mode_enabled: bool = False,
-    is_topk_then_softmax: bool = True,
+    is_softmax_over_topk: bool = True,
     norm_topk_probs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
@@ -342,7 +342,7 @@ def moe_TC_softmax_topk_layer(
     E = router_w.size(0)
     router_logits = F.linear(x, router_w)
     topk_scores, topk_indices = TC_Softmax_Topk_Router_Function.apply(
-        router_logits, E, K, is_topk_then_softmax, norm_topk_probs
+        router_logits, E, K, is_softmax_over_topk, norm_topk_probs
     )
 
     T, K = topk_indices.size()

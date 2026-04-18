@@ -12,7 +12,7 @@ Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 
 ## News
 
-> 04/19/2026: we release SonicMoE with Blackwell (SM100) support, built on [QuACK](https://github.com/Dao-AILab/quack)'s Grouped GEMM kernels. 
+- 04/19/2026: we release SonicMoE with Blackwell (SM100) support, built on [QuACK](https://github.com/Dao-AILab/quack)'s Grouped GEMM kernels. 
 
 ## 📦 Installation
 
@@ -80,14 +80,14 @@ make test
 
 ### Example usage
 
-- SonicMoE with TC top-K routing (topk-then-softmax, or `softmax(topk(logits))`)
+- SonicMoE with TC top-K routing (softmax-over-topk, or `softmax(topk(logits))`)
 ```bash
 python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --activation swiglu
 ```
 
-- SonicMoE with Qwen3-style routing (softmax-then-topk, or `topk(softmax(logits))`) with topk probabilities renormalization
+- SonicMoE with Qwen3-style routing (topk-over-softmax, or `topk(softmax(logits))`) with topk probabilities renormalization
 ```bash
-python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --softmax_then_topk --norm_topk_probs
+python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --topk_over_softmax --norm_topk_probs
 ```
 
 - SonicMoE with token rounding routing (SwiGLU activation)
