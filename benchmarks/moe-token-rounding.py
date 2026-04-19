@@ -156,8 +156,8 @@ def ref_moe_token_rounding(
 
             w1_out = F.linear(x[T_idx, :], w1[i, :, :].squeeze(), bias=(b1[i] if b1 is not None else None))
             if concat_layout:
-                I = w1_out.shape[-1] // 2
-                w1_out = F.silu(w1_out[:, :I]) * w1_out[:, I:]
+                g, u = torch.chunk(w1_out, 2, dim=-1)
+                w1_out = F.silu(g) * u
             else:
                 w1_out = F.silu(w1_out[:, ::2]) * w1_out[:, 1::2]
 

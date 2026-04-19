@@ -77,21 +77,19 @@ gemm_dgated_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_confi
 # ─────────────── Monkey-patch ends ───────────────
 
 
-def swiglu(x: torch.Tensor, concat_layout: bool = False) -> torch.Tensor:
+def swiglu(h: torch.Tensor, concat_layout: bool = False) -> torch.Tensor:
     if concat_layout:
-        I = x.shape[-1] // 2
-        g, u = x[..., :I], x[..., I:]
+        g, u = torch.chunk(h, 2, dim=-1)
     else:
-        u, g = x[..., 1::2], x[..., ::2]
+        u, g = h[..., 1::2], h[..., ::2]
     return u * F.silu(g)
 
 
-def geglu(x: torch.Tensor, concat_layout: bool = False) -> torch.Tensor:
+def geglu(h: torch.Tensor, concat_layout: bool = False) -> torch.Tensor:
     if concat_layout:
-        I = x.shape[-1] // 2
-        g, u = x[..., :I], x[..., I:]
+        g, u = torch.chunk(h, 2, dim=-1)
     else:
-        u, g = x[..., 1::2], x[..., ::2]
+        u, g = h[..., 1::2], h[..., ::2]
     return F.gelu(g.float()).to(dtype=g.dtype) * u
 
 
@@ -99,12 +97,11 @@ def gelu(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x.float()).to(dtype=x.dtype)
 
 
-def reglu(x: torch.Tensor, concat_layout: bool = False) -> torch.Tensor:
+def reglu(h: torch.Tensor, concat_layout: bool = False) -> torch.Tensor:
     if concat_layout:
-        I = x.shape[-1] // 2
-        g, u = x[..., :I], x[..., I:]
+        g, u = torch.chunk(h, 2, dim=-1)
     else:
-        u, g = x[..., 1::2], x[..., ::2]
+        u, g = h[..., 1::2], h[..., ::2]
     return (F.relu(g.float()) * u).to(dtype=g.dtype)
 
 
