@@ -10,7 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "nvidia-cutlass-dsl==4.4.2",
     "torch>=2.7.1,<=2.9.1",
-    "quack-kernels>=0.3.10",
+    "quack-kernels>=0.3.11",
 ]
 
 [project.optional-dependencies]

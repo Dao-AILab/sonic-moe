@@ -89,7 +89,7 @@ def _up_projection_forward(
         postact_out=a,
         store_preact=(not is_inference_mode_enabled),
         bias=b1,
-        concat_layout=(("B",) if concat_layout else None),
+        concat_layout=(("B", "bias") if b1 is not None else ("B",)) if concat_layout else None,
     )
 
 
