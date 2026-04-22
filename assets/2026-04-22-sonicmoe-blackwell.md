@@ -4,7 +4,7 @@ Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 
 [![arXiv](https://img.shields.io/badge/arXiv-2512.14080-b31b1b.svg)](https://arxiv.org/abs/2512.14080) [![Code](https://img.shields.io/badge/GitHub-SonicMoE-blue?logo=github)](https://github.com/Dao-AILab/sonic-moe) [![PyPI](https://img.shields.io/pypi/v/sonic-moe?cache=no)](https://pypi.org/project/sonic-moe/)
 
-<p align="center"><img src="media/blogpost_teasor.png" width="100%"></p>
+<p align="center"><img src="./media/blogpost_teasor.png" width="100%"></p>
 <p align="center"><em>Figure: SonicMoE's per-layer activation memory footprint (left) stays constant even when expert granularity (embedding dimension / expert intermediate dimension) increases, and SonicMoE can achieve 1.87-4.04x relative speedup compared to existing MoE training kernels ScatterMoE and MoMoE. </em></p>
 
 
@@ -15,7 +15,7 @@ Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 Mixture-of-Experts (MoE) models have become the dominant architecture for scaling language models without proportionally increasing compute. The appeal is straightforward: by routing each token to a small subset of $K$ out of $E$ expert networks, we get a model with hundreds of billions of parameters at the compute cost of a much smaller dense model. The training FLOP savings and quality improvements are well-established, but they come with hardware costs that grow worse as models become more fine-grained.
 
 
-<p align="center"><img src="media/finegrained-MoE.png" width="70%"></p>
+<p align="center"><img src="./media/finegrained-MoE.png" width="70%"></p>
 <p align="center"><em>Figure: fine-grained MoE architecture [1] </em></p>
 
 Two architectural dimensions define how an MoE model trades off quality and efficiency. 
@@ -28,7 +28,7 @@ MoE scaling laws, from controlled experiments (e.g. [Krajewski et al.](https://a
 
 However, the pursuit of granularity and sparsity comes with two painful hardware costs:
 
-<p align="center"><img src="media/act-mem-io-vs-granularity.png" width="90%"></p>
+<p align="center"><img src="./media/act-mem-io-vs-granularity.png" width="90%"></p>
 <p align="center"><em>Figure: Per-layer activation memory (left) and forward IO costs (right) as expert granularity increases. We fix microbatch size as 32768 and each model's embedding dimension, then vary the expert intermediate size while keeping training FLOPs and parameter count constant. </em></p>
 
 
@@ -68,28 +68,28 @@ In MoE, each expert usually receives a different number of tokens, and input tok
 
 For the forward pass and backward activation gradient, we would need Grouped GEMM with input shapes that have constant $N$ and $K$ (embedding dimension and expert intermediate dimension) but different $M$ (the number of routed tokens per expert). **We call this varlen-M Grouped GEMM**. (CUTLASS would describe it as *Grouped GEMM with ragged M dimensions*). For the backward weight gradient, we would reduce over token embeddings for each expert GEMM, in which $M$ and $N$ (embedding dimension and expert intermediate dimension) are fixed but the $K$ dimension varies. **We call this varlen-K Grouped GEMM**. 
 
-<p align="center"><img src="media/input-formats.png" width="36%" style="margin-right: 50px;">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<img src="media/grouped-gemm.png" width="47%"></p>
+<p align="center"><img src="./media/input-formats.png" width="36%" style="margin-right: 50px;">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<img src="./media/grouped-gemm.png" width="47%"></p>
 <p align="center"><em>Left: Each expert gathers inputs from different positions on an input tensor (top) or reads a contiguous chunk on a grouped input array (bottom). Right: Illustration of using Grouped GEMM in MoE.</em></p>
 
 
 We can use varlen-M Grouped GEMM to build a standard MoE forward pass as demonstrated in the following code snippet. 
-<p align="center"><img src="media/standard-illustration.png" width="100%"></p>
+<p align="center"><img src="./media/standard-illustration.png" width="100%"></p>
 <p align="center"><em>Figure: Visual workflow (left) with corresponding reference code (right) of standard MoE forward pass in PyTorch. Each yellow dashed line marks a kernel boundary. The standard implementation launches 6 separate kernels: gather, up-proj Grouped GEMM, SwiGLU, down-proj Grouped GEMM, scatter, and expert aggregation.</em></p>
 
 
 This can be simplified to the following workflow diagram:
-<p align="center"><img src="media/standard-workflow-forward.png" width="100%"></p>
+<p align="center"><img src="./media/standard-workflow-forward.png" width="100%"></p>
 <p align="center"><em>Figure: Workflow of standard MoE implementation forward pass. π is the binary mask that stores routing metadata. <font color="#fedd26">Yellow boxes</font> are kernel boundaries. <font color="blue">Blue boxes</font> are variables in HBM. <font color="red">Red labels</font> indicate the activations cached across the forward/backward. <font color="purple">Purple boxes</font> are the final outputs. The <font color="orange">orange box</font> beside each variable on global memory represents the tensor size in proportion for Qwen3-235B-A22B-Thinking-2507 MoE model with 32k tokens.</em></p>
 
 The workflow of backward activation gradient is simply a reverse operation with dSwiGLU as follows:
 
-<p align="center"><img src="media/standard-workflow-backward-activation.png" width="100%"></p>
+<p align="center"><img src="./media/standard-workflow-backward-activation.png" width="100%"></p>
 <p align="center"><em>Figure: Workflow of standard MoE implementation backward activation gradient pass.</em></p>
 
 
 For weight gradient, we need to use varlen-K Grouped GEMM to reduce over token embeddings. 
 
-<p align="center"><img src="media/standard-workflow-backward-weight.png" width="70%"></p>
+<p align="center"><img src="./media/standard-workflow-backward-weight.png" width="70%"></p>
 <p align="center"><em>Figure: Workflow of standard MoE implementation backward weight gradient pass.</em></p>
 
 The standard implementation materializes every intermediate tensor in HBM between kernel launches. This creates two separate costs that both scale with expert granularity:
@@ -126,12 +126,12 @@ In particular, SonicMoE avoids caching down-proj output $Y$, scattered $Y$, and 
 
 **SonicMoE's forward pass.** In the forward pass, SonicMoE only caches $X$ and $H$. The gathered results for $X$ are *never* cached or materialized. The expert aggregation kernel fuses the scatter and summation together.
 
-<p align="center"><img src="media/forward-workflow.png" width="100%"></p>
+<p align="center"><img src="./media/forward-workflow.png" width="100%"></p>
 <p align="center"><em>Figure: SonicMoE's forward computational workflow and comparison with a standard MoE implementation in PyTorch. We also compare the activation memory and IO costs for both methods.</em></p>
 
 The following figure gives a brief comparison on the activation memory breakdown. SonicMoE caches only inputs $X$ and pre-SwiGLU activation $H$ and *does not need any GEMM recomputation*.
 
-<p align="center"><img src="media/moe-activation-memory-qwen.png" width="40%"></p>
+<p align="center"><img src="./media/moe-activation-memory-qwen.png" width="40%"></p>
 <p align="center"><em>Figure: illustration of cached activation memory for a single layer of Qwen3-235B MoE model (microbatch=32k) when equipped with different training kernels.</em></p>
 
 > [!NOTE]
@@ -147,22 +147,22 @@ Each variable that is no longer cached is also one fewer read or write to HBM. T
 
 - **Activation gradient**: The down-proj activation grad $dH$ kernel computes $dH$, $dS$, and $A'$ (input for $dW_2$) simultaneously, none of which require caching $Y$ or $dY$. We similarly fuse dSwiGLU and the gather operation into the GEMM.
 
-  <p align="center"><img src="media/backward-activation-workflow.png" width="100%"></p>
+  <p align="center"><img src="./media/backward-activation-workflow.png" width="100%"></p>
   <p align="center"><em>Figure: SonicMoE's backward computational workflow for activation gradient and comparison with a standard MoE implementation in PyTorch.</em></p>
 
 - **Weight gradient**: The weight gradient kernels for $dW_1$ and $dW_2$ gather $X$ and $dO$ on the fly during execution. While their *algorithmic IO costs* match a standard MoE implementation, SonicMoE's gather fusion reduces the *hardware IO costs* by exploiting L2 cache locality, which we will discuss later.
 
-  <p align="center"><img src="media/backward-weight-workflow.png" width="80%"></p>
+  <p align="center"><img src="./media/backward-weight-workflow.png" width="80%"></p>
   <p align="center"><em>Figure: SonicMoE's backward computational workflow for weight gradient and comparison with a standard MoE implementation in PyTorch.</em></p>
 
 The net effect is a large reduction in IO costs even before any hardware-specific optimizations:
 
-<p align="center"><img src="media/moe-io-costs-qwen-fwd.png" width="40%"><img src="media/moe-io-costs-qwen-bwd.png" width="40%"></p>
+<p align="center"><img src="./media/moe-io-costs-qwen-fwd.png" width="40%"><img src="./media/moe-io-costs-qwen-bwd.png" width="40%"></p>
 <p align="center"><em>Figure: Illustration of IO costs for a single layer of Qwen3-235B MoE model (microbatch=32k) when equipped with different training kernels. SonicMoE's workflow circumvents the need to read or write multiple massive-sized tensors compared to existing MoE kernels.</em></p>
 
 Among these kernels, we want to give a special highlight to our backward down-proj activation gradient $dH$ kernel as a combination of IO-aware and hardware-aware algorithmic design:
 
-<p align="center"><img src="media/dH-kernel-comparison.png" width="100%"></p>
+<p align="center"><img src="./media/dH-kernel-comparison.png" width="100%"></p>
 <p align="center"><em>Figure: the semantics of SonicMoE's dH workflow diagram is equivalent to standard PyTorch MoE implementation for multiple kernels while SonicMoE substantially reduces the IO costs. </em></p>
 
 
@@ -171,7 +171,7 @@ Among these kernels, we want to give a special highlight to our backward down-pr
 
 - **hardware asynchrony features that further hide the remaining IO cost latency** (will discuss later): the design of this $dH$ kernel already reduces IO costs, and we further minimize the remaining impact of IO costs by leveraging the asynchrony features on modern NVIDIA GPUs.
 
-<p align="center"><img src="media/backward-dH-overlap.png" width="50%"></p>
+<p align="center"><img src="./media/backward-dH-overlap.png" width="50%"></p>
 <p align="center"><em>Figure: we can leverage recent NVIDIA hardware features to hide the IO latency in SonicMoE's dH kernel and greatly reduce the overall runtime. </em></p>
 
 
@@ -198,13 +198,13 @@ Below, we examine the design of QuACK GEMM and how it helps SonicMoE achieve pea
 
 A General Matrix Multiplication (GEMM) kernel on NVIDIA GPUs repeatedly fetches tiles of input data $A,B$ ($A$ is usually the activations while $B$ is the weights), and we accumulate the tiled MMA (matrix multiply-accumulate) results into a zero-initialized buffer $C$ (often the output activations).
 
-<p align="center"><img src="media/gemm.png" width="30%"></p>
+<p align="center"><img src="./media/gemm.png" width="30%"></p>
 <p align="center"><em>Figure: illustration of GEMM tiled accumulation [2]</em></p>
 
 
 #### Repeated 3-phase Accumulation for Each Output Tile
 
-<p align="center"><img src="media/gemm-in-3-phase.png" width="60%"></p>
+<p align="center"><img src="./media/gemm-in-3-phase.png" width="60%"></p>
 <p align="center"><em>Figure: each Streaming Processor (SM) on GPUs will perform tiled MMA in 3 phases until no tiles left. Usually there will be a persistent tile scheduler that schedules which tile each SM will receive. Adapted from [3]. </em></p>
 
 For every output tile, the accumulation process is formulated into three phases:
@@ -244,7 +244,7 @@ The `epi_visit_subtile` method is a no-op in the base class. Subclasses override
 
 Each epilogue mixin (e.g., `GemmGatedMixin` for SwiGLU, `GemmDGatedMixin` for the $dH$ backward) is paired with an architecture-specific base class: `GemmGatedSm90` / `GemmGatedSm100`, `GemmDGatedSm90` / `GemmDGatedSm100`, etc. The architecture-specific suffix controls only the warp layout, accumulator movement (registers vs. tensor memory), and hardware resource management. **The epilogue fusion logic in `epi_visit_subtile` is shared across architectures.** For example, the heaviest kernel in SonicMoE is just a `GemmDGatedMixin` with additional arguments, implemented in 88 lines:
 
-<p align="center"><img src="media/quack-sonicmoe-code.png" width="100%"></p>
+<p align="center"><img src="./media/quack-sonicmoe-code.png" width="100%"></p>
 <p align="center"><em>Figure: Two SonicMoE kernels implemented with QuACK. Left: the kernel workflow diagram. Center: the QuACK epilogue mixin class where each kernel overrides `epi_visit_subtile` (88 LoC for dH, 21 LoC for up-proj forward). Right: SonicMoE's simplified kernel launch call. </em></p>
 
 In total, this software abstraction on QuACK delivers three properties we prioritize:
@@ -281,7 +281,7 @@ The software abstraction described in the previous section was designed so that 
 
 For example, the down-proj forward kernel's epilogue has heavy HBM store IO relative to the mainloop. In the $dH$ kernel's epilogue, we need to load $H$ and execute multiple activation and reduction operations to compute and store $dH$, $dS$, and $A'$ as inputs for $dW_2$. 
 
-<p align="center"><img src="media/pingpong-hopper.png" width="100%"></p>
+<p align="center"><img src="./media/pingpong-hopper.png" width="100%"></p>
 <p align="center"><em>Figure: Hopper Ping-Pong: two consumer warpgroups alternate between MMA and epilogue: while one runs Tensor Core MMA, the other
 runs the epilogue (TMA store + any async load). Green arrows show the signal from one warpgroup that the other can proceed. </em></p>
 
@@ -290,13 +290,13 @@ runs the epilogue (TMA store + any async load). Green arrows show the signal fro
 
 TMEM is organized as 128 rows × 512 columns of 32-bit cells, for a total of 256 KB per SM. The 512-column structure can hold two independent accumulator stages of 256 columns each. This is the hardware basis for Blackwell's MMA/epilogue overlap as shown below.
 
-<p align="center"><img src="media/tmem-blackwell.png" width="50%"></p>
+<p align="center"><img src="./media/tmem-blackwell.png" width="50%"></p>
 <p align="center"><em>Figure: TMEM column ownership transfer between MMA warp and epilogue warps. This technique is often referred to as "double-buffering".</em></p>
 
 
 While the MMA warp accumulates into one 256-column stage, the epilogue warps are simultaneously draining the other stage via `tcgen05.ld` (the TMEM-to-register copy instruction) and performing epilogue ops afterwards. When the epilogue warps finish and signal via the accumulator pipeline, the MMA warp acquires the next stage and begins filling it. The stages alternate every tile. **This is Ping-Pong in spirit as it overlaps MMA with epilogue IO.**
 
-<p align="center"><img src="media/pingpong-blackwell.png" width="100%"></p>
+<p align="center"><img src="./media/pingpong-blackwell.png" width="100%"></p>
 <p align="center"><em>Figure: Blackwell warp-specialized pipeline: one producer warp (top), one MMA warp (middle), multiple epilogue warps (bottom) running concurrently. Green arrows show the ready signal of TMEM stage from the MMA to epilogue warp. Yellow arrows show the release signal of TMEM stage from the epilogue to MMA warp. </em></p>
 
 
@@ -306,7 +306,7 @@ A second major Blackwell feature is the `cta_group::2` variant of UMMA. When thi
 
 For a tile of shape $M_\mathrm{tile} \times N_\mathrm{tile} \times K_\mathrm{tile}$, the number of FLOPs is $2 M_\mathrm{tile} N_\mathrm{tile} K_\mathrm{tile}$ and the number of bytes loaded from SMEM is $2(M_\mathrm{tile} K_\mathrm{tile} + N_\mathrm{tile} K_\mathrm{tile})$ for A and B. For fixed $N_\mathrm{tile}$ and $K_\mathrm{tile}$, doubling $M_\mathrm{tile}$ doubles the FLOPs but only adds $2M_\mathrm{tile} K_\mathrm{tile}$ bytes of A data — the B tile of shape $N_\mathrm{tile} \times K_\mathrm{tile}$ is *shared* across the pair, so each CTA loads only half the B data it would need for two independent 1CTA tiles. This is the key benefit: the B tile is multicasted via TMA across the CTA pair, halving B-side SMEM traffic per output element.
 
-<p align="center"><img src="media/2cta-mma.png" width="60%"></p>
+<p align="center"><img src="./media/2cta-mma.png" width="60%"></p>
 <p align="center"><em>Figure: independent 1CTA MMA (left) vs. 2CTA MMA, referred to as 2xSM MMA in the figure (right). Left: two separate CTAs each load a full B tile and hold a full accumulator in TMEM. Right: in 2CTA MMA, B tile is halved and shared. Each CTA holds the full accumulator on TMEM but loads only half the B data. [4] </em></p>
 
 
@@ -321,13 +321,13 @@ On Hopper, we often have a fixed, *static* linear pre-assignment of tiles to CTA
 
 Blackwell introduces **Cluster Launch Control (CLC)**: a hardware instruction `clusterlaunchcontrol.try_cancel` that lets a running cluster query the hardware for its next tile coordinate without touching GMEM atomics. The hardware manages the work queue, operates at cluster granularity, and returns either a tile coordinate or a decline signal when all tiles are processed. The query to the hardware has minimal overhead and the response is broadcast to the whole cluster at once, eliminating per-CTA atomic traffic entirely.
 
-<p align="center"><img src="media/non-persistent-heatmap.png" width="40%"><img src="media/clc-heatmap.png" width="40%"></p>
+<p align="center"><img src="./media/non-persistent-heatmap.png" width="40%"><img src="./media/clc-heatmap.png" width="40%"></p>
 <p align="center"><em>Figure: SM heatmap without persistent tile scheduler (left) and with CLC tile scheduler (right) [5]. The CLC tile scheduler can help all SMs stay active throughout the kernel runtime.  </em></p>
 
 
 **The CLC tile scheduler and extensive use of 2CTA MMA in varlen-M Grouped GEMM already help SonicMoE to achieve higher throughput (~10\%) than both [DeepGEMM sm100_m_grouped_bf16_gemm_contiguous](https://github.com/deepseek-ai/DeepGEMM/blob/d30fc36c8f229f4f873b90a492f6e19e6e610923/csrc/jit_kernels/impls/sm100_bf16_gemm.hpp#L124) and [triton official example](https://github.com/triton-lang/triton/blob/7d0756121cc95d6971112fc5c1fa99107b892444/python/triton_kernels/triton_kernels/matmul_details/_p_matmul.py#L57).** We compare SonicMoE's implementation with the DeepGEMM and triton official example in the appendix.
 
-<p align="center"><img src="media/grouped_gemm_benchmark-B300.png" width="100%"></p>
+<p align="center"><img src="./media/grouped_gemm_benchmark-B300.png" width="100%"></p>
 <p align="center"><em>Figure: Varlen-M Grouped GEMM with contiguously-packed inputs on B300 GPUs. Detailed descriptions of other baselines can be found in the caption of Figure 18 of our arXiv paper. </em></p>
 
 
@@ -343,12 +343,12 @@ Multiple varlen-M GEMMs in SonicMoE read tokens from arbitrary positions in the 
 - **`cp.async` gather fusion with 2CTA MMA.** When 2CTA MMA is combined with cp.async gather fusion, a synchronization challenge arises: cp.async can only signal completion within its own CTA, **but the leader CTA's MMA needs both CTAs' data ready.** We resolve this with a dedicated relay warp in CTA 1 (non-leader) that forwards the completion signal to CTA 0 (leader) via a cluster-scope barrier.
 
 
-<p align="center"><img src="media/relay-2CTA.png" width="40%"></p>
+<p align="center"><img src="./media/relay-2CTA.png" width="40%"></p>
 <p align="center"><em>Figure: 2CTA MMA relay mechanism. CTA 0 (top) as the leader CTA: 1 warp fetches indices, 4 warps issue `cp.async` gathers, 1 warp issues the 2CTA MMA instruction after waiting at its barrier. CTA 1 (bottom): 1 warp fetches indices, 4 warps issue `cp.async` gathers, 1 relay warp waits for the `cp.async` completion and then arrives at CTA 0's barrier. </em></p>
 
 We then compare the speed of SonicMoE's gather fusion against other MoE kernels' GEMM with a separate gather kernel or with gather fusion. SonicMoE's gather fusion is only 1.4% slower on the M dimension and 0.5% faster on the K dimension relative to contiguous inputs. Therefore, SonicMoE consistently achieves higher TFLOPS than ScatterMoE, MoMoE, and the triton official example even with gather fusion.
 
-<p align="center"><img src="media/gather_grouped_gemm_benchmark-B300.png" width="100%"></p>
+<p align="center"><img src="./media/gather_grouped_gemm_benchmark-B300.png" width="100%"></p>
 <p align="center"><em>Figure: Forward pass up-proj (gather on M dim) and backward dW1 kernel (gather on K dim) kernel on B300 GPUs. SonicMoE supports both inputs gathered from different positions (opaque bars) and contiguously-packed inputs (transparent bars). Detailed descriptions of other baselines can be found in the caption of Figure 19 of our arXiv paper. </em></p>
 
 #### Gather Fusion Reduces *Hardware* IO costs via L2 Cache Locality
@@ -357,7 +357,7 @@ The L2 cache sits between HBM and SMEM in the GPU memory hierarchy and is shared
 
 A common alternative to gather fusion is to run a separate gather kernel that pre-arranges the inputs into a contiguous buffer before the Grouped GEMM. Although both approaches have identical *algorithmic IO costs* (assuming no TMA multicast along the N dimension), gather fusion reduces the actual HBM load traffic through better L2 cache utilization.
 
-<p align="center"><img src="media/gather-fusion-L2.png" width="100%"></p>
+<p align="center"><img src="./media/gather-fusion-L2.png" width="100%"></p>
 <p align="center"><em>Figure: Gather fusion (left) reads from a compact source tensor. Contiguous load (right) reads from a K times larger tensor where each token is duplicated across K distinct addresses, expanding the working set beyond L2 capacity as granularity increases. </em></p>
 
 
@@ -376,7 +376,7 @@ SonicMoE applies the activation function in-register before any data leaves the 
 ### Overlapping IO with MMA Compute: $dH$ kernel
 SonicMoE overlaps IO with MMA whenever possible. Here we focus on the $dH$ kernel which has the heaviest epilogue in SonicMoE. To address this, we overlap the role of epilogue warps with the role of MMA warp by splitting the TMEM resources and employing dedicated TMA pipeline. 
 
-<p align="center"><img src="media/dH-kernel.png" width="50%"></p>
+<p align="center"><img src="./media/dH-kernel.png" width="50%"></p>
 <p align="center"><em>Figure: illustration of epilogue ops overlapped with GEMM MMA in SonicMoE's dH kernel. </em></p>
 
 
@@ -385,8 +385,8 @@ In the following figure, we examine the hardware unit utilization of SonicMoE's 
 - However, both the Tensor Core and Tensor Memory utilization only drop from 98% to 88% with the corresponding TFLOPS drop from 1213 to 1078 (11% decrease).
 
 
-<p align="center"><img src="media/ncu-profiles/32k-4k-1.5k-128-8-dH.png" width="47%">&nbsp;&nbsp;&nbsp;<img src="media/ncu-profiles/32k-4k-1.5k-128-8-gemm-alone.png" width="47.5%"></p>
-<p align="center"><img src="media/ncu-profiles/32k-4k-1.5k-128-8-dH-memory-chart.png" width="47%"> &nbsp;&nbsp;&nbsp;<img src="media/ncu-profiles/32k-4k-1.5k-128-8-gemm-alone-memory-chart.png" width="48%"></p>
+<p align="center"><img src="./media/ncu-profiles/32k-4k-1.5k-128-8-dH.png" width="47%">&nbsp;&nbsp;&nbsp;<img src="./media/ncu-profiles/32k-4k-1.5k-128-8-gemm-alone.png" width="47.5%"></p>
+<p align="center"><img src="./media/ncu-profiles/32k-4k-1.5k-128-8-dH-memory-chart.png" width="47%"> &nbsp;&nbsp;&nbsp;<img src="./media/ncu-profiles/32k-4k-1.5k-128-8-gemm-alone-memory-chart.png" width="48%"></p>
 <p align="center"><em>Figure: Nsight Compute Profiling of SonicMoE's dH kernel Grouped GEMM with 4 epilogue ops (left column) vs. Grouped GEMM alone (right column) of Qwen3-235B-A22B-Thinking-2507 (microbatch size=32k) on B300 GPUs. The top row is the achieved throughput of Tensor Pipe (MMA) and DRAM at kernel runtime, and the bottom row shows the transferred bytes on hardware units. </em></p>
 
 > [!NOTE]
@@ -403,7 +403,7 @@ We evaluate SonicMoE against multiple baselines on B300 GPUs. We benchmark the f
 
 The figure below shows forward and backward TFLOPS across six real open-source MoE configurations, ranging from a 7B to a 685B MoE model.
 
-<p align="center"><img src="media/real_moe_benchmark-B300.png" width="100%"></p>
+<p align="center"><img src="./media/real_moe_benchmark-B300.png" width="100%"></p>
 <p align="center"><em>Figure: Forward (left) and backward (right) TFLOPS on B300 for 6 real MoE configurations. From left to right: OLMoE-1B-7B-0125, gpt-oss-20b, Kimi-Linear-48B-A3B-Base, Qwen3-Next-80B-A3B-Thinking, Qwen3-235B-A22B-Thinking-2507, and DeepSeek-V3.2-Exp. Triton official example does not support backward pass, nor K=10 for Qwen3-Next-80B forward pass. </em></p>
 
 
@@ -430,7 +430,7 @@ The runtime breakdown below makes the speedup concrete. The "gather $X$" segment
 
 We note that **although Triton official example has gather fusion and *does not* store $H$ (as it is inference-oriented with no need of caching activation), SonicMoE is still faster for all three kernels during forward pass**. This is because SonicMoE employs a faster Grouped GEMM implementation with the CLC tile scheduler and 2CTA MMA, and the expert aggregation kernel is heavily optimized. Please refer to the appendix for more details.
 
-<p align="center"><img src="media/moe_breakdown_fwd_bwd-B300.png" width="100%"></p>
+<p align="center"><img src="./media/moe_breakdown_fwd_bwd-B300.png" width="100%"></p>
 <p align="center"><em>Figure: Runtime breakdown of SonicMoE vs baselines on B300 for a 7B OLMoE-sized MoE (T=32768, d=2048, n=1024, E=64, K=8). Detailed descriptions of other baselines can be found in the caption of Figure 5 of our arXiv paper. On this config, SonicMoE's major speedup comes from the gather fusion, and the faster GEMM delivers another 10% speedup. We abbreviate TFLOPS as "TF/s" in the figure. </em></p>
 
 
@@ -489,14 +489,14 @@ Below, we collect implementation comparisons and ablation studies that support t
 
 We first autotune on the best GEMM configs (tile shape, tile scheduler type, etc.) with `cp.async`, and then we switch in-place to TMA gather. In the following figure, we find that these two mechanisms deliver similar TFLOPS (diff < 2% for most cases). Nevertheless, we add whether to use TMA gather or cp.async gather as an autotunable configuration at kernel runtime.
 
-<p align="center"><img src="media/cpasync-tma-gather-comparison.png" width="100%"></p>
+<p align="center"><img src="./media/cpasync-tma-gather-comparison.png" width="100%"></p>
 <p align="center"><em>Figure: `cp.async` vs. TMA gather TFLOPS for forward pass up-proj (gather on M dim) and backward dW1 kernel (gather on K dim) kernels on B300 GPUs. Percentages indicate the relative TFLOPS difference of TMA gather over `cp.async`. </em></p>
 
 #### L2 Cache Locality with Gather Fusion
 
 We compare the gather fusion against running a separate gather kernel to pre-arrange the inputs into a contiguous buffer before feeding into the Grouped GEMM kernel. The Nsight Compute memory charts below show a varlen-M Grouped GEMM kernel with gather fusion (left) and with pre-gathered contiguous inputs (right). Despite nearly identical L2->SMEM traffic (17.74 GB), the gather fusion (left figure) shows less HBM load traffic (2.20 vs 2.68 GB) and higher L2 cache hit rate (74.9% vs 66.3%).
 
-<p align="center"><img src="media/ncu-profiles/olmoe-512-gather-memory-chart.png" width="48%">&nbsp;&nbsp;&nbsp;<img src="media/ncu-profiles/olmoe-512-TMA-memory-chart.png" width="48.5%"></p>
+<p align="center"><img src="./media/ncu-profiles/olmoe-512-gather-memory-chart.png" width="48%">&nbsp;&nbsp;&nbsp;<img src="./media/ncu-profiles/olmoe-512-TMA-memory-chart.png" width="48.5%"></p>
 <p align="center"><em>Figure: Nsight Compute memory chart for varlen-M Grouped GEMM during up-proj forward pass for MoE with size (T, d, n, E, K) = (32768, 2048, 512, 256, 32). Left: gather fusion with `cp.async`. Right: contiguous TMA load with pre-gathered inputs. Both use the same tile shape, scheduler configuration, and L2 swizzling pattern. </em></p>
 
 
@@ -508,7 +508,7 @@ This is because gather fusion's source tensor ($X$ or $dO$) often has size $T \t
 
 This advantage compounds with expert granularity. Gathered $X$ and gathered $dO$, which are inputs to four of SonicMoE's six Grouped GEMM kernels, are both $O(TKd)$-sized and grow linearly with $K$. The figures below confirm the trend across three model families: as granularity increases (from left to right on each column), the contiguous path's HBM load traffic grows faster and its L2 hit rate drops further relative to gather fusion.
 
-<p align="center"><img src="media/gather-l2-analysis.png" width="100%"></p>
+<p align="center"><img src="./media/gather-l2-analysis.png" width="100%"></p>
 <p align="center"><em>Figure: HBM load bytes (top row) and device L2 cache hit rate (bottom row) for gather fusion vs. contiguous load across varying expert granularity on B300 GPUs. Annotations on the top row show the absolute and relative HBM load increase of the contiguous path over gather fusion. Annotations on the bottom row show the L2 hit rate advantage of gather fusion. </em></p>
 
 
@@ -516,14 +516,14 @@ This advantage compounds with expert granularity. Gathered $X$ and gathered $dO$
 
 In SonicMoE's expert aggregation kernel, each token will gather the Grouped GEMM results and sum over them in parallel. No GEMM is involved and this is a memory-bound kernel. The first version was implemented on CuteDSL, but we later switched to a pure Triton implementation due to the convenience of autotuning. This kernel achieves close-to-peak memory bandwidth on Hopper; here we validate its performance on Blackwell:
 
-<p align="center"><img src="media/reduction_benchmark-B300.png" width="100%"></p>
+<p align="center"><img src="./media/reduction_benchmark-B300.png" width="100%"></p>
 <p align="center"><em>Figure: Expert aggregation kernel memory bandwidth on B300 across 1.4B, 7B, 30B, and 120B MoE configurations. SonicMoE's gather-and-sum kernel (blue) approaches the triton upper bound (grey, max of tl.load and TMA) at every scale. </em></p>
 
 **Surprisingly, we find this Triton implementation still performs well enough on Blackwell GPUs (B300).  This kernel surpasses 6.5 TB/s (85%+ peak) across most configs, achieving 98% of an optimized summation kernel on contiguous inputs.** We also find this simple aggregation kernel outperforms the [Gluon TMA gather-and-sum, adapted from Gluon official example](https://github.com/triton-lang/triton/blob/main/python/tutorials/gluon/09-tma-gather-scatter.py) implementation by 5% on average. This further suggests that gather with `cp.async` is not worse than TMA gather.
 
 ####  GEMM + gather-and-sum vs. GEMM with scatter + sum aggregation
 
-<p align="center"><img src="media/expert-agg.png" width="100%"></p>
+<p align="center"><img src="./media/expert-agg.png" width="100%"></p>
 <p align="center"><em>Figure: Possible strategies for storing the results and aggregating the results for each token. SonicMoE chooses the first strategy (left) in which each expert directly stores contiguously-packed outputs via TMA in the GEMM epilogue. In the expert aggregation kernel, each token gathers and sums over activated expert outputs. ScatterMoE and MoMoE (middle) choose to fuse HBM store with scatter in epilogue and launch a summation kernel afterwards. It is also possible to fuse atomic add in the epilogue to circumvent the requirement of an expert aggregation kernel as the right subfigure illustrated. </em></p>
 
 On Hopper GPUs, SonicMoE makes an unconventional design choice that we *do not* fuse scatter with GEMM. Instead, we perform this task alongside the aggregation. **We previously ablated on Hopper GPUs and identified that the synchronous `st.global` PTX instruction required for scatter fusion on Hopper would degrade TFLOPS by 20% for fine-grained MoE configs.**
@@ -539,7 +539,7 @@ We perform an ablation comparing varlen-M Grouped GEMM w. TMA + gather-and-sum a
 
 *Disclaimer: the Grouped GEMM kernel in this ablation study is implemented with triton with fewer low-level optimizations (e.g. without 2CTA MMA) than SonicMoE's Grouped GEMM, but it still provides insight on the relative performance comparison between GEMM w. TMA and GEMM w. TMA scatter4.*
 
-<p align="center"><img src="media/triton_example_grouped_gemm_expert_agg.png" width="100%"></p>
+<p align="center"><img src="./media/triton_example_grouped_gemm_expert_agg.png" width="100%"></p>
 <p align="center"><em>Figure: Throughput of varlen-M Grouped GEMM and expert aggregation kernel on B300 GPUs during forward pass. In the first row, we report the Grouped GEMM TFLOPS on transparent bars and the gemm-and-aggregation TFLOPS on opaque bars. In the second row, we compare the expert aggregation bandwidth between gather-and-sum and a contiguous sum kernel.</em></p>
 
 In the first row,
