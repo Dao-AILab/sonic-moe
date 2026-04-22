@@ -5,7 +5,7 @@
 import torch
 from parameterized import parameterized
 
-from sonicmoe import KernelBackendMoE, MoE, enable_quack_gemm
+from sonicmoe import KernelBackendMoE, MoE
 from sonicmoe.enums import ActivationType
 
 from .test_commons import TestCommons
@@ -23,7 +23,8 @@ class MoETest(TestCommons):
             [torch.device("cuda")],
             [torch.bfloat16],
             [
-                ((16384 + 512) * 16, 512, 512, 128, 8)(8192, 768, 256, 128, 8),
+                ((16384 + 512) * 16, 512, 512, 128, 8),
+                (8192, 768, 256, 128, 8),
                 (8192, 768, 512, 64, 4),
                 (8192, 768, 1024, 32, 2),
                 (8192, 1536, 256, 128, 8),
@@ -37,7 +38,9 @@ class MoETest(TestCommons):
                 (8192, 4096, 2048, 64, 4),
             ],
             [KernelBackendMoE.sonicmoe],  # kernel_backend_moe
-            [False, True],  # is_compiling
+            [
+                False,
+            ],  # is_compiling
             [False, True],  # add_bias
             [False, True],  # use_quack_gemm
         )
@@ -85,8 +88,7 @@ class MoETest(TestCommons):
         x_kernel = x_torch.clone().detach().requires_grad_()
 
         with torch.autocast(x_torch.device.type, torch.float32):
-            with enable_quack_gemm(use_quack_gemm):
-                y_kernel = moe_kernel(x_kernel, kernel_backend_moe=kernel_backend_moe)[0]
+            y_kernel = moe_kernel(x_kernel, kernel_backend_moe=kernel_backend_moe)[0]
 
             y_torch = moe_torch(x_torch, kernel_backend_moe=KernelBackendMoE.torch)[0]
             self.assert_equal_tensors(

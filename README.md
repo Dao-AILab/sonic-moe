@@ -12,6 +12,8 @@ Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 
 ## News
 
+- 04/22/2026: We release a [blogpost](./assets/2026-04-22-sonicmoe-blackwell.md) on SonicMoE's activation memory-efficient and IO-aware design, and how we extend it to Blackwell GPUs through [QuACK](https://github.com/Dao-AILab/quack)'s software abstraction.
+
 - 04/19/2026: we release SonicMoE with Blackwell (SM100) support, built on [QuACK](https://github.com/Dao-AILab/quack)'s Grouped GEMM kernels. 
 
 ## 📦 Installation

@@ -23,6 +23,7 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["sonicmoe*"]
+exclude = ["assets*", "benchmarks*", "tests*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "sonicmoe.__version__"}
