@@ -236,14 +236,10 @@ def _general_metadata_compute_stage2(
     entry_idx = pid_m * BLOCK_SIZE + presort_offs
     token_idx = tl.load(sorted_selected_T_ptr + entry_idx, mask=mask)
 
-    # EP sentinel handling: zero `s_reverse_scatter_val` at sentinel slots so the s_reverse_scatter_idx
-    # store below writes 0 there. Without this, real entries (entry_idx < TK) routed to sentinel
-    # experts would leave that position uninitialized, and the downstream reduction would index OOB
-    # / pull NaN from a recycled gemm_out row. The other two stores still gate on `mask`, so the
-    # zeroed value never reaches them.
-    s_reverse_scatter_val = tl.where(mask, s_reverse_scatter_val, 0)
-
-    tl.store(s_reverse_scatter_idx_ptr + entry_idx, s_reverse_scatter_val, mask=entry_idx < TK)
+    # Sentinel lanes (expert == E) and the output-indexed tail [sum_valid, TK) of s_scatter_idx /
+    # x_gather_idx are left untouched here — the caller zero-inits these arrays so downstream reads
+    # (`topk_scores[s_scatter_idx]`, `gemm_dgated(A_idx=...)`, reverse scatter) are well-defined.
+    tl.store(s_reverse_scatter_idx_ptr + entry_idx, s_reverse_scatter_val, mask=mask)
     tl.store(s_scatter_idx_ptr + s_reverse_scatter_val, entry_idx, mask=mask)
     tl.store(x_gather_idx_ptr + s_reverse_scatter_val, token_idx, mask=mask)
 
@@ -350,7 +346,7 @@ def general_routing_router_metadata_triton(
         TK,
         col_partial_sum,
         n_tiles,
-        expert_frequency_offset[:E],
+        expert_frequency_offset,  # full (E+1,) — kernel reads `[E]` for the sum-of-valid sentinel boundary
         E=E,
         BLOCK_SIZE=BLOCK_SIZE,
     )

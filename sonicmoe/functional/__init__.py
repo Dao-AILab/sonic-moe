@@ -447,11 +447,13 @@ def moe_general_routing_inputs(
     if router_scores.dtype != torch.float32:
         router_scores = router_scores.float()
 
-    s_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
-    s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    # Zero-init: EP sentinel lanes (expert == E) and the output-indexed tail [sum_valid, TK) are
+    # not written by the routing kernel; downstream reads see well-defined zeros.
+    s_scatter_idx = torch.zeros(TK, dtype=torch.int32, device=device)
+    s_reverse_scatter_idx = torch.zeros(TK, dtype=torch.int32, device=device)
     expert_frequency = torch.empty(E, dtype=torch.int32, device=device)
     expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
-    x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    x_gather_idx = torch.zeros(TK, dtype=torch.int32, device=device)
     num_activated_expert_per_token_offset = torch.empty(T + 1, dtype=torch.int32, device=device)
 
     general_routing_router_metadata_triton(
