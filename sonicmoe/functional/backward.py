@@ -376,6 +376,7 @@ def _softmax_over_topk_bwd_kernel(
     stride_gk: tl.constexpr,
     stride_im: tl.constexpr,
     stride_ik: tl.constexpr,
+    E: tl.constexpr,
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     dlogits_is_none: tl.constexpr,
@@ -390,16 +391,21 @@ def _softmax_over_topk_bwd_kernel(
     s_sel = tl.load(score_ptr + row * stride_sm + k_offs * stride_sn, mask=k_mask, other=0).to(tl.float32)
     g_sel = tl.load(dscore_ptr + row * stride_gm + k_offs * stride_gk, mask=k_mask, other=0).to(tl.float32)
 
+    # Sentinel slots (idx == E) carry no gradient and must not be loaded/stored at column E
+    # of the (T, E)-shaped dlogits buffer — that address is OOB.
+    valid_mask = k_mask & (idx < E)
+    safe_idx = tl.where(valid_mask, idx, 0)
+
     # dot = sum_j g_j * y_j over selected columns
     dot = tl.sum(g_sel * s_sel, axis=0)
 
     # scatter-only: dx[idx] += y_sel * (g_sel - dot)
     add_vals = s_sel * (g_sel - dot)
 
-    indices = row * stride_dm + idx * stride_dn
+    indices = row * stride_dm + safe_idx * stride_dn
     if not dlogits_is_none:
-        add_vals += tl.load(dlogits_ptr + indices, mask=k_mask)
-    tl.store(dlogits_full_ptr + indices, add_vals, mask=k_mask)
+        add_vals += tl.load(dlogits_ptr + indices, mask=valid_mask)
+    tl.store(dlogits_full_ptr + indices, add_vals, mask=valid_mask)
 
 
 @triton.jit
@@ -465,19 +471,26 @@ def _topk_over_softmax_bwd_kernel(
         other=0,
     ).to(tl.float32)
 
+    # Sentinel slots (idx == E) must not gather from logits[row, E] (OOB column) and must
+    # not contribute to the dp scatter — zero-out their dp_sel and remap idx to 0.
+    valid_mask = k_mask & (idx < E)
+    safe_idx = tl.where(valid_mask, idx, 0)
+
     # p at selected indices (gather from global mem; can't index register tensor)
     sel_logits = tl.load(
-        logits_ptr + row * stride_lm + idx * stride_le,
-        mask=k_mask,
+        logits_ptr + row * stride_lm + safe_idx * stride_le,
+        mask=valid_mask,
         other=-float("inf"),
     ).to(tl.float32)
     p_sel = tl.exp(sel_logits - row_max) / row_sum  # (BLOCK_K,)
+    p_sel = tl.where(valid_mask, p_sel, 0.0)
+    g_sel = tl.where(valid_mask, g_sel, 0.0)
 
     # --- Backward through optional renormalization ---
     if norm_topk_probs:
         scores = tl.load(
             score_ptr + row * stride_scm + k_offs * stride_scn,
-            mask=k_mask,
+            mask=valid_mask,
             other=0,
         ).to(tl.float32)
         dot_s = tl.sum(g_sel * scores, axis=0)
@@ -485,6 +498,7 @@ def _topk_over_softmax_bwd_kernel(
         dp_sel = (g_sel - dot_s) / S
     else:
         dp_sel = g_sel
+    dp_sel = tl.where(valid_mask, dp_sel, 0.0)
 
     # dot = Σ dp_sel_j * p_sel_j
     dot = tl.sum(dp_sel * p_sel, axis=0)
@@ -495,7 +509,7 @@ def _topk_over_softmax_bwd_kernel(
     dp = tl.zeros([BLOCK_E], dtype=tl.float32)
     for k_iter in tl.static_range(K):
         cur_dp = tl.sum(tl.where(k_offs == k_iter, dp_sel, 0.0))
-        cur_idx = tl.sum(tl.where(k_offs == k_iter, idx, 0))
+        cur_idx = tl.sum(tl.where(k_offs == k_iter, safe_idx, 0))
         dp = tl.where(e_offs == cur_idx, cur_dp, dp)
 
     # --- dlogits = p * (dp - dot) for all E ---
@@ -538,6 +552,7 @@ def _topk_softmax_bwd(
             dtopk_score.stride(1),
             topk_router_indices.stride(0),
             topk_router_indices.stride(1),
+            E,
             K,
             triton.next_power_of_2(K),
             (dlogits is None),
@@ -580,6 +595,7 @@ def _topk_bwd_scatter_small_kernel(
     stride_gk: tl.constexpr,
     stride_im: tl.constexpr,
     stride_ik: tl.constexpr,
+    E: tl.constexpr,
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -592,11 +608,15 @@ def _topk_bwd_scatter_small_kernel(
     idx = tl.load(idx_ptr + row * stride_im + k_offs * stride_ik, mask=k_mask, other=0).to(tl.int32)
     g_sel = tl.load(dscore_ptr + row * stride_gm + k_offs * stride_gk, mask=k_mask, other=0).to(tl.float32)
 
+    # Skip sentinel slots — column E is OOB on the (T, E)-shaped dlogits buffer.
+    valid_mask = k_mask & (idx < E)
+    safe_idx = tl.where(valid_mask, idx, 0)
+
     # scatter-only: dx[idx] += y_sel * (g_sel - dot)
     add_vals = g_sel
 
-    indices = row * stride_dm + idx * stride_dn
-    tl.store(dlogits_full_ptr + indices, add_vals, mask=k_mask)
+    indices = row * stride_dm + safe_idx * stride_dn
+    tl.store(dlogits_full_ptr + indices, add_vals, mask=valid_mask)
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_topk_bwd", mutates_args={"dlogits_full"})
@@ -604,6 +624,7 @@ def _topk_bwd(
     dlogits_full: torch.Tensor,
     dtopk_values: torch.Tensor,
     topk_indices: torch.Tensor,
+    E: int,
     K: int,
 ) -> None:
     T = dtopk_values.shape[0]
@@ -618,6 +639,7 @@ def _topk_bwd(
         dtopk_values.stride(1),
         topk_indices.stride(0),
         topk_indices.stride(1),
+        E,
         K,
         triton.next_power_of_2(K),
     )
