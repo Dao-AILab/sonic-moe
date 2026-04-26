@@ -216,7 +216,10 @@ def _general_metadata_compute_stage2(
     kv_pairs = tl.sort(((expert << 16) | offs_local).to(tl.uint32), 0)
     expert = kv_pairs >> 16
     # Drop EP sentinels and out-of-tile slots (both have `expert >= E` after the load default).
+    # `safe_expert` remaps masked-off lanes to expert 0 so the OOB addresses below stay inside
+    # `partial_sum` / `expert_offs` — masked LDG still validates the address on Hopper.
     mask = expert < E
+    safe_expert = tl.where(mask, expert, 0)
 
     # Segmented scan for within-expert rank.
     scan_input = (kv_pairs & 0xFFFF0000) | 0x00000001
@@ -224,8 +227,8 @@ def _general_metadata_compute_stage2(
     within_expert_rank = (inclusive_run_lengths - 1) & 0xFFFF
 
     # Output position = expert_offs[e] + partial_sum[tile, e] + within_expert_rank.
-    s_reverse_scatter_val = tl.load(partial_sum_ptr + pid_m + expert * n_tiles, mask=mask)
-    s_reverse_scatter_val += tl.load(expert_offs_ptr + expert, mask=mask)
+    s_reverse_scatter_val = tl.load(partial_sum_ptr + pid_m + safe_expert * n_tiles, mask=mask)
+    s_reverse_scatter_val += tl.load(expert_offs_ptr + safe_expert, mask=mask)
     s_reverse_scatter_val += within_expert_rank
 
     # Recover pre-sort entry index and look up the token index.
