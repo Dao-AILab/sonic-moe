@@ -168,14 +168,15 @@ def _general_compute_col_partial_sum_kernel(
             mask=e_offs < E,
         )
 
-    # Load expert ids for this tile (flat indexing into selected_E).
+    # Load expert ids for this tile (flat indexing into selected_E). Out-of-tile lanes
+    # default to `E`, so the EP-sentinel mask below catches them with the same `< E` test.
     offs = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < TK
-    expert_ids = tl.load(selected_E_ptr + offs, mask=mask, other=-1)
+    expert_ids = tl.load(selected_E_ptr + offs, mask=mask, other=E)
 
-    # Drop EP sentinels (expert_ids < 0 or >= E) from the per-expert histogram.
-    # Without this guard, `safe_experts * n_tiles + tile_id` can index outside `partial_sum`.
-    mask = mask & (expert_ids >= 0) & (expert_ids < E)
+    # Drop EP sentinels (expert_ids >= E) from the per-expert histogram. Without this guard,
+    # `safe_experts * n_tiles + tile_id` can index outside `partial_sum`.
+    mask = mask & (expert_ids < E)
     safe_experts = tl.where(mask, expert_ids, 0)
     tl.atomic_add(
         partial_sum_ptr + safe_experts * n_tiles + tile_id,
@@ -206,16 +207,16 @@ def _general_metadata_compute_stage2(
     offs_global = pid_m * BLOCK_SIZE + offs_local
     mask = offs_global < TK
 
-    # Load expert id for each entry in this tile.
-    expert = tl.load(selected_E_ptr + offs_global, mask=mask, other=-1).to(tl.uint32)
+    # Load expert id for each entry in this tile. Out-of-tile lanes default to `E`, so they
+    # share the same `< E` mask path as EP sentinels — no extra check needed below.
+    expert = tl.load(selected_E_ptr + offs_global, mask=mask, other=E).to(tl.uint32)
 
     # Pack (expert, local_offset) into uint32 and sort by expert.
     # Upper 16 bits = expert id, lower 16 bits = pre-sort local offset.
     kv_pairs = tl.sort(((expert << 16) | offs_local).to(tl.uint32), 0)
     expert = kv_pairs >> 16
-    # Drop out-of-tile slots (loaded as -1, mapped to 0xFFFF in the upper 16 bits via the
-    # earlier `.to(tl.uint32)`) and EP sentinels (expert >= E).
-    mask = (expert != 0xFFFF) & (expert < E)
+    # Drop EP sentinels and out-of-tile slots (both have `expert >= E` after the load default).
+    mask = expert < E
 
     # Segmented scan for within-expert rank.
     scan_input = (kv_pairs & 0xFFFF0000) | 0x00000001
