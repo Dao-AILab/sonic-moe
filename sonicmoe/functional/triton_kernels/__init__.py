@@ -173,12 +173,15 @@ def _general_compute_col_partial_sum_kernel(
     offs = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     expert_ids = tl.load(selected_E_ptr + offs, mask=offs < TK, other=E)
 
-    # Drop EP sentinels and out-of-tile lanes (both have `expert_ids >= E`). The masked
-    # atomic skips OOB addresses for those lanes — only the address arithmetic happens.
+    # Drop EP sentinels and out-of-tile lanes (both have `expert_ids >= E`). `safe_experts`
+    # remaps masked-off lanes to expert 0 so even the unused address stays inside `partial_sum`
+    # — past-end pointers can trip `cudaErrorInvalidAddressSpace` before the mask gates the op.
+    mask = expert_ids < E
+    safe_experts = tl.where(mask, expert_ids, 0)
     tl.atomic_add(
-        partial_sum_ptr + expert_ids * n_tiles + tile_id,
+        partial_sum_ptr + safe_experts * n_tiles + tile_id,
         tl.full([BLOCK_SIZE], 1, dtype=tl.int32),
-        mask=expert_ids < E,
+        mask=mask,
     )
 
 
