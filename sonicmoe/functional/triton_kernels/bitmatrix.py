@@ -55,8 +55,17 @@ def _bitmatrix_metadata_compute_stage1(
             curr_sum += tl.sum(expert_freq, 0)
             tl.store(expert_freq_offs_ptr + offs, excl_cumsum, mask=offs < E)
     elif pid == E + 1:
-        # expert_freq_off[E] = TK (total number of entries)
-        tl.store(expert_freq_offs_ptr + E, TK)
+        # expert_freq_off[E] = total number of *valid* entries (sum of expert_freq).
+        # Without EP sentinels this equals TK, but when sentinels (expert_id >= E) are
+        # excluded from `expert_freq`, the last expert's slot range must stop at the
+        # valid total — otherwise the downstream GEMM extends the last expert into
+        # uninitialized `s_scatter_idx` / `x_gather_idx` slots and OOB-reads.
+        curr_sum = 0
+        for start in tl.static_range(0, E, BLOCK_N):
+            offs = start + tl.arange(0, BLOCK_N)
+            expert_freq = tl.load(expert_freq_ptr + offs, mask=offs < E, other=0)
+            curr_sum += tl.sum(expert_freq, 0)
+        tl.store(expert_freq_offs_ptr + E, curr_sum)
 
 
 # Adapted from https://github.com/triton-lang/triton/blob/434aecbe933af6a8d49595d4197bfc3df7618748/python/triton_kernels/triton_kernels/tensor_details/bitmatrix.py#L44
