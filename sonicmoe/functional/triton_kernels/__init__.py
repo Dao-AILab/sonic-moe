@@ -173,6 +173,9 @@ def _general_compute_col_partial_sum_kernel(
     mask = offs < TK
     expert_ids = tl.load(selected_E_ptr + offs, mask=mask, other=-1)
 
+    # Drop EP sentinels (expert_ids < 0 or >= E) from the per-expert histogram.
+    # Without this guard, `safe_experts * n_tiles + tile_id` can index outside `partial_sum`.
+    mask = mask & (expert_ids >= 0) & (expert_ids < E)
     safe_experts = tl.where(mask, expert_ids, 0)
     tl.atomic_add(
         partial_sum_ptr + safe_experts * n_tiles + tile_id,
@@ -193,6 +196,7 @@ def _general_metadata_compute_stage2(
     partial_sum_ptr,  # [n_tiles, E] with strides (1, n_tiles)
     n_tiles,
     expert_offs_ptr,
+    E: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     tl.static_assert(BLOCK_SIZE <= 32768)
@@ -209,7 +213,9 @@ def _general_metadata_compute_stage2(
     # Upper 16 bits = expert id, lower 16 bits = pre-sort local offset.
     kv_pairs = tl.sort(((expert << 16) | offs_local).to(tl.uint32), 0)
     expert = kv_pairs >> 16
-    mask = expert != 0xFFFF
+    # Drop out-of-tile slots (loaded as -1, mapped to 0xFFFF in the upper 16 bits via the
+    # earlier `.to(tl.uint32)`) and EP sentinels (expert >= E).
+    mask = (expert != 0xFFFF) & (expert < E)
 
     # Segmented scan for within-expert rank.
     scan_input = (kv_pairs & 0xFFFF0000) | 0x00000001
@@ -226,7 +232,14 @@ def _general_metadata_compute_stage2(
     entry_idx = pid_m * BLOCK_SIZE + presort_offs
     token_idx = tl.load(sorted_selected_T_ptr + entry_idx, mask=mask)
 
-    tl.store(s_reverse_scatter_idx_ptr + entry_idx, s_reverse_scatter_val, mask=mask)
+    # EP sentinel handling: zero `s_reverse_scatter_val` at sentinel slots so the s_reverse_scatter_idx
+    # store below writes 0 there. Without this, real entries (entry_idx < TK) routed to sentinel
+    # experts would leave that position uninitialized, and the downstream reduction would index OOB
+    # / pull NaN from a recycled gemm_out row. The other two stores still gate on `mask`, so the
+    # zeroed value never reaches them.
+    s_reverse_scatter_val = tl.where(mask, s_reverse_scatter_val, 0)
+
+    tl.store(s_reverse_scatter_idx_ptr + entry_idx, s_reverse_scatter_val, mask=entry_idx < TK)
     tl.store(s_scatter_idx_ptr + s_reverse_scatter_val, entry_idx, mask=mask)
     tl.store(x_gather_idx_ptr + s_reverse_scatter_val, token_idx, mask=mask)
 
@@ -334,6 +347,7 @@ def general_routing_router_metadata_triton(
         col_partial_sum,
         n_tiles,
         expert_frequency_offset[:E],
+        E=E,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
