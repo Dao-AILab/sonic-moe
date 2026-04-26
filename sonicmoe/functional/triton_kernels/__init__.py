@@ -169,19 +169,16 @@ def _general_compute_col_partial_sum_kernel(
         )
 
     # Load expert ids for this tile (flat indexing into selected_E). Out-of-tile lanes
-    # default to `E`, so the EP-sentinel mask below catches them with the same `< E` test.
+    # default to `E`, so the `< E` mask below catches them and EP sentinels uniformly.
     offs = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offs < TK
-    expert_ids = tl.load(selected_E_ptr + offs, mask=mask, other=E)
+    expert_ids = tl.load(selected_E_ptr + offs, mask=offs < TK, other=E)
 
-    # Drop EP sentinels (expert_ids >= E) from the per-expert histogram. Without this guard,
-    # `safe_experts * n_tiles + tile_id` can index outside `partial_sum`.
-    mask = mask & (expert_ids < E)
-    safe_experts = tl.where(mask, expert_ids, 0)
+    # Drop EP sentinels and out-of-tile lanes (both have `expert_ids >= E`). The masked
+    # atomic skips OOB addresses for those lanes — only the address arithmetic happens.
     tl.atomic_add(
-        partial_sum_ptr + safe_experts * n_tiles + tile_id,
+        partial_sum_ptr + expert_ids * n_tiles + tile_id,
         tl.full([BLOCK_SIZE], 1, dtype=tl.int32),
-        mask=mask,
+        mask=expert_ids < E,
     )
 
 
