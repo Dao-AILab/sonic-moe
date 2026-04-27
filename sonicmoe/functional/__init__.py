@@ -356,11 +356,13 @@ def moe_TC_softmax_topk_layer(
     TK = T * K
     device = topk_indices.device
 
-    s_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
-    s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    # Zero-init: padding/OOB lanes in the routing kernel are skipped, leaving downstream reads to
+    # see well-defined zeros instead of uninitialized memory.
+    s_scatter_idx = torch.zeros(TK, dtype=torch.int32, device=device)
+    s_reverse_scatter_idx = torch.zeros(TK, dtype=torch.int32, device=device)
     expert_frequency = torch.empty(E, dtype=torch.int32, device=device)
     expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
-    x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    x_gather_idx = torch.zeros(TK, dtype=torch.int32, device=device)
 
     TC_topk_router_metadata_triton(
         topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
