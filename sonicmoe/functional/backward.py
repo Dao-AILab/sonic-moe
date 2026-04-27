@@ -465,26 +465,26 @@ def _topk_over_softmax_bwd_kernel(
         mask=k_mask,
         other=0,
     ).to(tl.int32)
-    g_sel = tl.load(
-        dscore_ptr + row * stride_sm + k_offs * stride_sn,
-        mask=k_mask,
-        other=0,
-    ).to(tl.float32)
 
-    # Sentinel slots (idx == E) must not gather from logits[row, E] (OOB column) and must
-    # not contribute to the dp scatter — zero-out their dp_sel and remap idx to 0.
+    # Sentinels (idx == E) must not gather from logits[row, E] (OOB column on a (T, E) buffer)
+    # nor contribute to dp/dot. Loading every value through `valid_mask` zeros them at the source.
     valid_mask = k_mask & (idx < E)
     safe_idx = tl.where(valid_mask, idx, 0)
 
-    # p at selected indices (gather from global mem; can't index register tensor)
+    g_sel = tl.load(
+        dscore_ptr + row * stride_sm + k_offs * stride_sn,
+        mask=valid_mask,
+        other=0,
+    ).to(tl.float32)
+
+    # p at selected indices: `other=-inf` makes `exp(-inf - finite) / row_sum = 0` for sentinels,
+    # so p_sel is naturally zero there — no separate masking needed.
     sel_logits = tl.load(
         logits_ptr + row * stride_lm + safe_idx * stride_le,
         mask=valid_mask,
         other=-float("inf"),
     ).to(tl.float32)
     p_sel = tl.exp(sel_logits - row_max) / row_sum  # (BLOCK_K,)
-    p_sel = tl.where(valid_mask, p_sel, 0.0)
-    g_sel = tl.where(valid_mask, g_sel, 0.0)
 
     # --- Backward through optional renormalization ---
     if norm_topk_probs:
@@ -496,9 +496,11 @@ def _topk_over_softmax_bwd_kernel(
         dot_s = tl.sum(g_sel * scores, axis=0)
         S = tl.sum(p_sel, axis=0)
         dp_sel = (g_sel - dot_s) / S
+        # Renorm produces nonzero `-dot_s / S` at sentinel slots even though g_sel is zero —
+        # explicitly zero them so the dp scatter below doesn't corrupt dp[0] via safe_idx=0.
+        dp_sel = tl.where(valid_mask, dp_sel, 0.0)
     else:
         dp_sel = g_sel
-    dp_sel = tl.where(valid_mask, dp_sel, 0.0)
 
     # dot = Σ dp_sel_j * p_sel_j
     dot = tl.sum(dp_sel * p_sel, axis=0)

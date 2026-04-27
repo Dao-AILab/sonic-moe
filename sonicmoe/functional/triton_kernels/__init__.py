@@ -118,7 +118,7 @@ def TC_topk_router_metadata_triton(
     # - For pid == E: write exclusive cumsum of expert_freq_offset into
     #   expert_freq_off[0:E] (= col_offs, a view into expert_freq_off).
 
-    _bitmatrix_metadata_compute_stage1[(E + 2,)](
+    _bitmatrix_metadata_compute_stage1[(E + 1,)](
         expert_frequency,
         expert_frequency_offset,
         E,
@@ -325,7 +325,7 @@ def general_routing_router_metadata_triton(
     col_partial_sum = col_partial_sum_trans.T  # [n_tiles, E], strides (1, n_tiles)
 
     # ── Kernel 2: stage1 ─────────────────────────────────────────────────
-    _bitmatrix_metadata_compute_stage1[(E + 2,)](
+    _bitmatrix_metadata_compute_stage1[(E + 1,)](
         expert_frequency,
         expert_frequency_offset,
         E,

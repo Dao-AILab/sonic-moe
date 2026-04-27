@@ -47,6 +47,9 @@ def _bitmatrix_metadata_compute_stage1(
         # Exclusive prefix sum of per-expert total counts → expert_offs[e].
         # expert_freq_offset[e] = total entries routed to expert e (from A.sum(dim=1)).
         # expert_offs[e] = sum of expert_freq_offset[0..e-1] = global start of expert e.
+        # expert_offs[E] = sum(expert_freq) = total *valid* entries (= TK without EP sentinels).
+        # The valid-only total is what bounds the downstream GEMM; with sentinels, slot range
+        # `[expert_offs[E], TK)` is left unwritten by stage 2 and zero-init'd by the caller.
         curr_sum = 0
         for start in tl.static_range(0, E, BLOCK_N):
             offs = start + tl.arange(0, BLOCK_N)
@@ -54,17 +57,6 @@ def _bitmatrix_metadata_compute_stage1(
             excl_cumsum = tl.cumsum(expert_freq, 0) - expert_freq + curr_sum
             curr_sum += tl.sum(expert_freq, 0)
             tl.store(expert_freq_offs_ptr + offs, excl_cumsum, mask=offs < E)
-    elif pid == E + 1:
-        # expert_freq_off[E] = total number of *valid* entries (sum of expert_freq).
-        # Without EP sentinels this equals TK, but when sentinels (expert_id >= E) are
-        # excluded from `expert_freq`, the last expert's slot range must stop at the
-        # valid total — otherwise the downstream GEMM extends the last expert into
-        # uninitialized `s_scatter_idx` / `x_gather_idx` slots and OOB-reads.
-        curr_sum = 0
-        for start in tl.static_range(0, E, BLOCK_N):
-            offs = start + tl.arange(0, BLOCK_N)
-            expert_freq = tl.load(expert_freq_ptr + offs, mask=offs < E, other=0)
-            curr_sum += tl.sum(expert_freq, 0)
         tl.store(expert_freq_offs_ptr + E, curr_sum)
 
 
