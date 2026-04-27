@@ -346,7 +346,7 @@ def general_routing_router_metadata_triton(
         TK,
         col_partial_sum,
         n_tiles,
-        expert_frequency_offset,  # full (E+1,) — kernel reads `[E]` for the sum-of-valid sentinel boundary
+        expert_frequency_offset[:E],
         E=E,
         BLOCK_SIZE=BLOCK_SIZE,
     )
