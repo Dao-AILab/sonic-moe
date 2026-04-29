@@ -20,11 +20,7 @@ torch._functorch.config.donated_buffer = False
 # Scale shape matrix to GPU memory: 80GB+ (H100/B200) runs everything; 40-80GB
 # (A100-40) shrinks the largest-T shape; <40GB (RTX 5090/4090, A6000) further
 # shrinks T0 and drops H=4096 shapes whose expert weights alone won't fit.
-_GPU_MEM_GB = (
-    torch.cuda.get_device_properties(0).total_memory / 2**30
-    if torch.cuda.is_available()
-    else 0.0
-)
+_GPU_MEM_GB = torch.cuda.get_device_properties(0).total_memory / 2**30 if torch.cuda.is_available() else 0.0
 if _GPU_MEM_GB >= 80:
     _T0 = (16384 + 512) * 16
     _DROP_LARGE_H4096 = False

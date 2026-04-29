@@ -6,16 +6,12 @@
 import torch
 from parameterized import parameterized
 
-from sonicmoe.functional.triton_kernels import (
-    TC_topk_router_metadata_triton,
-    general_routing_router_metadata_triton,
-)
+from sonicmoe.functional.triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
 
 from .test_commons import TestCommons
 
 
 _SEED = 0
-
 
 
 def _ref_TC_topk_router_metadata(topk_router_indices: torch.Tensor, E: int):
@@ -133,7 +129,6 @@ def _assert_expert_grouping(test_case: TestCommons, flat_expert_ids, expert_freq
         )
 
 
-
 class TCTopkRouterMetadataTest(TestCommons):
 
     @parameterized.expand(
@@ -141,17 +136,17 @@ class TCTopkRouterMetadataTest(TestCommons):
             [torch.device("cuda")],
             [
                 # (T, E, K)
-                (10, 8, 2),            
-                (236, 16, 4),       
-                (1024, 128, 8),        
-                (8192, 128, 8),         # matches moe_test.py T=8192, E=128, K=8
-                (8192, 64, 4),          # matches moe_test.py T=8192, E=64, K=4
-                (8192, 32, 2),          # matches moe_test.py T=8192, E=32, K=2
-                (8192, 256, 16),        # matches moe_test.py T=8192, E=256, K=16
-                (32768, 128, 8),        # large scale
-                (1000, 96, 7),          # K=7, non-power-of-2, many tokens
-                (50, 384, 3),             # K=1, degenerate
-                (2048, 512, 10),         # many experts
+                (10, 8, 2),
+                (236, 16, 4),
+                (1024, 128, 8),
+                (8192, 128, 8),  # matches moe_test.py T=8192, E=128, K=8
+                (8192, 64, 4),  # matches moe_test.py T=8192, E=64, K=4
+                (8192, 32, 2),  # matches moe_test.py T=8192, E=32, K=2
+                (8192, 256, 16),  # matches moe_test.py T=8192, E=256, K=16
+                (32768, 128, 8),  # large scale
+                (1000, 96, 7),  # K=7, non-power-of-2, many tokens
+                (50, 384, 3),  # K=1, degenerate
+                (2048, 512, 10),  # many experts
             ],
         )
     )
@@ -173,15 +168,16 @@ class TCTopkRouterMetadataTest(TestCommons):
         s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
 
         TC_topk_router_metadata_triton(
-            topk_indices, E,
-            expert_frequency, expert_frequency_offset,
-            x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
+            topk_indices,
+            E,
+            expert_frequency,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
         )
 
-
-        ref_freq, ref_offset, ref_gather, ref_scatter, ref_reverse = _ref_TC_topk_router_metadata(
-            topk_indices, E
-        )
+        ref_freq, ref_offset, ref_gather, ref_scatter, ref_reverse = _ref_TC_topk_router_metadata(topk_indices, E)
 
         # expert_frequency exact match
         self.assertTrue(torch.equal(expert_frequency, ref_freq), "expert_frequency mismatch")
@@ -220,9 +216,13 @@ class TCTopkRouterMetadataTest(TestCommons):
         s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
 
         TC_topk_router_metadata_triton(
-            topk_indices, E,
-            expert_frequency, expert_frequency_offset,
-            x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
+            topk_indices,
+            E,
+            expert_frequency,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
         )
 
         self.assertEqual(expert_frequency[0].item(), T)
@@ -247,9 +247,13 @@ class TCTopkRouterMetadataTest(TestCommons):
         s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
 
         TC_topk_router_metadata_triton(
-            topk_indices, E,
-            expert_frequency, expert_frequency_offset,
-            x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
+            topk_indices,
+            E,
+            expert_frequency,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
         )
 
         ref_freq, ref_offset, _, _, _ = _ref_TC_topk_router_metadata(topk_indices, E)
@@ -311,7 +315,6 @@ class TCTopkRouterMetadataTest(TestCommons):
         self.assertTrue(torch.equal(xg, ss // K))
 
 
-
 class GeneralRoutingRouterMetadataTest(TestCommons):
 
     @parameterized.expand(
@@ -319,17 +322,17 @@ class GeneralRoutingRouterMetadataTest(TestCommons):
             [torch.device("cuda")],
             [
                 # (T, E, avg_K)
-                (10, 8, 2),            
-                (236, 16, 4),       
-                (1024, 128, 8),        
-                (8192, 128, 8),         # matches moe_test.py T=8192, E=128, K=8
-                (8192, 64, 4),          # matches moe_test.py T=8192, E=64, K=4
-                (8192, 32, 2),          # matches moe_test.py T=8192, E=32, K=2
-                (8192, 256, 16),        # matches moe_test.py T=8192, E=256, K=16
-                (32768, 128, 8),        # large scale
-                (1000, 96, 7),          # K=7, non-power-of-2, many tokens
-                (50, 384, 3),             # K=1, degenerate
-                (2048, 512, 10),         # many experts
+                (10, 8, 2),
+                (236, 16, 4),
+                (1024, 128, 8),
+                (8192, 128, 8),  # matches moe_test.py T=8192, E=128, K=8
+                (8192, 64, 4),  # matches moe_test.py T=8192, E=64, K=4
+                (8192, 32, 2),  # matches moe_test.py T=8192, E=32, K=2
+                (8192, 256, 16),  # matches moe_test.py T=8192, E=256, K=16
+                (32768, 128, 8),  # large scale
+                (1000, 96, 7),  # K=7, non-power-of-2, many tokens
+                (50, 384, 3),  # K=1, degenerate
+                (2048, 512, 10),  # many experts
             ],
         )
     )
@@ -353,15 +356,21 @@ class GeneralRoutingRouterMetadataTest(TestCommons):
         num_activated_expert_per_token_offset = torch.empty(T + 1, dtype=torch.int32, device=device)
 
         general_routing_router_metadata_triton(
-            sorted_selected_T, selected_E, T, E,
-            expert_frequency, expert_frequency_offset,
-            x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
+            sorted_selected_T,
+            selected_E,
+            T,
+            E,
+            expert_frequency,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
             num_activated_expert_per_token_offset,
         )
 
         # --- PyTorch reference ---
-        ref_freq, ref_offset, ref_gather, ref_scatter, ref_reverse, ref_token_offset = (
-            _ref_general_routing_metadata(sorted_selected_T, selected_E, T, E)
+        ref_freq, ref_offset, ref_gather, ref_scatter, ref_reverse, ref_token_offset = _ref_general_routing_metadata(
+            sorted_selected_T, selected_E, T, E
         )
 
         self.assertTrue(torch.equal(expert_frequency, ref_freq), "expert_frequency mismatch")
@@ -406,9 +415,15 @@ class GeneralRoutingRouterMetadataTest(TestCommons):
         num_activated_expert_per_token_offset = torch.empty(T + 1, dtype=torch.int32, device=device)
 
         general_routing_router_metadata_triton(
-            sorted_selected_T, selected_E, T, E,
-            expert_frequency, expert_frequency_offset,
-            x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
+            sorted_selected_T,
+            selected_E,
+            T,
+            E,
+            expert_frequency,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
             num_activated_expert_per_token_offset,
         )
 
@@ -435,9 +450,15 @@ class GeneralRoutingRouterMetadataTest(TestCommons):
         num_activated_expert_per_token_offset = torch.empty(T + 1, dtype=torch.int32, device=device)
 
         general_routing_router_metadata_triton(
-            sorted_selected_T, selected_E, T, E,
-            expert_frequency, expert_frequency_offset,
-            x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
+            sorted_selected_T,
+            selected_E,
+            T,
+            E,
+            expert_frequency,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
             num_activated_expert_per_token_offset,
         )
 
@@ -475,9 +496,15 @@ class GeneralRoutingRouterMetadataTest(TestCommons):
         num_activated_expert_per_token_offset = torch.empty(T + 1, dtype=torch.int32, device=device)
 
         general_routing_router_metadata_triton(
-            sorted_selected_T, selected_E, T, E,
-            expert_frequency, expert_frequency_offset,
-            x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
+            sorted_selected_T,
+            selected_E,
+            T,
+            E,
+            expert_frequency,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
             num_activated_expert_per_token_offset,
         )
 
@@ -505,8 +532,16 @@ class GeneralRoutingRouterMetadataTest(TestCommons):
             sr = torch.empty(TK, dtype=torch.int32, device=device)
             tok_off = torch.empty(T + 1, dtype=torch.int32, device=device)
             general_routing_router_metadata_triton(
-                sorted_selected_T, selected_E, T, E,
-                ef, efo, xg, ss, sr, tok_off,
+                sorted_selected_T,
+                selected_E,
+                T,
+                E,
+                ef,
+                efo,
+                xg,
+                ss,
+                sr,
+                tok_off,
             )
             return ef, efo, xg, ss, sr, tok_off
 
@@ -536,8 +571,16 @@ class GeneralRoutingRouterMetadataTest(TestCommons):
         tok_off = torch.empty(T + 1, dtype=torch.int32, device=device)
 
         general_routing_router_metadata_triton(
-            sorted_selected_T, selected_E, T, E,
-            ef, efo, xg, ss, sr, tok_off,
+            sorted_selected_T,
+            selected_E,
+            T,
+            E,
+            ef,
+            efo,
+            xg,
+            ss,
+            sr,
+            tok_off,
         )
 
         ref = _ref_general_routing_metadata(sorted_selected_T, selected_E, T, E)
