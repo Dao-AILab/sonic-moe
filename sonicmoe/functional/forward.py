@@ -9,7 +9,6 @@ import triton
 import triton.language as tl
 from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import torch2cute_dtype_map
-from quack.gemm_interface import gemm, gemm_gated
 
 from ..enums import LIBRARY_NAME
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
@@ -60,54 +59,6 @@ def _topk_fwd(
 
 
 _topk_fwd.compile_cache = {}
-
-
-@torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_forward", mutates_args={"h", "a"})
-def _up_projection_forward(
-    x: torch.Tensor,
-    w1: torch.Tensor,
-    h: torch.Tensor,
-    a: torch.Tensor,
-    b1: torch.Tensor | None,
-    expert_frequency_offset: torch.Tensor,
-    x_gather_idx: torch.Tensor,
-    activation_type: str,
-    is_inference_mode_enabled: bool = False,
-    concat_layout: bool = False,
-) -> None:
-    assert activation_type in (
-        "swiglu",
-        "geglu",
-    ), f"QuACK gemm_gated only supports glu activations, got {activation_type}"
-    gemm_gated(
-        x,
-        w1.permute(2, 1, 0),
-        activation=activation_type,
-        cu_seqlens_m=expert_frequency_offset,
-        A_idx=x_gather_idx,
-        preact_out=h,
-        postact_out=a,
-        store_preact=(not is_inference_mode_enabled),
-        bias=b1,
-        concat_layout=(("B", "bias") if b1 is not None else ("B",)) if concat_layout else None,
-    )
-
-
-_up_projection_forward.compile_cache = {}
-
-
-@torch.library.custom_op(f"{LIBRARY_NAME}::_down_projection_forward", mutates_args={"y"})
-def _down_projection_forward(
-    w2: torch.Tensor,
-    a: torch.Tensor,
-    y: torch.Tensor,
-    b2: torch.Tensor | None,
-    expert_frequency_offset: torch.Tensor,
-) -> None:
-    gemm(a, w2.permute(2, 1, 0), out=y, cu_seqlens_m=expert_frequency_offset, bias=b2)
-
-
-_down_projection_forward.compile_cache = {}
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_router_forward", mutates_args={"o"})

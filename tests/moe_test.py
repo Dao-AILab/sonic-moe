@@ -17,26 +17,48 @@ torch._dynamo.config.accumulated_cache_size_limit = 1024
 torch._functorch.config.donated_buffer = False
 
 
+# Scale shape matrix to GPU memory: 80GB+ (H100/B200) runs everything; 40-80GB
+# (A100-40) shrinks the largest-T shape; <40GB (RTX 5090/4090, A6000) further
+# shrinks T0 and drops H=4096 shapes whose expert weights alone won't fit.
+_GPU_MEM_GB = torch.cuda.get_device_properties(0).total_memory / 2**30 if torch.cuda.is_available() else 0.0
+if _GPU_MEM_GB >= 80:
+    _T0 = (16384 + 512) * 16
+    _DROP_LARGE_H4096 = False
+elif _GPU_MEM_GB >= 40:
+    _T0 = 65536
+    _DROP_LARGE_H4096 = False
+else:
+    _T0 = 8192
+    _DROP_LARGE_H4096 = True
+
+_SHAPES = [
+    (_T0, 512, 512, 128, 8),
+    (8192, 768, 256, 128, 8),
+    (8192, 768, 512, 64, 4),
+    (8192, 768, 1024, 32, 2),
+    (8192, 1536, 256, 128, 8),
+    (8192, 1536, 512, 64, 4),
+    (8192, 1536, 1024, 32, 2),
+    (8192, 4096, 256, 256, 16),
+    (8192, 4096, 512, 128, 8),
+    (8192, 4096, 1024, 64, 4),
+    (8192, 4096, 512, 256, 16),
+    (8192, 4096, 1024, 128, 8),
+    (8192, 4096, 2048, 64, 4),
+]
+if _DROP_LARGE_H4096:
+    # Weight footprint = E * 2I * H * 4 bytes (transient f32 init); skip cases
+    # where E*I > 64K so MoE construction fits alongside the previous test's
+    # allocator carry-over on a 32 GB GPU.
+    _SHAPES = [s for s in _SHAPES if not (s[1] == 4096 and s[3] * s[2] > 65536)]
+
+
 class MoETest(TestCommons):
     @parameterized.expand(
         TestCommons.make_args_matrix(
             [torch.device("cuda")],
             [torch.bfloat16],
-            [
-                ((16384 + 512) * 16, 512, 512, 128, 8),
-                (8192, 768, 256, 128, 8),
-                (8192, 768, 512, 64, 4),
-                (8192, 768, 1024, 32, 2),
-                (8192, 1536, 256, 128, 8),
-                (8192, 1536, 512, 64, 4),
-                (8192, 1536, 1024, 32, 2),
-                (8192, 4096, 256, 256, 16),
-                (8192, 4096, 512, 128, 8),
-                (8192, 4096, 1024, 64, 4),
-                (8192, 4096, 512, 256, 16),
-                (8192, 4096, 1024, 128, 8),
-                (8192, 4096, 2048, 64, 4),
-            ],
+            _SHAPES,
             [KernelBackendMoE.sonicmoe],  # kernel_backend_moe
             [
                 False,
@@ -61,6 +83,7 @@ class MoETest(TestCommons):
         self.set_seed(_SEED)
 
         T, H, I, E, K = problem_shape
+        torch.cuda.empty_cache()
         with torch.device(device):
             moe = MoE(
                 num_experts=E,
@@ -83,7 +106,6 @@ class MoETest(TestCommons):
         if is_compiling:
             moe_kernel = torch.compile(moe_kernel, fullgraph=True)
 
-        torch.cuda.empty_cache()
         x_torch = 0.02 * torch.randn(T, H, device=device, dtype=dtype, requires_grad=True)
         x_kernel = x_torch.clone().detach().requires_grad_()
 

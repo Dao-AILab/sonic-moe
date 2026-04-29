@@ -182,7 +182,7 @@ We want SonicMoE to achieve peak throughput on both Hopper and Blackwell GPUs, s
 
 ## 2. QuACK's Software Abstraction that Empowers SonicMoE
 
-SonicMoE already supports NVIDIA Hopper (SM90), Blackwell GPUs (SM100), and the support for Blackwell GeForce (SM120) GPUs is on the way. When we first considered porting the Hopper kernels to Blackwell, the straightforward path was to rewrite 6 Grouped GEMM kernels from scratch. We chose instead to factor out the shared structure, and this decision proved highly productive later.
+SonicMoE supports NVIDIA Hopper (SM90), Blackwell datacenter GPUs (SM100, e.g. B200/B300), and Blackwell GeForce GPUs (SM120, e.g. RTX 5090). When we first considered porting the Hopper kernels to Blackwell, the straightforward path was to rewrite 6 Grouped GEMM kernels from scratch. We chose instead to factor out the shared structure, and this decision proved highly productive later.
 
 Every Grouped GEMM kernel is an instance of the same underlying structure: **a producer-consumer GEMM mainloop that overlaps data movement with tensor core computation, followed by a parameterized epilogue** that applies fusion logic directly to the accumulator before any data reaches HBM. 
 

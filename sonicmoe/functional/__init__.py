@@ -11,13 +11,11 @@ from quack.gemm_interface import gemm, gemm_dgated, gemm_gated
 from ..enums import ActivationType, is_glu
 from .backward import (
     _down_projection_backward_act,
-    _down_projection_backward_weight,
     _token_broadcast_backward,
     _topk_softmax_bwd,
     _up_projection_backward_act,
-    _up_projection_backward_weight,
 )
-from .forward import _down_projection_forward, _router_forward, _topk_softmax_fwd, _up_projection_forward
+from .forward import _router_forward, _topk_softmax_fwd
 from .triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
 
 
@@ -107,17 +105,21 @@ class _UpProjection(torch.autograd.Function):
             else None
         )
 
-        _up_projection_forward(
-            x=x,
-            w1=w1,
-            h=h,
-            a=a,
-            b1=b1,
-            expert_frequency_offset=expert_frequency_offset,
-            x_gather_idx=x_gather_idx,
-            activation_type=activation_type.value,
-            is_inference_mode_enabled=is_inference_mode_enabled,
-            concat_layout=concat_layout,
+        assert activation_type.value in (
+            "swiglu",
+            "geglu",
+        ), f"QuACK gemm_gated only supports glu activations, got {activation_type.value}"
+        gemm_gated(
+            x,
+            w1.permute(2, 1, 0),
+            activation=activation_type.value,
+            cu_seqlens_m=expert_frequency_offset,
+            A_idx=x_gather_idx,
+            preact_out=h,
+            postact_out=a,
+            store_preact=(not is_inference_mode_enabled),
+            bias=b1,
+            concat_layout=(("B", "bias") if b1 is not None else ("B",)) if concat_layout else None,
         )
 
         ctx.T = T
@@ -182,14 +184,15 @@ class _UpProjection(torch.autograd.Function):
             concat_layout=concat_layout,
         )
 
-        _up_projection_backward_weight(
-            x=x,
-            dw1=dw1,
-            dh=dh,
-            expert_frequency_offset=expert_frequency_offset,
-            x_gather_idx=x_gather_idx,
-            is_glu_activation=is_glu_activation,
-            concat_layout=concat_layout,
+        gemm(
+            x.T,
+            dh,
+            out=dw1.permute(2, 1, 0),
+            cu_seqlens_k=expert_frequency_offset,
+            A_idx=x_gather_idx,
+            batch_idx_permute=None,
+            dynamic_scheduler=False,
+            concat_layout=(("out",) if concat_layout else None),
         )
 
         dx_reduced = torch.empty(T, H, dtype=dh.dtype, device=dh.device)
@@ -231,13 +234,7 @@ class _DownProjection(torch.autograd.Function):
 
         y = torch.empty(TK, H, dtype=a.dtype, device=a.device)
 
-        _down_projection_forward(
-            w2=w2,
-            a=a,
-            y=y,
-            b2=b2,
-            expert_frequency_offset=expert_frequency_offset,
-        )
+        gemm(a, w2.permute(2, 1, 0), out=y, cu_seqlens_m=expert_frequency_offset, bias=b2)
 
         o = torch.empty(T, H, device=a.device, dtype=a.dtype)
         topk_scores = topk_scores.view(-1)
@@ -313,12 +310,14 @@ class _DownProjection(torch.autograd.Function):
             activation_type=activation_type.value,
         )
 
-        _down_projection_backward_weight(
-            dout=dout,
-            a_prime=a_prime,
-            dw2=dw2,
-            expert_frequency_offset=expert_frequency_offset,
-            x_gather_idx=x_gather_idx,
+        gemm(
+            dout.T,
+            a_prime,
+            out=dw2.permute(2, 0, 1),
+            cu_seqlens_k=expert_frequency_offset,
+            A_idx=x_gather_idx,
+            batch_idx_permute=None,
+            dynamic_scheduler=False,
         )
 
         # TC top-K routing

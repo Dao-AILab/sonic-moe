@@ -208,35 +208,6 @@ def _up_projection_backward_act(
 _up_projection_backward_act.compile_cache = {}
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_backward_weight", mutates_args={"dw1"})
-def _up_projection_backward_weight(
-    x: torch.Tensor,
-    dw1: torch.Tensor,
-    dh: torch.Tensor,
-    expert_frequency_offset: torch.Tensor,
-    x_gather_idx: torch.Tensor,
-    is_glu_activation: bool,
-    concat_layout: bool = False,
-) -> None:
-    I, H, E = dw1.size()
-    if is_glu_activation:
-        I //= 2
-
-    gemm(
-        x.T,
-        dh,
-        out=dw1.permute(2, 1, 0),
-        cu_seqlens_k=expert_frequency_offset,
-        A_idx=x_gather_idx,
-        batch_idx_permute=None,
-        dynamic_scheduler=False,
-        concat_layout=(("out",) if concat_layout else None),
-    )
-
-
-_up_projection_backward_weight.compile_cache = {}
-
-
 @torch.library.custom_op(f"{LIBRARY_NAME}::_down_projection_backward_act", mutates_args={"dh", "ds", "db2", "a_prime"})
 def _down_projection_backward_act(
     dout: torch.Tensor,
@@ -312,28 +283,6 @@ def _down_projection_backward_act(
 
 
 _down_projection_backward_act.compile_cache = {}
-
-
-@torch.library.custom_op(f"{LIBRARY_NAME}::_down_projection_backward_weight", mutates_args={"dw2"})
-def _down_projection_backward_weight(
-    dout: torch.Tensor,
-    a_prime: torch.Tensor,
-    dw2: torch.Tensor,
-    expert_frequency_offset: torch.Tensor,
-    x_gather_idx: torch.Tensor,
-) -> None:
-    gemm(
-        dout.T,
-        a_prime,
-        out=dw2.permute(2, 0, 1),
-        cu_seqlens_k=expert_frequency_offset,
-        A_idx=x_gather_idx,
-        batch_idx_permute=None,
-        dynamic_scheduler=False,
-    )
-
-
-_down_projection_backward_weight.compile_cache = {}
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_token_broadcast_backward", mutates_args={"dx_reduced"})

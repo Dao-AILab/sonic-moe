@@ -8,13 +8,12 @@ dynamic = ["version"]
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "nvidia-cutlass-dsl==4.4.2",
     "torch>=2.7.1,<=2.9.1",
-    "quack-kernels>=0.3.11",
+    "quack-kernels>=0.4.0",
 ]
 
 [project.optional-dependencies]
-cu13 = ["nvidia-cutlass-dsl[cu13]>=4.4.2"]
+cu13 = ["quack-kernels[cu13]>=0.4.0"]
 dev = [
     "pre-commit",
     "ruff",

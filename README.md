@@ -5,7 +5,7 @@ Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # SonicMoE: Accelerating MoE with IO and Tile-aware Optimizations
 [![arXiv](https://img.shields.io/badge/arXiv-2512.14080-b31b1b.svg)](https://arxiv.org/abs/2512.14080) [![PyPI](https://img.shields.io/pypi/v/sonic-moe?cache=no)](https://pypi.org/project/sonic-moe/)
 
-**SonicMoE** is a simple but blazing-fast Mixture-of-Experts (MoE) implementation optimized for NVIDIA Hopper and Blackwell architecture GPUs. It mainly leverages [CuTeDSL](https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) and [Triton](https://triton-lang.org/main/getting-started/tutorials/index.html) to deliver state-of-the-art performance through IO-aware optimizations. These 2 figures provide an overview of activation memory usage and training throughput on Hopper GPUs (H100) and Blackwell GPUs (B300). The current version of SonicMoE builds on the Grouped GEMM kernels from the [QuACK](https://github.com/Dao-AILab/quack/tree/main) library which is itself built on [CUTLASS](https://github.com/NVIDIA/cutlass).
+**SonicMoE** is a simple but blazing-fast Mixture-of-Experts (MoE) implementation optimized for NVIDIA Hopper (SM90), Blackwell datacenter (SM100, e.g. B200/B300), and Blackwell consumer (SM120, e.g. RTX 5090) GPUs. It mainly leverages [CuTeDSL](https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) and [Triton](https://triton-lang.org/main/getting-started/tutorials/index.html) to deliver state-of-the-art performance through IO-aware optimizations. These 2 figures provide an overview of activation memory usage and training throughput on Hopper GPUs (H100) and Blackwell GPUs (B300). The current version of SonicMoE builds on the Grouped GEMM kernels from the [QuACK](https://github.com/Dao-AILab/quack/tree/main) library which is itself built on [CUTLASS](https://github.com/NVIDIA/cutlass).
 
 ![Activation Memory](https://raw.githubusercontent.com/Dao-AILab/sonic-moe/main/assets/mem.png)
 ![Training Throughput](https://raw.githubusercontent.com/Dao-AILab/sonic-moe/main/assets/tput.png)
@@ -20,7 +20,7 @@ Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 
 ### Prerequisites
 
-- NVIDIA Hopper GPUs (H100, H200, etc.) or Blackwell GPUs (GB200, B200, B300, etc.) 
+- NVIDIA Hopper GPUs (H100, H200, etc.), Blackwell datacenter GPUs (GB200, B200, B300, etc.), or Blackwell consumer GPUs (e.g. RTX 5090, SM120)
 - CUDA 12.9+ (13.0+ for B300 GPUs)
 - Python 3.12+ recommended
 - PyTorch 2.7+ (2.9.1 recommended)

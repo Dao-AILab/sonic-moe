@@ -1,23 +1,17 @@
+import argparse
+
 import torch
 import torch.nn.functional as F
-import argparse
-from triton.testing import do_bench
 from rich import print
-from triton_kernels.swiglu import swiglu_fn
-from triton_kernels.matmul import matmul, PrecisionConfig, FnSpecs, FusedActivation
-from triton_kernels.topk import topk
-from triton_kernels.tensor import make_ragged_tensor_metadata
+from triton.testing import do_bench
+from triton_kernels.matmul import FnSpecs, FusedActivation, PrecisionConfig, matmul
 from triton_kernels.reduce import reduce
+from triton_kernels.swiglu import swiglu_fn
+from triton_kernels.tensor import make_ragged_tensor_metadata
+from triton_kernels.topk import topk
 
 
-
-
-
-def run_mlp_single_gpu(x_bf16, x_fp8,
-                       wg, bg,
-                       w1, act1,
-                       w2,
-                       n_expts_act, pc):
+def run_mlp_single_gpu(x_bf16, x_fp8, wg, bg, w1, act1, w2, n_expts_act, pc):
     # gate matrix multiplication
     l = matmul(x_bf16, wg, bg, precision_config=pc)
     # topk (no all_gather needed for single GPU)
@@ -30,8 +24,15 @@ def run_mlp_single_gpu(x_bf16, x_fp8,
     x_metadata = make_ragged_tensor_metadata(expt_sizes, dispatch_indx.shape[0])
     # first matmul + swiglu (fused gather via gather_indx)
     gather_indx = combine_indx // n_expts_act
-    y = matmul(x_fp8, w1, None, a_ragged_metadata=x_metadata,
-               gather_indx=gather_indx, precision_config=pc, fused_activation=act1)
+    y = matmul(
+        x_fp8,
+        w1,
+        None,
+        a_ragged_metadata=x_metadata,
+        gather_indx=gather_indx,
+        precision_config=pc,
+        fused_activation=act1,
+    )
     # second matmul
     y = matmul(y, w2, None, a_ragged_metadata=x_metadata, scatter_indx=combine_indx, precision_config=pc)
     # scatter_indx=combine_indx maps expert-sorted results back to original [T*K] order
@@ -45,6 +46,7 @@ def run_mlp_single_gpu(x_bf16, x_fp8,
     z, _ = reduce(z, dim=1, scale=scale)
     return z
 
+
 def run(args):
     n = args.n
     T, K, E, H, I = args.T, args.K, args.E, args.H, args.I
@@ -54,10 +56,11 @@ def run(args):
     def make_weight(*shape):
         w = torch.randn(shape, device=dev, dtype=torch.bfloat16)
         return w.transpose(-1, -2).contiguous().transpose(-1, -2)
-    wg = make_weight(H, E) 
-    w1 = make_weight(E, H, 2 * I) 
-    w2 = make_weight(E, I, H) 
-    bg = torch.randn((E,), device=dev) 
+
+    wg = make_weight(H, E)
+    w1 = make_weight(E, H, 2 * I)
+    w2 = make_weight(E, I, H)
+    bg = torch.randn((E,), device=dev)
     pc = PrecisionConfig()
 
     # -- init activation --
@@ -69,15 +72,10 @@ def run(args):
 
     print(f"[bold]Config: T={T}, H={H}, I={I}, E={E}, K={K}[/bold]")
 
-
     # -- benchmark (uncomment to enable) --
     def test_forward():
-       run_mlp_single_gpu(x_bf16, x_fp8,
-                           wg, bg,
-                           w1, act1,
-                           w2,
-                           K, pc)
-    
+        run_mlp_single_gpu(x_bf16, x_fp8, wg, bg, w1, act1, w2, K, pc)
+
     forward_time = do_bench(test_forward, warmup=5, rep=n)
     flops = 6 * T * I * H * K
     tflops = flops / (forward_time / 1e3) / 1e12
