@@ -91,10 +91,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import triton
-
-# Down projection used to be wrapped by sonicmoe.functional.forward._down_projection_forward,
-# which was a one-line `gemm(a, w2.permute(2, 1, 0), out=y, cu_seqlens_m=...)` shim.
-# Recent sonic-moe main dropped that shim, so we call QuACK's gemm directly.
 from quack.gemm_interface import gemm
 from torch.distributed import _symmetric_memory as _symm_mem
 
@@ -108,7 +104,7 @@ from .functional.ep.triton_comm import (
     barrier,
     compute_dispatch_metadata,
     gather_aggregation,
-    rendezvous,
+    reduce_scatter,
 )
 
 
@@ -167,7 +163,8 @@ class _EPWorkspace:
     (T_local, d, K, E_local, dtype, mode) shape."""
 
     idx_symm: torch.Tensor
-    x_symm: torch.Tensor  # always allocated (used by both modes)
+    scores_symm: torch.Tensor
+    x_symm: torch.Tensor
     y_symm: torch.Tensor
     s_rev_symm: torch.Tensor
     ep_group: dist.ProcessGroup
@@ -271,6 +268,7 @@ class SymmMemManager:
         dev = self.device
 
         idx_symm = self._alloc_symm((T_local, K), torch.int32)
+        scores_symm = self._alloc_symm((T_local, K), torch.float32)
         x_symm = self._alloc_symm((T_local, d), dtype)
         y_symm = self._alloc_symm((TK_global, d), dtype)
         s_rev_symm = self._alloc_symm((TK_global,), torch.int32)
@@ -295,6 +293,7 @@ class SymmMemManager:
 
         return _EPWorkspace(
             idx_symm=idx_symm,
+            scores_symm=scores_symm,
             x_symm=x_symm,
             y_symm=y_symm,
             s_rev_symm=s_rev_symm,
@@ -436,12 +435,12 @@ def _moe_ep_forward_inner(
         True,
         activation_type,
         is_inference_mode_enabled,
-        concat_layout,
+        False,  # force concat_layout=False for EP varlen path, incompatibility with QuACK
     )
 
     gemm(
         a,
-        w2.permute(2, 1, 0),
+        w2.permute(0, 2, 1),
         out=ep_ws.y_symm,
         cu_seqlens_m=metadata["expert_frequency_offset"],
         bias=b2,
@@ -477,12 +476,32 @@ def _validate_and_resolve(
     return W, E // W, resolved
 
 
-def _ag_routing_indices(idx_symm: torch.Tensor, topk_idx_l: torch.Tensor, grp: dist.ProcessGroup) -> torch.Tensor:
-    idx_symm.copy_(topk_idx_l.contiguous())
-    barrier(idx_symm, grp)  # B1: fences both
-    # idx_symm and x_symm
-    g = all_gather(idx_symm, grp)
-    return g.view(dist.get_world_size(grp), idx_symm.shape[0], idx_symm.shape[1])
+def _ag_routing_decision(
+    idx_symm: torch.Tensor,
+    topk_idx_l: torch.Tensor,
+    grp: dist.ProcessGroup,
+    *,
+    scores_symm: Optional[torch.Tensor] = None,
+    topk_scores_l: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    idx_symm.copy_(topk_idx_l)
+    stage_scores = scores_symm is not None
+    if stage_scores:
+        assert topk_scores_l is not None, "_ag_routing_decision: scores_symm given but topk_scores_l is None"
+        # scores_symm is fp32; .copy_ casts from caller dtype if needed.
+        scores_symm.copy_(topk_scores_l)
+
+    barrier(idx_symm, grp)  # fences idx_symm + scores_symm + x_symm
+
+    W = dist.get_world_size(grp)
+    T_local, K = idx_symm.shape
+    topk_idx_g = all_gather(idx_symm, grp).view(W, T_local, K)
+
+    topk_scores_g = None
+    if stage_scores:
+        topk_scores_g = all_gather(scores_symm, grp)  # (W*T_local, K) fp32
+
+    return topk_idx_g, topk_scores_g
 
 
 def _stage_input(ws: _EPWorkspace, x: torch.Tensor) -> torch.Tensor:
@@ -530,7 +549,7 @@ def moe_ep_TC_softmax_topk_forward(
     topk_scores_l, topk_idx_l = TC_Softmax_Topk_Router_Function.apply(
         router_logits, W * E_local, K, is_softmax_over_topk, norm_topk_probs
     )
-    topk_idx_g = _ag_routing_indices(ws.idx_symm, topk_idx_l, ws.ep_group)
+    topk_idx_g, _ = _ag_routing_decision(ws.idx_symm, topk_idx_l, ws.ep_group)
 
     return _moe_ep_forward_inner(
         x_local=x_in,
@@ -586,7 +605,7 @@ def moe_ep_general_routing_forward(
     x_in = _stage_input(ep_ws, x)
 
     topk_idx_l = topk_indices.to(torch.int32)
-    topk_idx_g = _ag_routing_indices(ep_ws.idx_symm, topk_idx_l, ep_ws.ep_group)
+    topk_idx_g, _ = _ag_routing_decision(ep_ws.idx_symm, topk_idx_l, ep_ws.ep_group)
 
     return _moe_ep_forward_inner(
         x_local=x_in,

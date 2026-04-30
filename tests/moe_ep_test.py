@@ -3,10 +3,10 @@
 #
 # Multi-rank correctness test for the EP forward.
 #
-# Spawns W ranks, each constructs the same MoE (seeded), shards weights along
-# the leading E axis, runs the EP forward on its slice of the global x, all-
-# gathers the per-rank outputs, and compares against a single-rank
-# PyTorch reference computed on rank 0.
+# Each rank constructs the same MoE (seeded), shards weights along the leading
+# E axis, runs the EP forward on its slice of the global x, all-gathers the
+# per-rank outputs, and compares against a single-rank PyTorch reference
+# computed on rank 0.
 #
 # Coverage matrix per shape:
 #   - Both public entry points: moe_ep_TC_softmax_topk_forward,
@@ -19,9 +19,17 @@
 # Shape list is comprehensive: smoke, K∈{1,2,4,8,10}, H/I aspect ratio sweep,
 # T not divisible by common block sizes, E∈{32,64,128,256,512}.
 #
-# Usage:
-#     EP_TEST_WORLD_SIZE=4 python tests/test_ep.py
-#     EP_TEST_WORLD_SIZE=8 python tests/test_ep.py --master-port 29600
+# Usage (torchrun-launched):
+#
+#   torchrun --nproc_per_node=4 --standalone --local-ranks-filter 0 \
+#            tests/test_ep.py
+#   torchrun --nproc_per_node=8 --standalone --local-ranks-filter 0 \
+#            tests/test_ep.py --concat-layout
+#
+# torchrun sets RANK / WORLD_SIZE / LOCAL_RANK / MASTER_ADDR / MASTER_PORT in
+# each child; we just read them. --standalone picks a free master port; use
+# --local-ranks-filter 0 to dedupe console output (rank 0 already does the
+# printing, but Triton/NCCL warnings on other ranks can still be noisy).
 # ********************************************************************************
 
 from __future__ import annotations
@@ -35,14 +43,12 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from sonicmoe import MoE
 from sonicmoe.enums import ActivationType
 
 # Private helper — used to print which mode "auto" resolves to.
-# Adjust this import to where your cleaned-up ep.py lives.
 from sonicmoe.ep import _select_dispatch_mode  # type: ignore
 from sonicmoe.ep import SymmMemManager, moe_ep_general_routing_forward, moe_ep_TC_softmax_topk_forward
 
@@ -166,26 +172,9 @@ def _per_expert_reference(
 
 
 # ============================================================================
-# Distributed plumbing
+# Distributed plumbing — torchrun-driven. dist is initialized once in main();
+# everything else is plain rank-aware code.
 # ============================================================================
-
-
-def _setup(rank: int, world_size: int, master_port: int) -> torch.device:
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(master_port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    return torch.device(f"cuda:{rank}")
-
-
-def _teardown():
-    try:
-        dist.barrier()
-        dist.destroy_process_group()
-    except Exception:
-        pass
 
 
 def _all_gather_y(y_local: torch.Tensor, world_size: int) -> torch.Tensor:
@@ -252,9 +241,6 @@ def _run_one_shape(
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # Construct MoE WITH biases on every rank (seeded → identical across
-    # ranks). For the bias=False pass we just pass b1=b2=None to both EP
-    # and reference — saves one full MoE construction per shape.
     moe = (
         MoE(
             num_experts=E,
@@ -423,51 +409,6 @@ def _run_one_shape(
 
 
 # ============================================================================
-# Per-rank entry point
-# ============================================================================
-
-
-def _run_rank(
-    rank: int, world_size: int, master_port: int, concat_layout: bool, atol: float, rtol: float, queue
-) -> None:
-    try:
-        device = _setup(rank, world_size, master_port)
-        all_stats: List[ShapeStats] = []
-        for shape in SHAPES:
-            try:
-                stats = _run_one_shape(
-                    rank,
-                    world_size,
-                    device,
-                    shape,
-                    dtype=torch.bfloat16,
-                    concat_layout=concat_layout,
-                    atol=atol,
-                    rtol=rtol,
-                    seed=1111,
-                )
-                all_stats.append(stats)
-            except Exception as e:
-                if rank == 0:
-                    print(f"[ERR {shape.name}] {e}")
-                    traceback.print_exc()
-                stats = ShapeStats(shape.name)
-                stats.fail_count = 1
-                stats.failures.append(f"exception: {e}")
-                all_stats.append(stats)
-            torch.cuda.empty_cache()
-        if rank == 0:
-            queue.put(all_stats)
-        _teardown()
-    except Exception:
-        if rank == 0:
-            traceback.print_exc()
-            queue.put([])
-        _teardown()
-        raise
-
-
-# ============================================================================
 # Driver
 # ============================================================================
 
@@ -479,66 +420,108 @@ def _print_summary(all_stats: List[ShapeStats]) -> bool:
     name_w = max((len(s.shape_name) for s in all_stats), default=10)
     for s in all_stats:
         marker = "✓" if s.fail_count == 0 else "✗"
-        print(f"  {marker} {s.shape_name:<{name_w}}  " f"pass={s.pass_count}  fail={s.fail_count}")
+        print(f"  {marker} {s.shape_name:<{name_w}}  pass={s.pass_count}  fail={s.fail_count}")
         for f in s.failures:
             print(f"      - {f}")
     print(f"\nTotal: pass={total_pass}  fail={total_fail}")
     return total_fail == 0
 
 
+def _under_torchrun() -> bool:
+    return "RANK" in os.environ and "WORLD_SIZE" in os.environ
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--world-size",
-        type=int,
-        default=int(os.environ.get("EP_TEST_WORLD_SIZE", torch.cuda.device_count())),
+        "--concat-layout",
+        action="store_true",
+        help="Test the concat [g; u] up-proj layout instead of interleaved.",
     )
-    parser.add_argument("--master-port", type=int, default=29500)
-    parser.add_argument(
-        "--concat-layout", action="store_true", help="Test the concat [g; u] up-proj layout instead " "of interleaved."
-    )
-    parser.add_argument("--atol", type=float, default=2e-2)
-    parser.add_argument("--rtol", type=float, default=2e-2)
     args = parser.parse_args()
 
-    if args.world_size < 2:
-        print(f"SKIP: EP test needs world_size >= 2 (got {args.world_size}).")
-        return 0
-    if torch.cuda.device_count() < args.world_size:
-        print(f"SKIP: need {args.world_size} GPUs, found " f"{torch.cuda.device_count()}.")
-        return 0
-
-    print(
-        f"\nEP correctness test (W={args.world_size}, "
-        f"concat_layout={args.concat_layout}, "
-        f"shapes={len(SHAPES)})\n"
-    )
-
-    ctx = mp.get_context("spawn")
-    queue = ctx.Queue()
-    procs = []
-    for rank in range(args.world_size):
-        p = ctx.Process(
-            target=_run_rank,
-            args=(rank, args.world_size, args.master_port, args.concat_layout, args.atol, args.rtol, queue),
+    if not _under_torchrun():
+        print(
+            "ERROR: this test must be launched with torchrun, e.g.:\n"
+            "  torchrun --nproc_per_node=8 --standalone tests/test_ep.py",
+            file=sys.stderr,
         )
-        p.start()
-        procs.append(p)
-    for p in procs:
-        p.join()
+        return 2
 
-    bad_exit = [p.exitcode for p in procs if p.exitcode not in (0, None)]
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+
+    if world_size < 2:
+        if rank == 0:
+            print(f"SKIP: EP test needs world_size >= 2 (got {world_size}).")
+        return 0
+    if local_rank >= torch.cuda.device_count():
+        print(
+            f"[r{rank}] ERROR: LOCAL_RANK={local_rank} but only " f"{torch.cuda.device_count()} CUDA devices visible",
+            file=sys.stderr,
+        )
+        return 2
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        "nccl",
+        rank=rank,
+        world_size=world_size,
+        device_id=torch.device(f"cuda:{local_rank}"),
+    )
+    device = torch.device(f"cuda:{local_rank}")
+
+    if rank == 0:
+        print(
+            f"\nEP correctness test (W={world_size}, "
+            f"concat_layout={args.concat_layout}, "
+            f"shapes={len(SHAPES)})\n"
+        )
+
     all_stats: List[ShapeStats] = []
-    while not queue.empty():
-        all_stats.extend(queue.get())
+    try:
+        for shape in SHAPES:
+            try:
+                stats = _run_one_shape(
+                    rank,
+                    world_size,
+                    device,
+                    shape,
+                    dtype=torch.bfloat16,
+                    concat_layout=args.concat_layout,
+                    atol=2e-2,
+                    rtol=2e-2,
+                    seed=1111,
+                )
+            except Exception as e:
+                if rank == 0:
+                    print(f"[ERR {shape.name}] {e}")
+                    traceback.print_exc()
+                stats = ShapeStats(shape.name)
+                stats.fail_count = 1
+                stats.failures.append(f"exception: {e}")
+            all_stats.append(stats)
+            torch.cuda.empty_cache()
+    finally:
+        # Decide pass/fail on rank 0, then broadcast so every rank exits the
+        # same way. Without this, rank 0 might exit 1 while peers exit 0 and
+        # torchrun's exit code becomes ambiguous.
+        if rank == 0:
+            success = _print_summary(all_stats)
+            success_t = torch.tensor([1 if success else 0], device=device, dtype=torch.int32)
+        else:
+            success_t = torch.zeros(1, device=device, dtype=torch.int32)
+        dist.broadcast(success_t, src=0)
+        success = bool(success_t.item())
 
-    if bad_exit:
-        print(f"\nFAIL: ranks exited with {bad_exit}")
-        return 1
+        try:
+            dist.barrier()
+            dist.destroy_process_group()
+        except Exception:
+            pass
 
-    if not _print_summary(all_stats):
-        return 1
-    return 0
+    return 0 if success else 1
 
 
 if __name__ == "__main__":

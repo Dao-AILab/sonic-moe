@@ -225,19 +225,15 @@ def run(args: argparse.Namespace) -> None:
     torch.cuda.manual_seed_all(1111)
 
     # Construct same MoE on every rank (seeded → identical weights).
-    moe = (
-        MoE(
-            num_experts=E,
-            num_experts_per_tok=K,
-            hidden_size=H,
-            intermediate_size=I,
-            activation_function=activation,
-            add_bias=add_bias,
-            std=0.02,
-        )
-        .to(dtype=torch_dtype)
-        .to(device)
-    )
+    moe = MoE(
+        num_experts=E,
+        num_experts_per_tok=K,
+        hidden_size=H,
+        intermediate_size=I,
+        activation_function=activation,
+        add_bias=add_bias,
+        std=0.02,
+    ).to(dtype=torch_dtype, device=device)
     if add_bias:
         torch.nn.init.normal_(moe.c_fc.bias, 0, 0.01)
         torch.nn.init.normal_(moe.c_proj.bias, 0, 0.01)
@@ -252,8 +248,8 @@ def run(args: argparse.Namespace) -> None:
     router_w = moe.router.weight  # (E, H)
 
     e_slc = slice(rank * E_local, (rank + 1) * E_local)
-    w1 = w1_full[e_slc].permute(0, 2, 1).contiguous().permute(2, 1, 0)
-    w2 = w2_full[e_slc].permute(1, 2, 0).contiguous()
+    w1 = w1_full[e_slc].permute(2, 0, 1).contiguous().permute(2, 0, 1)
+    w2 = w2_full[e_slc].contiguous()
     b1 = b1_full[e_slc].contiguous() if add_bias else None
     b2 = b2_full[e_slc].contiguous() if add_bias else None
 

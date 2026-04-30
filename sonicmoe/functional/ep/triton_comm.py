@@ -28,7 +28,7 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable
+from typing import Iterable, Optional
 
 import torch
 import torch.distributed as dist
@@ -135,6 +135,107 @@ def _all_gather_kernel(
                 mask = offs < numel_per_rank
                 data = tl.load(buf_tuple[i] + offs, mask=mask)
                 tl.store(output_ptr + i * numel_per_rank + offs, data, mask=mask)
+
+
+# ============================================================================
+# Reduce-scatter (sum) — symmetric to all_gather. Each rank reads peers'
+# my_rank-th chunk via NVLink and accumulates locally. fp32 accumulation,
+# implicit cast on store. No NCCL.
+#
+# Shape contract: x_symm is (W*T_local, ...) — i.e. the same total-size
+# input that NCCL's reduce_scatter_tensor expects. Output is (T_local, ...).
+#
+# Determinism: summation order is rank 0 → W-1, fixed at compile time via
+# tl.static_range. Bitwise reproducible across runs for the same inputs;
+# NCCL ring RS is not, because the algorithm reorders depending on topology.
+# ============================================================================
+
+_RS_BLOCK_CONFIGS = [
+    triton.Config({"BLOCK_SIZE": 2048}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_SIZE": 4096}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_SIZE": 8192}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_SIZE": 16384}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_SIZE": 16384}, num_warps=16, num_stages=3),
+    triton.Config({"BLOCK_SIZE": 32768}, num_warps=16, num_stages=3),
+]
+
+
+@triton.autotune(
+    configs=_RS_BLOCK_CONFIGS,
+    key=["numel_per_rank", "world_size"],
+    prune_configs_by=_prune_by_grid_y("numel_per_rank"),
+)
+@triton.heuristics({"EVEN_K": lambda args: args["numel_per_rank"] % args["BLOCK_SIZE"] == 0})
+@triton.jit
+def _reduce_scatter_kernel(
+    buf_tuple,
+    output_ptr,
+    numel_per_rank: tl.constexpr,
+    my_rank: tl.constexpr,
+    world_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    EVEN_K: tl.constexpr,
+):
+    """output[0:N] ← Σ_{r in 0..W} buf_tuple[r][my_rank*N : (my_rank+1)*N]
+
+    AG fans out: 1 program reads 1 peer chunk, writes 1 output chunk.
+    RS fans in:  1 program reads W peer chunks, writes 1 local chunk.
+    fp32 accumulation; tl.store implicitly casts to output dtype.
+    """
+    pid_tile = tl.program_id(0)
+    offs = pid_tile * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    base = my_rank * numel_per_rank
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    if EVEN_K:
+        for i in tl.static_range(world_size):
+            data = tl.load(buf_tuple[i] + base + offs)
+            acc += data.to(tl.float32)
+        tl.store(output_ptr + offs, acc)
+    else:
+        mask = offs < numel_per_rank
+        for i in tl.static_range(world_size):
+            data = tl.load(buf_tuple[i] + base + offs, mask=mask, other=0.0)
+            acc += data.to(tl.float32)
+        tl.store(output_ptr + offs, acc, mask=mask)
+
+
+def reduce_scatter(x_symm, group, out=None):
+    """Sum-reduce-scatter via Triton + symm-mem (no NCCL).
+
+    Equivalent to:
+        dist.reduce_scatter_tensor(out, x_symm, op=ReduceOp.SUM, group=group)
+    up to fp32-accumulation order. Output dtype matches x_symm.
+
+    Args:
+        x_symm: symm-mem tensor, shape (W*T_local, ...). The leading dim must
+            be divisible by world_size.
+        group: process group used at rendezvous time.
+        out: optional pre-allocated output of shape (T_local, ...) and matching
+            dtype/device. If None, allocated here.
+
+    Caller contract: x_symm has been written and a barrier has been issued
+    before the call (peers read this rank's bytes via NVLink).
+    """
+    hdl = rendezvous(x_symm, group)
+    W = hdl.world_size
+    rank = hdl.rank
+    assert x_symm.shape[0] % W == 0, f"reduce_scatter: x_symm.shape[0]={x_symm.shape[0]} not divisible by W={W}"
+    T_local = x_symm.shape[0] // W
+    out_shape = (T_local,) + tuple(x_symm.shape[1:])
+    if out is None:
+        out = torch.empty(out_shape, dtype=x_symm.dtype, device=x_symm.device)
+
+    numel_per_rank = out.numel()
+    buf_tuple = tuple(hdl.get_buffer(r, tuple(x_symm.shape), x_symm.dtype) for r in range(W))
+    grid = lambda META: (triton.cdiv(numel_per_rank, META["BLOCK_SIZE"]),)
+    _reduce_scatter_kernel[grid](
+        buf_tuple,
+        out,
+        numel_per_rank=numel_per_rank,
+        my_rank=rank,
+        world_size=W,
+    )
+    return out
 
 
 _A2A_PULL_CONFIGS = [
@@ -491,7 +592,7 @@ def _metadata_phase3_emit_kernel(
 
 
 def compute_dispatch_metadata(
-    topk_idx_g: torch.Tensor,
+    topk_idx_global: torch.Tensor,
     my_rank: int,
     E_local: int,
 ):
@@ -506,12 +607,10 @@ def compute_dispatch_metadata(
     previously computed in ep.py's _moe_ep_forward_inner, eliminating
     3 + 3 torch kernel launches and two cached workspace patterns
     (invalid_lane_expert, src_rank_pattern)."""
-    assert topk_idx_g.dim() == 3
-    assert topk_idx_g.dtype == torch.int32
-    W, T_local, K = topk_idx_g.shape
+    W, T_local, K = topk_idx_global.shape
     TK_local = T_local * K
     TK_global = W * TK_local
-    device = topk_idx_g.device
+    device = topk_idx_global.device
 
     BLOCK_TK = max(triton.next_power_of_2(TK_local), 64) if TK_local <= 256 else 512
     n_tiles = (TK_local + BLOCK_TK - 1) // BLOCK_TK
@@ -524,7 +623,7 @@ def compute_dispatch_metadata(
     expert_local_padded = torch.empty(TK_global, dtype=torch.int32, device=device)
 
     _metadata_phase1_reduce_kernel[(W, n_tiles)](
-        topk_idx_g.contiguous(),
+        topk_idx_global,
         dst_rank_flat,
         within_tile_slot,
         tile_count,
@@ -605,10 +704,6 @@ def safe_block_size(chunk_numel: int, requested: int = 4096) -> int:
     return block
 
 
-def _product(xs: Iterable[int]) -> int:
-    return math.prod(map(int, xs))
-
-
 # ============================================================================
 # Python wrappers
 # ============================================================================
@@ -657,8 +752,6 @@ def a2a_dispatch_pull(
     T_local, d = x_symm.shape
     TK_local = T_local * K
     TK_global = W * TK_local
-    assert dst_rank_flat.shape == (TK_global,) and dst_rank_flat.dtype == torch.int32
-    assert slot_flat_per_rank.shape == (TK_global,) and slot_flat_per_rank.dtype == torch.int32
 
     x_peer_tuple = tuple(hdl.get_buffer(r, (T_local, d), x_symm.dtype) for r in range(W))
     recv_flat = recv.view(W * TK_local, d)
@@ -769,7 +862,7 @@ def _rs_aggregation_kernel(
     y_symm_ptr,  # (TK_global, d) expert output, flat
     s_reverse_ptr,  # (TK_global,) int32, dispatch slot -> row index
     dst_rank_flat_ptr,  # (TK_global,) int32, destination rank per slot
-    scores_ag_ptr,  # (TK_global,) dtype, score per slot
+    scores_ag_ptr,  # (TK_global,) float32, score per slot
     rs_buf_ptr,  # (W * T_local, d) float32 output, flat
     T_local,
     my_rank: tl.constexpr,
@@ -829,47 +922,58 @@ def rs_aggregation(
     rs_buf: torch.Tensor,
     K: int,
     T_local: int,
+    group: dist.ProcessGroup,
 ) -> None:
     """Writes rs_buf[home_rank * T_local + home_t, :] =
-        sum_{k where dst[f]==my_rank} score[f] * y_symm[s_reverse[f], :]
-    for each (home_rank, home_t) pair.
+        sum_{k where dst[f] == my_rank} score[f] * y_symm[s_reverse[f], :]
+    for each (home_rank, home_t) pair, where f = (home_rank*T_local + home_t)*K + k.
 
-    No atomic_add. No zero_() needed -- the kernel writes every output row
-    exactly once (zero accumulator -> zero store when no k matched).
+    No atomic_add. No zero_() needed — the kernel writes every output row
+    exactly once (zero accumulator → zero store when no k matched).
 
-    Intended call pattern in the EP forward:
-        1. rs_aggregation(y_symm, s_reverse, dst_rank_flat, scores_ag,
-                      rs_buf, K, T_local)
-        2. barrier(rs_buf, group)
-        3. out = reduce_scatter(rs_buf, group)
+    Intended call pattern in the EP forward (when rs combine is wired up):
+        topk_idx_g, topk_scores_g = _ag_routing_decision(
+            ws.idx_symm, topk_idx_l, grp,
+            scores_symm=ws.scores_symm, topk_scores_l=topk_scores_l,
+        )                                          # topk_scores_g: (W*T_local, K) fp32
+        ...
+        rs_aggregation(y_symm, s_reverse, meta["dst_rank_flat"],
+                       topk_scores_g, rs_buf, K, T_local, group=grp)
+        barrier(rs_buf, grp)
+        out = reduce_scatter(rs_buf, grp)
 
     Args:
-        y_symm: (TK_global, d) expert output (flat, already on this rank).
-        s_reverse: (TK_global,) int32, maps dispatch slot -> row in y_symm.
-        dst_rank_flat: (TK_global,) int32, destination rank for each slot.
-        scores_ag: (TK_global,) dtype, topk score per slot (flat).
-        rs_buf: (W * T_local, d) float32, output buffer. Will be written
-            in-place. Should be symm-mem for the subsequent reduce_scatter.
+        y_symm: (TK_global, d) expert output. Reads are local — symm-mem
+            allocation only matters for the subsequent reduce_scatter.
+        s_reverse: (TK_global,) int32, dispatch slot → row in y_symm.
+        dst_rank_flat: (TK_global,) int32, destination rank per slot.
+            From compute_dispatch_metadata.
+        scores_ag: GLOBAL all-gathered scores, fp32. Accepted shapes:
+            (TK_global,) flat, or (W*T_local, K) — the natural output of
+            all_gather(scores_symm). Flattened internally; no copy when
+            already contiguous.
+        rs_buf: (W*T_local, d) fp32 output buffer. Should be symm-mem so it
+            can feed reduce_scatter directly. Written in-place.
         K: top-K experts per token.
         T_local: tokens per rank.
+        group: the EP process group. Used to query my_rank consistently
+            with the rest of the EP collective stack.
     """
-    assert rs_buf.ndim == 2, (
-        f"rs_buf must be 2D (W * T_local, d), got shape {rs_buf.shape}. "
-        f"Use (W * T_local, d) so it can be passed directly to reduce_scatter."
-    )
+    assert rs_buf.ndim == 2, f"rs_buf must be 2D (W*T_local, d), got shape {tuple(rs_buf.shape)}."
     WT, d = rs_buf.shape
-    W = WT // T_local
-    assert WT == W * T_local, f"rs_buf.shape[0]={WT} not divisible by T_local={T_local}"
+    W = dist.get_world_size(group)
+    my_rank = dist.get_rank(group)
+    assert WT == W * T_local, f"rs_buf.shape[0]={WT} != W*T_local={W*T_local} (W from group)"
 
     grid = lambda META: (W * T_local, triton.cdiv(d, META["BLOCK_D"]))
     _rs_aggregation_kernel[grid](
         y_symm,
         s_reverse,
         dst_rank_flat,
-        scores_ag.contiguous(),
+        scores_ag.view(-1),
         rs_buf,
         T_local=T_local,
-        my_rank=dist.get_rank(),
+        my_rank=my_rank,
         world_size=W,
         K=K,
         d=d,

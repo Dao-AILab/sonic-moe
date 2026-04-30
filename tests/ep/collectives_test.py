@@ -1,18 +1,34 @@
 # ********************************************************************************
 # Copyright (c) 2026, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
+#
+# Run with torchrun:
+#
+#   torchrun --nproc_per_node=8 --standalone --local-ranks-filter 0 -m pytest tests/ep/collectives_test.py -s
+#
+# Single test:
+#
+#   torchrun --nproc_per_node=8 --standalone --local-ranks-filter 0 \
+#       -m pytest tests/ep/collectives_test.py::EPCollectivesTest::test_all_gather -s
+#
+# torchrun sets RANK / WORLD_SIZE / LOCAL_RANK / MASTER_ADDR / MASTER_PORT in each
+# child process; we initialize the process group once in setUpClass and let each
+# test method execute on its own rank, gathering failure strings across ranks via
+# dist.all_gather_object.
 
 import os
+import traceback
 import unittest
 
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from torch.distributed import _symmetric_memory as _symm_mem
 
 from sonicmoe.functional.ep import a2a_dispatch_pull
 from sonicmoe.functional.ep import all_gather as triton_all_gather
-from sonicmoe.functional.ep import compute_dispatch_metadata, gather_aggregation, rs_aggregation
+from sonicmoe.functional.ep import compute_dispatch_metadata, gather_aggregation
+from sonicmoe.functional.ep import reduce_scatter as triton_reduce_scatter
+from sonicmoe.functional.ep import rs_aggregation
 from tests.test_commons import TestCommons
 
 
@@ -24,17 +40,39 @@ def _set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def _get_world_size() -> int:
-    n = int(os.environ.get("EP_TEST_WORLD_SIZE", str(min(torch.cuda.device_count(), 8))))
-    if n < 2:
-        raise unittest.SkipTest(f"EP collective tests require ≥2 GPUs (have {n})")
-    return n
+# ============================================================================
+# Distributed setup (torchrun-driven). dist is initialized exactly once per
+# process; we key off RANK/WORLD_SIZE in os.environ to detect torchrun.
+# ============================================================================
 
 
-def _setup_dist(rank: int, world_size: int, port: str) -> None:
-    os.environ.update(MASTER_ADDR="localhost", MASTER_PORT=port, RANK=str(rank), WORLD_SIZE=str(world_size))
-    torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", rank=rank, world_size=world_size, device_id=torch.device(f"cuda:{rank}"))
+def _under_torchrun() -> bool:
+    return "RANK" in os.environ and "WORLD_SIZE" in os.environ
+
+
+def _init_dist_from_env() -> None:
+    if dist.is_initialized():
+        return
+    if not _under_torchrun():
+        raise unittest.SkipTest(
+            "EP collective tests must be launched with torchrun, e.g.:\n"
+            "  torchrun --nproc_per_node=8 --standalone "
+            "-m pytest tests/ep/collectives_test.py -s"
+        )
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    if world_size < 2:
+        raise unittest.SkipTest(f"EP collective tests require ≥2 GPUs (have {world_size})")
+    if local_rank >= torch.cuda.device_count():
+        raise unittest.SkipTest(f"LOCAL_RANK={local_rank} but only {torch.cuda.device_count()} CUDA devices visible")
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        "nccl",
+        rank=rank,
+        world_size=world_size,
+        device_id=torch.device(f"cuda:{local_rank}"),
+    )
     _symm_mem.enable_symm_mem_for_group(dist.group.WORLD.group_name)
 
 
@@ -60,54 +98,34 @@ def _gen_routing(T_local, K, E, my_rank, world_size, device, *, pattern, seed):
 
 
 # ============================================================================
-# Subprocess driver: spawn N workers, collect failures via SimpleQueue.
-# Worker functions must be module-level (picklable for spawn context).
+# Run a worker on this rank and aggregate failure strings across all ranks.
+# Replaces the old mp.spawn-based _spawn_and_run; under torchrun every rank is
+# already executing this code path, so we just call the worker locally and use
+# all_gather_object to collect each rank's findings.
 # ============================================================================
 
 
-def _subprocess_entry(rank, world_size, worker_fn, port, error_queue):
+def _run_worker_collect_failures(worker_fn) -> list[str]:
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    device = torch.device(f"cuda:{local_rank}")
+    _set_seed(_SEED + rank)
+
     try:
-        _setup_dist(rank, world_size, port=port)
-        device = torch.device(f"cuda:{rank}")
-        _set_seed(_SEED + rank)
-        failures = worker_fn(rank, world_size, device)
-        error_queue.put((rank, list(failures)))
+        local_fails = list(worker_fn(rank, world_size, device))
     except Exception as e:
-        import traceback
+        local_fails = [f"EXCEPTION: {e}\n{traceback.format_exc()}"]
 
-        error_queue.put((rank, [f"EXCEPTION: {e}\n{traceback.format_exc()}"]))
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
+    # Make sure every rank reaches the gather even if some raised. all_gather_object
+    # is a collective: any rank that skips it would deadlock the others.
+    gathered: list[list[str]] = [[] for _ in range(world_size)]
+    dist.all_gather_object(gathered, local_fails)
 
-
-def _spawn_and_run(world_size, worker_fn, port, timeout=600):
-    """Spawn `world_size` processes running worker_fn(rank, world_size, device).
-    Returns aggregated list of failure strings from all ranks."""
-    ctx = mp.get_context("spawn")
-    error_queue = ctx.SimpleQueue()
-    procs = []
-    for rank in range(world_size):
-        p = ctx.Process(target=_subprocess_entry, args=(rank, world_size, worker_fn, port, error_queue))
-        p.start()
-        procs.append(p)
-
-    for p in procs:
-        p.join(timeout=timeout)
-
-    failures = []
-    for i, p in enumerate(procs):
-        if p.is_alive():
-            p.terminate()
-            p.join()
-            failures.append(f"[r{i}] subprocess timed out after {timeout}s")
-        elif p.exitcode not in (0, None):
-            failures.append(f"[r{i}] subprocess exited with code {p.exitcode}")
-
-    while not error_queue.empty():
-        rank, fails = error_queue.get()
-        failures.extend(f"[r{rank}] {f}" for f in fails)
-    return failures
+    aggregated: list[str] = []
+    for r, fails in enumerate(gathered):
+        aggregated.extend(f"[r{r}] {f}" for f in fails)
+    return aggregated
 
 
 # ============================================================================
@@ -140,12 +158,62 @@ def _worker_all_gather(rank, world_size, device):
         for dtype in (torch.bfloat16, torch.float32):
             x = _alloc_symm((T_local, d), dtype, device)
             x.normal_()
+            dist.barrier()
             tri = triton_all_gather(x, dist.group.WORLD)
             ref = torch.empty(world_size * T_local, d, dtype=dtype, device=device)
             dist.all_gather_into_tensor(ref, x, group=dist.group.WORLD)
             if not torch.equal(tri, ref):
-                fails.append(f"AG T={T_local} d={d} dt={dtype}: " f"{(tri != ref).sum().item()} differ")
+                fails.append(f"AG T={T_local} d={d} dt={dtype}: {(tri != ref).sum().item()} differ")
             del x, tri, ref
+        torch.cuda.empty_cache()
+    return fails
+
+
+# ============================================================================
+# Worker: reduce_scatter — Triton fp32-accum vs NCCL ring RS.
+# ----------------------------------------------------------------------------
+# Both reduce in fp32 internally for bf16 i/o, but they differ in summation
+# order (Triton: rank 0..W-1 left-to-right; NCCL: ring), so we use allclose
+# rather than equal. fp32 i/o has the same order issue, plus rounding from
+# non-associative fp32 add — same allclose path.
+# ============================================================================
+
+
+def _worker_reduce_scatter(rank, world_size, device):
+    fails = []
+    for T_local, d, K, E_local in _SHAPES:
+        for dtype in (torch.bfloat16, torch.float32):
+            x = _alloc_symm((world_size * T_local, d), dtype, device)
+            x.normal_()
+            dist.barrier()
+
+            tri = triton_reduce_scatter(x, dist.group.WORLD)
+
+            # Algorithmic reference matching the kernel exactly: AG every
+            # rank's x_symm, then sum the my_rank-th T_local slice over peers
+            # in fp32 (rank order, left-to-right), cast to dtype at the end.
+            #
+            # NCCL's bf16 reduce_scatter is NOT a valid bit-exact reference:
+            # its accumulation precision and topology are implementation-
+            # defined, so its bf16 output may differ from ours by ~1 ULP at
+            # high-magnitude elements (we observed exactly 2^-4 = 0.0625,
+            # one bf16 ULP at magnitude 16). The AG-based reference shares
+            # the kernel's precision and accumulation order, so torch.equal
+            # is the right check.
+            x_all = triton_all_gather(x, dist.group.WORLD).view(world_size, world_size * T_local, d)
+            ref_fp32 = torch.zeros(T_local, d, dtype=torch.float32, device=device)
+            for p in range(world_size):
+                ref_fp32 += x_all[p, rank * T_local : (rank + 1) * T_local].to(torch.float32)
+            ref = ref_fp32.to(dtype)
+
+            if not torch.equal(tri, ref):
+                diff = (tri.float() - ref.float()).abs()
+                fails.append(
+                    f"RS T={T_local} d={d} dt={dtype}: "
+                    f"{(tri != ref).sum().item()} differ, "
+                    f"max_diff={diff.max().item():.3e}"
+                )
+            del x, tri, ref, x_all, ref_fp32
         torch.cuda.empty_cache()
     return fails
 
@@ -185,7 +253,7 @@ def _worker_a2a_pull(rank, world_size, device):
 
             if not torch.equal(recv, ref):
                 fails.append(
-                    f"A2A T={T_local} d={d} K={K} {pat}: " f"{(recv != ref).any(dim=-1).sum().item()} rows differ"
+                    f"A2A T={T_local} d={d} K={K} {pat}: {(recv != ref).any(dim=-1).sum().item()} rows differ"
                 )
             del x, recv, ref, x_all
         torch.cuda.empty_cache()
@@ -226,7 +294,7 @@ def _worker_rs_aggregation(rank, world_size, device):
 
             rs = _alloc_symm((world_size * T_local, d), torch.float32, device)
             rs.zero_()
-            rs_aggregation(y, sr, meta["dst_rank_flat"], sc_flat, rs, K, T_local)
+            rs_aggregation(y, sr, meta["dst_rank_flat"], sc_flat, rs, K, T_local, group=dist.group.WORLD)
 
             # Reference: same K-order accumulation. The kernel masks non-mine
             # slots with other=0.0, so contribution is score * 0 = 0; mirror
@@ -241,7 +309,7 @@ def _worker_rs_aggregation(rank, world_size, device):
                 ref += sc_flat[f].to(torch.float32)[:, None] * rows
 
             if not torch.allclose(rs, ref, atol=1e-4, rtol=1e-3):
-                fails.append(f"RS T={T_local} d={d} K={K} {pat}: " f"max_abs={(rs - ref).abs().max():.3e}")
+                fails.append(f"RS T={T_local} d={d} K={K} {pat}: max_abs={(rs - ref).abs().max():.3e}")
             del y, sr, rs, sc_full
         torch.cuda.empty_cache()
     return fails
@@ -258,7 +326,6 @@ def _worker_gather_aggregation(rank, world_size, device):
     for T_local, d, K, E_local in _SHAPES:
         TK_local = T_local * K
         TK_global = world_size * TK_local
-        # y_all reference is (W * TK_global, d). Skip if it would exceed 8 GB.
         if world_size * TK_global * d * 2 > (8 << 30):
             continue
 
@@ -274,13 +341,25 @@ def _worker_gather_aggregation(rank, world_size, device):
             topk = _gen_routing(T_local, K, E, rank, world_size, device, pattern=pat, seed=300)
             meta = compute_dispatch_metadata(topk, my_rank=rank, E_local=E_local)
             pos_2d = (torch.arange(TK_local, device=device, dtype=torch.int32) + rank * TK_local).view(T_local, K)
-            scores = torch.softmax(
+
+            # LOCAL scores — gather_aggregation does not need globals.
+            scores_local = torch.softmax(
                 torch.randn(T_local, K, device=device, dtype=torch.float32, generator=g), dim=-1
             ).to(torch.bfloat16)
+
             out = torch.empty(T_local, d, dtype=torch.bfloat16, device=device)
 
             dist.barrier()
-            gather_aggregation(y, sr, meta["my_dst_rank"], pos_2d, scores, out, K=K, group=dist.group.WORLD)
+            gather_aggregation(
+                y,
+                sr,
+                meta["my_dst_rank"],
+                pos_2d,
+                scores_local,
+                out,
+                K=K,
+                group=dist.group.WORLD,
+            )
 
             y_all = triton_all_gather(y, dist.group.WORLD)
             s_all = triton_all_gather(sr, dist.group.WORLD)
@@ -290,35 +369,56 @@ def _worker_gather_aggregation(rank, world_size, device):
                 pos = pos_2d[:, k].long()
                 s_peer = s_all[peer * TK_global + pos].long()
                 row = y_all[peer * TK_global + s_peer].to(torch.float32)
-                ref_acc += scores[:, k].to(torch.float32)[:, None] * row
+                ref_acc += scores_local[:, k].to(torch.float32)[:, None] * row
             ref = ref_acc.to(torch.bfloat16)
 
             if not torch.allclose(out, ref, atol=1e-2, rtol=1e-2):
                 max_abs = (out.float() - ref.float()).abs().max().item()
-                fails.append(f"Gather T={T_local} d={d} K={K} {pat}: " f"max_abs={max_abs:.3e}")
+                fails.append(f"Gather T={T_local} d={d} K={K} {pat}: max_abs={max_abs:.3e}")
             del y, sr, out, y_all, s_all
         torch.cuda.empty_cache()
     return fails
 
 
 # ============================================================================
-# Test class
+# Test class — one process per rank; dist is initialized once per process.
 # ============================================================================
 
 
 class EPCollectivesTest(TestCommons):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass() if hasattr(super(), "setUpClass") else None
+        _init_dist_from_env()
+
+    @classmethod
+    def tearDownClass(cls):
+        # Don't destroy the group between tests in the same run; only at process
+        # exit. torchrun will reap child processes cleanly.
+        if hasattr(super(), "tearDownClass"):
+            super().tearDownClass()
+
+    def setUp(self):
+        # Keep ranks lockstep at the start of each test so a slow rank doesn't
+        # collide with the previous test's tail traffic.
+        dist.barrier()
+
     def test_all_gather(self) -> None:
-        fails = _spawn_and_run(_get_world_size(), _worker_all_gather, port="29556")
+        fails = _run_worker_collect_failures(_worker_all_gather)
+        self.assertEqual(fails, [], "\n" + "\n".join(fails))
+
+    def test_reduce_scatter(self) -> None:
+        fails = _run_worker_collect_failures(_worker_reduce_scatter)
         self.assertEqual(fails, [], "\n" + "\n".join(fails))
 
     def test_a2a_dispatch_pull(self) -> None:
-        fails = _spawn_and_run(_get_world_size(), _worker_a2a_pull, port="29557")
+        fails = _run_worker_collect_failures(_worker_a2a_pull)
         self.assertEqual(fails, [], "\n" + "\n".join(fails))
 
     def test_rs_aggregation(self) -> None:
-        fails = _spawn_and_run(_get_world_size(), _worker_rs_aggregation, port="29558")
+        fails = _run_worker_collect_failures(_worker_rs_aggregation)
         self.assertEqual(fails, [], "\n" + "\n".join(fails))
 
     def test_gather_aggregation(self) -> None:
-        fails = _spawn_and_run(_get_world_size(), _worker_gather_aggregation, port="29559")
+        fails = _run_worker_collect_failures(_worker_gather_aggregation)
         self.assertEqual(fails, [], "\n" + "\n".join(fails))
