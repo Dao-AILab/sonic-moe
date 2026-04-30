@@ -73,17 +73,21 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed import _symmetric_memory as _symm_mem
 
-from .enums import ActivationType
-from .functional import TC_Softmax_Topk_Router_Function, _UpProjection
-from .functional.forward import _down_projection_forward
-from .functional.triton_kernels import general_routing_router_metadata_triton
+# Down projection used to be wrapped by sonicmoe.functional.forward._down_projection_forward,
+# which was a one-line `gemm(a, w2.permute(2, 1, 0), out=y, cu_seqlens_m=...)` shim.
+# Recent sonic-moe main dropped that shim, so we call QuACK's gemm directly.
+from quack.gemm_interface import gemm
 
-from .ep_triton_comm import (
+from .enums import ActivationType
+from sonicmoe.functional import TC_Softmax_Topk_Router_Function, _UpProjection
+from sonicmoe.functional.triton_kernels import general_routing_router_metadata_triton
+
+from .functional.ep.triton_comm import (
     a2a_dispatch_pull,
     all_gather,
     barrier,
     compute_dispatch_metadata,
-    fused_gather_combine,
+    gather_aggregation,
     rendezvous,
     _all_gather_kernel,
 )
@@ -412,14 +416,21 @@ def _moe_ep_forward_inner(
     # ------------------------------------------------------------------------
     # Stage D: down-proj + combine.
     # ------------------------------------------------------------------------
-    _down_projection_forward(
-        w2=w2, a=a, y=ep_ws.y_symm,
-        b2=b2, expert_frequency_offset=metadata["expert_frequency_offset"])
+    # Down-proj: was `_down_projection_forward(w2=..., a=..., y=ws.y_symm,
+    # b2=..., expert_frequency_offset=...)` — a one-line shim around QuACK's
+    # `gemm`. Recent sonic-moe main removed the shim, so we call gemm directly
+    # with the same arguments the shim used.
+    gemm(
+        a, w2.permute(2, 1, 0),
+        out=ep_ws.y_symm,
+        cu_seqlens_m=metadata["expert_frequency_offset"],
+        bias=b2,
+    )
 
     barrier(ep_ws.y_symm, grp)                             # B3
 
     y_local = torch.empty(T_local, d, dtype=x_local.dtype, device=dev)
-    fused_gather_combine(
+    gather_aggregation(
         ep_ws.y_symm, ep_ws.s_rev_symm, rank_2d, ep_ws.pos_2d_pattern,
         topk_scores_local.contiguous(), y_local,
         K=K, group=grp)
