@@ -21,6 +21,26 @@
 #   E_local     experts per rank (E // W)
 #
 # ----------------------------------------------------------------------------
+# Dispatch mode selection (mode="auto", default)
+# ----------------------------------------------------------------------------
+# Derived from `benchmarks/ep/bench-comm.py` on B300 (W=4) and H100 (W=8).
+# A2A pull moves ≈ (K/W) × the bytes AG moves; A2A achieves rho × BW_AG of
+# measured NVLink bandwidth where rho is hardware-dependent:
+#
+#   sm_100+ (B300): rho ~ 1.0       -> A2A iff K < W
+#   sm_90   (H100): rho ~ 0.7-0.85  -> A2A iff K/W < 0.8
+#   else            (conservative)  -> AG
+#
+# Validated against all 15 dispatch rows in the bench-comm output (B300 W=4
+# and H100 W=8): correct or tied in every config.
+#
+# ----------------------------------------------------------------------------
+# Combine mode
+# ----------------------------------------------------------------------------
+# `gather_aggregation` wins every benchmarked config (1.2-6× over rs+RS),
+# so there is no combine mode selector — it is hardcoded.
+#
+# ----------------------------------------------------------------------------
 # Barrier accounting (3 barriers per forward in BOTH modes)
 # ----------------------------------------------------------------------------
 # Symm-mem barrier(buf, grp) is a group-level sync. Minimal set kept:
@@ -32,10 +52,10 @@
 #     B4   pre-overwrite fence on y_symm AND x_symm before next iteration
 #          rewrites them.
 #
-# A2A dispatch is now done by the pull kernel, which reads peer.x_symm
-# directly. There is no a2a_send buffer and no separate post-A2A barrier:
-# B1 already fences x_symm, and B4 of the previous iteration fences peer
-# reads of x_symm before the next stage_input.
+# A2A dispatch is done by the pull kernel, which reads peer.x_symm directly.
+# There is no a2a_send buffer and no separate post-A2A barrier: B1 already
+# fences x_symm, and B4 of the previous iteration fences peer reads of
+# x_symm before the next stage_input.
 #
 # ----------------------------------------------------------------------------
 # CPU/GPU sync accounting
@@ -43,8 +63,7 @@
 # Forward issues zero host-blocking syncs. Up-proj/down-proj/combine run at
 # worst-case shape TK_global = W * T_local * K (a Python int from static
 # workspace shape). Invalid lanes carry a sentinel local-expert id and
-# produce garbage rows in y_symm that combine never reads. See
-# "Patterns to avoid" below.
+# produce garbage rows in y_symm that combine never reads.
 #
 # Patterns to avoid (each one re-introduces a host sync):
 #   * BAD:  x[bool_mask]  — implicit .nonzero(); host blocks for output shape.
@@ -71,17 +90,18 @@ from typing import Optional, Sequence, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.distributed import _symmetric_memory as _symm_mem
+import triton
 
 # Down projection used to be wrapped by sonicmoe.functional.forward._down_projection_forward,
 # which was a one-line `gemm(a, w2.permute(2, 1, 0), out=y, cu_seqlens_m=...)` shim.
 # Recent sonic-moe main dropped that shim, so we call QuACK's gemm directly.
 from quack.gemm_interface import gemm
+from torch.distributed import _symmetric_memory as _symm_mem
 
-from .enums import ActivationType
 from sonicmoe.functional import TC_Softmax_Topk_Router_Function, _UpProjection
 from sonicmoe.functional.triton_kernels import general_routing_router_metadata_triton
 
+from .enums import ActivationType
 from .functional.ep.triton_comm import (
     a2a_dispatch_pull,
     all_gather,
@@ -89,10 +109,7 @@ from .functional.ep.triton_comm import (
     compute_dispatch_metadata,
     gather_aggregation,
     rendezvous,
-    _all_gather_kernel,
 )
-
-import triton
 
 
 __all__ = [
@@ -103,27 +120,71 @@ __all__ = [
 
 
 # ============================================================================
+# Mode selection policy
+# ============================================================================
+
+_VALID_MODES = ("ag", "a2a")
+
+
+def _select_dispatch_mode(W: int, K: int) -> str:
+    """Heuristic pick between 'ag' and 'a2a' dispatch.
+
+    See module-level docstring for derivation. Single-rank trivially uses
+    AG (no off-rank traffic either way; the AG path skips the pull kernel).
+    """
+    if W <= 1:
+        return "ag"
+    cap_major = torch.cuda.get_device_capability()[0]
+    if cap_major >= 10:  # B300+
+        return "a2a" if K < W else "ag"
+    if cap_major == 9:  # H100
+        return "a2a" if 5 * K < 4 * W else "ag"
+    return "ag"  # conservative default
+
+
+def _resolve_mode(mode: str, W: int, K: int) -> str:
+    if mode == "auto":
+        return _select_dispatch_mode(W, K)
+    if mode not in _VALID_MODES:
+        raise ValueError(f"mode must be 'ag', 'a2a', or 'auto'; got {mode!r}")
+    return mode
+
+
+def _normalize_activation(activation_type) -> ActivationType:
+    if isinstance(activation_type, str):
+        return ActivationType[activation_type.upper()]
+    return activation_type
+
+
+# ============================================================================
 # Internal workspace
 # ============================================================================
+
 
 @dataclass
 class _EPWorkspace:
     """Symm-mem buffers and cached static patterns for one
     (T_local, d, K, E_local, dtype, mode) shape."""
+
     idx_symm: torch.Tensor
-    x_symm: torch.Tensor                     # always allocated (used by both modes)
+    x_symm: torch.Tensor  # always allocated (used by both modes)
     y_symm: torch.Tensor
     s_rev_symm: torch.Tensor
     ep_group: dist.ProcessGroup
     E_local: int
 
-    a2a_recv: Optional[torch.Tensor] = None  # A2A only
+    # Mode-specific reusable compute buffers. Cached here (not torch.empty'd
+    # per call) so the AG and A2A paths are symmetric in their allocation
+    # pattern and so the steady-state forward issues no torch.empty calls
+    # for the dispatch output.
+    a2a_recv: Optional[torch.Tensor] = None  # A2A only, (W, TK_local, d)
+    ag_compute: Optional[torch.Tensor] = None  # AG only,  (W * T_local, d)
 
     # Static patterns cached at allocation time.
-    pos_2d_pattern: Optional[torch.Tensor] = None        # (T_local, K) int32
-    invalid_lane_expert: Optional[torch.Tensor] = None   # (TK_global,) int32
-    t_global_pattern: Optional[torch.Tensor] = None      # (TK_global,) int32, AG only
-    src_rank_pattern: Optional[torch.Tensor] = None      # (TK_global,) int64, A2A only
+    pos_2d_pattern: Optional[torch.Tensor] = None  # (T_local, K) int32
+    invalid_lane_expert: Optional[torch.Tensor] = None  # (TK_global,) int32
+    t_global_pattern: Optional[torch.Tensor] = None  # (TK_global,) int32, AG only
+    src_rank_pattern: Optional[torch.Tensor] = None  # (TK_global,) int64, A2A only
 
     @property
     def W(self) -> int:
@@ -146,6 +207,7 @@ class _EPWorkspace:
 # SymmMemManager — owns allocation, rendezvous, and cache
 # ============================================================================
 
+
 class SymmMemManager:
     """Owns symm-mem buffer allocation and the workspace cache for one
     (ep_group, device) pair."""
@@ -157,8 +219,7 @@ class SymmMemManager:
         if gname is None:
             gname = "0" if ep_group is dist.group.WORLD else None
         if gname is None:
-            raise RuntimeError(
-                "Cannot resolve symm-mem group name for ep_group.")
+            raise RuntimeError("Cannot resolve symm-mem group name for ep_group.")
         self._group_name = gname
         self._cache: dict = {}
 
@@ -177,11 +238,17 @@ class SymmMemManager:
         self,
         T_locals: Sequence[int],
         *,
-        d: int, K: int, E_local: int,
-        dtype: torch.dtype, mode: str,
+        d: int,
+        K: int,
+        E_local: int,
+        dtype: torch.dtype,
+        mode: str,
     ) -> None:
+        """Pre-allocate workspaces for the given shapes. `mode` is resolved
+        if 'auto' is passed."""
+        resolved = _resolve_mode(mode, self.world_size, K)
         for T in T_locals:
-            self._get_or_alloc(T, d, K, E_local, dtype, mode)
+            self._get_or_alloc(T, d, K, E_local, dtype, resolved)
 
     def _alloc_symm(self, shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
         buf = _symm_mem.empty(*shape, dtype=dtype, device=self.device)
@@ -189,8 +256,13 @@ class SymmMemManager:
         return buf
 
     def _alloc_workspace(
-        self, T_local: int, d: int, K: int, E_local: int,
-        dtype: torch.dtype, mode: str,
+        self,
+        T_local: int,
+        d: int,
+        K: int,
+        E_local: int,
+        dtype: torch.dtype,
+        mode: str,
     ) -> _EPWorkspace:
         W = self.world_size
         my_rank = self.rank
@@ -203,34 +275,33 @@ class SymmMemManager:
         y_symm = self._alloc_symm((TK_global, d), dtype)
         s_rev_symm = self._alloc_symm((TK_global,), torch.int32)
 
-        pos_2d_pattern = (
-            torch.arange(TK_local, device=dev, dtype=torch.int32)
-            + my_rank * TK_local
-        ).view(T_local, K)
-        invalid_lane_expert = (
-            torch.arange(TK_global, device=dev, dtype=torch.int32) % E_local
-        )
+        pos_2d_pattern = (torch.arange(TK_local, device=dev, dtype=torch.int32) + my_rank * TK_local).view(T_local, K)
+        invalid_lane_expert = torch.arange(TK_global, device=dev, dtype=torch.int32) % E_local
 
         a2a_recv = None
+        ag_compute = None
         t_global_pattern = None
         src_rank_pattern = None
 
         if mode == "a2a":
-            # Local recv buffer for the pull kernel. (W, TK_local, d) layout:
-            # each source rank's slots are contiguous along axis 1.
+            # Pull kernel writes here. (W, TK_local, d) layout: each source
+            # rank's slots are contiguous along axis 1.
             a2a_recv = torch.empty((W, TK_local, d), dtype=dtype, device=dev)
-            src_rank_pattern = (
-                torch.arange(TK_global, device=dev) // TK_local
-            ).to(torch.int64)
+            src_rank_pattern = (torch.arange(TK_global, device=dev) // TK_local).to(torch.int64)
         else:  # ag
-            t_global_pattern = (
-                torch.arange(TK_global, device=dev, dtype=torch.int32) // K
-            )
+            # AG kernel writes here.
+            ag_compute = torch.empty((W * T_local, d), dtype=dtype, device=dev)
+            t_global_pattern = torch.arange(TK_global, device=dev, dtype=torch.int32) // K
 
         return _EPWorkspace(
-            idx_symm=idx_symm, x_symm=x_symm, y_symm=y_symm, s_rev_symm=s_rev_symm,
-            ep_group=self.ep_group, E_local=E_local,
+            idx_symm=idx_symm,
+            x_symm=x_symm,
+            y_symm=y_symm,
+            s_rev_symm=s_rev_symm,
+            ep_group=self.ep_group,
+            E_local=E_local,
             a2a_recv=a2a_recv,
+            ag_compute=ag_compute,
             pos_2d_pattern=pos_2d_pattern,
             invalid_lane_expert=invalid_lane_expert,
             t_global_pattern=t_global_pattern,
@@ -238,8 +309,13 @@ class SymmMemManager:
         )
 
     def _get_or_alloc(
-        self, T_local: int, d: int, K: int, E_local: int,
-        dtype: torch.dtype, mode: str,
+        self,
+        T_local: int,
+        d: int,
+        K: int,
+        E_local: int,
+        dtype: torch.dtype,
+        mode: str,
     ) -> _EPWorkspace:
         key = (T_local, d, K, E_local, str(dtype), mode)
         ws = self._cache.get(key)
@@ -250,8 +326,9 @@ class SymmMemManager:
 
 
 # ============================================================================
-# Consumer-side metadata + up-projection (worst-case sized)
+# Consumer-side metadata (worst-case sized)
 # ============================================================================
+
 
 def _build_consumer_metadata(
     expert_indices: torch.Tensor,
@@ -270,9 +347,17 @@ def _build_consumer_metadata(
     s_reverse_local = s_reverse_idx_symm[:TK]
 
     general_routing_router_metadata_triton(
-        token_indices, expert_indices, TK, E_local,
-        expert_frequency, expert_frequency_offset, x_gather_idx,
-        s_scatter_idx, s_reverse_local, num_offset)
+        token_indices,
+        expert_indices,
+        TK,
+        E_local,
+        expert_frequency,
+        expert_frequency_offset,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_local,
+        num_offset,
+    )
 
     return {
         "expert_frequency_offset": expert_frequency_offset,
@@ -283,35 +368,10 @@ def _build_consumer_metadata(
     }
 
 
-def _run_up_proj(
-    x_compute: torch.Tensor,
-    w1: torch.Tensor,
-    b1: Optional[torch.Tensor],
-    metadata: dict,
-    TK: int,
-    activation_type: ActivationType,
-    is_inference_mode_enabled: bool,
-    concat_layout: bool,
-):
-    a, h = _UpProjection.apply(
-        x_compute, w1, b1,
-        metadata["expert_frequency_offset"],
-        TK, None,
-        metadata["x_gather_idx"],
-        metadata["s_scatter_idx"],
-        metadata["s_reverse_local"],
-        metadata["num_offset"],
-        True,
-        activation_type,
-        is_inference_mode_enabled,
-        concat_layout,
-    )
-    return a, h
-
-
 # ============================================================================
 # Core forward
 # ============================================================================
+
 
 def _moe_ep_forward_inner(
     x_local: torch.Tensor,
@@ -334,45 +394,16 @@ def _moe_ep_forward_inner(
     dev = x_local.device
     grp = ep_ws.ep_group
 
-    # Dispatch metadata (sync-free).
-    meta = compute_dispatch_metadata(
-        topk_idx_global.to(torch.int32) if topk_idx_global.dtype != torch.int32 else topk_idx_global,
-        my_rank=my_rank,
-        E_local=E_local,
-    )
+    meta = compute_dispatch_metadata(topk_idx_global, my_rank=my_rank, E_local=E_local)
     dst_rank_flat = meta["dst_rank_flat"]
-    slot_flat_per_rank = meta["slot_flat_per_rank"]
     rank_2d = meta["my_dst_rank"]
+    expert_local_padded = meta["expert_local_padded"]
 
-    # Padded selected_E (sentinel = arange(TK_global) % E_local for invalid lanes).
-    real_local = topk_idx_global.reshape(-1).to(torch.int32) - my_rank * E_local
-    expert_local_padded = torch.where(
-        dst_rank_flat == my_rank, real_local, ep_ws.invalid_lane_expert)
-
-    # ------------------------------------------------------------------------
-    # Stage B: dispatch.
-    # ------------------------------------------------------------------------
     if mode == "ag":
-        # Full all-gather: each rank reads everyone's x.
-        # x_local has shape (T_local, d) by construction; build buffer shapes
-        # and per-rank numel from the named dimensions rather than going
-        # through x_local.shape / x_local.numel().
-        hdl_x = rendezvous(x_local, grp)
-        buf_tuple = tuple(
-            hdl_x.get_buffer(r, (T_local, d), x_local.dtype)
-            for r in range(W))
-        numel_per_rank = T_local * d
-        x_compute = torch.empty((W * T_local, d), dtype=x_local.dtype, device=dev)
-        # BLOCK_SIZE is autotuned; grid must be a callable that uses META.
-        grid = lambda META: (W, triton.cdiv(numel_per_rank, META["BLOCK_SIZE"]))
-        _all_gather_kernel[grid](
-            buf_tuple, x_compute,
-            numel_per_rank=numel_per_rank, world_size=W)
+        x_compute = all_gather(x_local, grp, out=ep_ws.ag_compute)
         token_indices_padded = ep_ws.t_global_pattern
     else:
-        # Pull-based A2A dispatch. One kernel reads peer.x_symm and writes
-        # directly into ws.a2a_recv. No a2a_send buffer, no zero_(), no
-        # explicit barriers (B1 already fenced x_symm before this point).
+        slot_flat_per_rank = meta["slot_flat_per_rank"]
         a2a_dispatch_pull(
             x_symm=x_local,
             dst_rank_flat=dst_rank_flat,
@@ -382,16 +413,8 @@ def _moe_ep_forward_inner(
             group=grp,
         )
         x_compute = ep_ws.a2a_recv.view(W * TK_local, d)
-        # token_indices for the metadata kernel: (src_rank, slot_per_source)
-        # flat index into x_compute. src_rank component is cached; slot
-        # component comes from compute_dispatch_metadata.
-        token_indices_padded = (
-            ep_ws.src_rank_pattern * TK_local + slot_flat_per_rank.long()
-        ).to(torch.int32)
+        token_indices_padded = meta["a2a_token_indices"]
 
-    # ------------------------------------------------------------------------
-    # Stage C: consumer metadata + up-proj at TK_global size.
-    # ------------------------------------------------------------------------
     metadata = _build_consumer_metadata(
         expert_indices=expert_local_padded,
         token_indices=token_indices_padded,
@@ -399,10 +422,13 @@ def _moe_ep_forward_inner(
         E_local=E_local,
         s_reverse_idx_symm=ep_ws.s_rev_symm,
     )
-    a, h = _UpProjection.apply(
-        x_compute, w1, b1,
+    a, _h = _UpProjection.apply(
+        x_compute,
+        w1,
+        b1,
         metadata["expert_frequency_offset"],
-        TK_global, None,
+        TK_global,
+        None,
         metadata["x_gather_idx"],
         metadata["s_scatter_idx"],
         metadata["s_reverse_local"],
@@ -413,29 +439,22 @@ def _moe_ep_forward_inner(
         concat_layout,
     )
 
-    # ------------------------------------------------------------------------
-    # Stage D: down-proj + combine.
-    # ------------------------------------------------------------------------
-    # Down-proj: was `_down_projection_forward(w2=..., a=..., y=ws.y_symm,
-    # b2=..., expert_frequency_offset=...)` — a one-line shim around QuACK's
-    # `gemm`. Recent sonic-moe main removed the shim, so we call gemm directly
-    # with the same arguments the shim used.
     gemm(
-        a, w2.permute(2, 1, 0),
+        a,
+        w2.permute(2, 1, 0),
         out=ep_ws.y_symm,
         cu_seqlens_m=metadata["expert_frequency_offset"],
         bias=b2,
     )
 
-    barrier(ep_ws.y_symm, grp)                             # B3
+    barrier(ep_ws.y_symm, grp)
 
     y_local = torch.empty(T_local, d, dtype=x_local.dtype, device=dev)
     gather_aggregation(
-        ep_ws.y_symm, ep_ws.s_rev_symm, rank_2d, ep_ws.pos_2d_pattern,
-        topk_scores_local.contiguous(), y_local,
-        K=K, group=grp)
+        ep_ws.y_symm, ep_ws.s_rev_symm, rank_2d, ep_ws.pos_2d_pattern, topk_scores_local, y_local, K=K, group=grp
+    )
 
-    barrier(ep_ws.y_symm, grp)                             # B4
+    barrier(ep_ws.y_symm, grp)
     return y_local
 
 
@@ -443,25 +462,25 @@ def _moe_ep_forward_inner(
 # Helpers shared by the public entry points
 # ============================================================================
 
-def _validate_common(mgr: "SymmMemManager", mode: str, E: int) -> Tuple[int, int]:
-    """Return (W, E_local). Validates the two constraints whose violation
-    cannot be silently absorbed by downstream kernels: the dispatch mode
-    selector and the E divisibility required by the sharding math."""
-    if mode not in ("ag", "a2a"):
-        raise ValueError(f"mode must be 'ag' or 'a2a'; got {mode!r}")
+
+def _validate_and_resolve(
+    mgr: "SymmMemManager",
+    mode: str,
+    E: int,
+    K: int,
+) -> Tuple[int, int, str]:
+    """Resolve auto mode, validate divisibility, return (W, E_local, mode)."""
     W = mgr.world_size
+    resolved = _resolve_mode(mode, W, K)
     if E % W != 0:
-        raise ValueError(
-            f"E ({E}) must be divisible by EP world size ({W}).")
-    return W, E // W
+        raise ValueError(f"E ({E}) must be divisible by EP world size ({W}).")
+    return W, E // W, resolved
 
 
-def _ag_routing_indices(idx_symm: torch.Tensor,
-                        topk_idx_l: torch.Tensor,
-                        grp: dist.ProcessGroup) -> torch.Tensor:
+def _ag_routing_indices(idx_symm: torch.Tensor, topk_idx_l: torch.Tensor, grp: dist.ProcessGroup) -> torch.Tensor:
     idx_symm.copy_(topk_idx_l.contiguous())
-    barrier(idx_symm, grp)                              # B1: fences both
-                                                        # idx_symm and x_symm
+    barrier(idx_symm, grp)  # B1: fences both
+    # idx_symm and x_symm
     g = all_gather(idx_symm, grp)
     return g.view(dist.get_world_size(grp), idx_symm.shape[0], idx_symm.shape[1])
 
@@ -476,6 +495,7 @@ def _stage_input(ws: _EPWorkspace, x: torch.Tensor) -> torch.Tensor:
 # ============================================================================
 # Public entry point #1 — TC softmax top-K routing (router computed inside)
 # ============================================================================
+
 
 def moe_ep_TC_softmax_topk_forward(
     x: torch.Tensor,
@@ -493,12 +513,14 @@ def moe_ep_TC_softmax_topk_forward(
     is_softmax_over_topk: bool = True,
     norm_topk_probs: bool = False,
     concat_layout: bool = False,
-    mode: str = "ag",
+    mode: str = "auto",
 ) -> torch.Tensor:
-    """EP MoE forward with TC softmax top-K routing computed internally."""
-    W, E_local = _validate_common(mgr, mode, E)
-    if isinstance(activation_type, str):
-        activation_type = ActivationType[activation_type.upper()]
+    """EP MoE forward with TC softmax top-K routing computed internally.
+
+    `mode='auto'` (default) selects 'ag' or 'a2a' from W, K, and the device's
+    compute capability — see module docstring."""
+    W, E_local, mode = _validate_and_resolve(mgr, mode, E, K)
+    activation_type = _normalize_activation(activation_type)
     T_local, d = x.shape
 
     ws = mgr._get_or_alloc(T_local, d, K, E_local, x.dtype, mode)
@@ -506,15 +528,18 @@ def moe_ep_TC_softmax_topk_forward(
 
     router_logits = F.linear(x_in, router_w)
     topk_scores_l, topk_idx_l = TC_Softmax_Topk_Router_Function.apply(
-        router_logits, W * E_local, K,
-        is_softmax_over_topk, norm_topk_probs)
+        router_logits, W * E_local, K, is_softmax_over_topk, norm_topk_probs
+    )
     topk_idx_g = _ag_routing_indices(ws.idx_symm, topk_idx_l, ws.ep_group)
 
     return _moe_ep_forward_inner(
         x_local=x_in,
         topk_idx_global=topk_idx_g,
         topk_scores_local=topk_scores_l,
-        w1=w1, b1=b1, w2=w2, b2=b2,
+        w1=w1,
+        b1=b1,
+        w2=w2,
+        b2=b2,
         ep_ws=ws,
         activation_type=activation_type,
         is_inference_mode_enabled=is_inference_mode_enabled,
@@ -526,6 +551,7 @@ def moe_ep_TC_softmax_topk_forward(
 # ============================================================================
 # Public entry point #2 — caller-supplied routing decision
 # ============================================================================
+
 
 def moe_ep_general_routing_forward(
     x: torch.Tensor,
@@ -541,18 +567,20 @@ def moe_ep_general_routing_forward(
     activation_type: ActivationType = ActivationType.SWIGLU,
     is_inference_mode_enabled: bool = False,
     concat_layout: bool = False,
-    mode: str = "ag",
+    mode: str = "auto",
 ) -> torch.Tensor:
     """EP MoE forward with caller-supplied routing decision (uniform K).
 
     Caller contract: x is (T_local, d); topk_indices and topk_scores are
     both (T_local, K). The forward does not check shapes — feed it aligned
-    inputs."""
-    W, E_local = _validate_common(mgr, mode, E)
-    if isinstance(activation_type, str):
-        activation_type = ActivationType[activation_type.upper()]
-    T_local, d = x.shape
+    inputs.
+
+    `mode='auto'` (default) selects 'ag' or 'a2a' from W, K, and the device's
+    compute capability — see module docstring."""
     K = topk_indices.shape[1]
+    W, E_local, mode = _validate_and_resolve(mgr, mode, E, K)
+    activation_type = _normalize_activation(activation_type)
+    T_local, d = x.shape
 
     ep_ws = mgr._get_or_alloc(T_local, d, K, E_local, x.dtype, mode)
     x_in = _stage_input(ep_ws, x)
@@ -564,7 +592,10 @@ def moe_ep_general_routing_forward(
         x_local=x_in,
         topk_idx_global=topk_idx_g,
         topk_scores_local=topk_scores,
-        w1=w1, b1=b1, w2=w2, b2=b2,
+        w1=w1,
+        b1=b1,
+        w2=w2,
+        b2=b2,
         ep_ws=ep_ws,
         activation_type=activation_type,
         is_inference_mode_enabled=is_inference_mode_enabled,
