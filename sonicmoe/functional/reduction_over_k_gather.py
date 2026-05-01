@@ -58,6 +58,7 @@ def token_gather_sum_kernel(
     T,
     H: tl.constexpr,
     MAX_K: tl.constexpr,
+    Mtotal: tl.constexpr,  # int32, total rows in x. Doubles as the EP-sentinel marker: M_perm[slot] == Mtotal → skip.
     # strides
     stride_xM: tl.constexpr,
     stride_xH: tl.constexpr,
@@ -105,16 +106,23 @@ def token_gather_sum_kernel(
             # Gather permuted indices
             perm_idx = tl.load(M_perm_ptr + m_abs, mask=m_k, other=0).to(tl.uint32)  # [BLOCK_K]
 
+            # EP-sentinel skip: routing metadata writes `perm_idx == Mtotal` for sentinel slots.
+            # Drop them — otherwise the bwd path (w_is_None) would read x[0] and silently
+            # corrupt d_hidden_states. `safe_perm_idx` keeps masked-off lanes in-bounds
+            # (Hopper validates addresses even for masked loads).
+            m_valid = m_k & (perm_idx < Mtotal)
+            safe_perm_idx = tl.where(m_valid, perm_idx, 0)
+
             # Load x values: [BLOCK_K, BLOCK_H]
-            x_ptrs = x_ptr + perm_idx[:, None] * stride_xM + h_idx[None, :] * stride_xH
-            x_mask = m_k[:, None] & m_h[None, :]
+            x_ptrs = x_ptr + safe_perm_idx[:, None] * stride_xM + h_idx[None, :] * stride_xH
+            x_mask = m_valid[:, None] & m_h[None, :]
             x_vals = tl.load(x_ptrs, mask=x_mask, other=0.0).to(tl.float32)
 
             # Reduce along K dimension and add to accumulator
             if w_is_None:
                 acc += tl.sum(x_vals, axis=0)  # [BLOCK_H]
             else:
-                w_vals = tl.load(w_ptr + m_abs, mask=m_k, other=0.0).to(tl.float32)  # [BLOCK_K]
+                w_vals = tl.load(w_ptr + m_abs, mask=m_valid, other=0.0).to(tl.float32)  # [BLOCK_K]
                 acc += tl.sum(x_vals * w_vals[:, None], axis=0)  # [BLOCK_H]
 
         # Store final result for this H tile (only once!)
@@ -152,6 +160,7 @@ def token_gather_and_sum_varlen_K_triton(
         T=T,
         H=H,
         MAX_K=MAX_K,
+        Mtotal=x.size(0),
         stride_xM=x.stride(0),
         stride_xH=x.stride(1),
         stride_outT=out.stride(0),

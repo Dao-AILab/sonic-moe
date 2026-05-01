@@ -236,10 +236,11 @@ def _general_metadata_compute_stage2(
     entry_idx = pid_m * BLOCK_SIZE + presort_offs
     token_idx = tl.load(sorted_selected_T_ptr + entry_idx, mask=mask)
 
-    # Sentinel lanes (expert == E) and the output-indexed tail [sum_valid, TK) of s_scatter_idx /
-    # x_gather_idx are left untouched here — the caller zero-inits these arrays so downstream reads
-    # (`topk_scores[s_scatter_idx]`, `gemm_dgated(A_idx=...)`, reverse scatter) are well-defined.
-    tl.store(s_reverse_scatter_idx_ptr + entry_idx, s_reverse_scatter_val, mask=mask)
+    # Sentinel lanes get `TK` written into s_reverse_scatter_idx as an out-of-range marker, so the
+    # bwd reduction (`token_gather_sum_kernel`) skips them via the `< M` bound check. The output-
+    # indexed tail [sum_valid, TK) of s_scatter_idx / x_gather_idx is left untouched — caller
+    # zero-inits those so downstream reads (topk_scores[s_scatter_idx], reverse scatter) are 0.
+    tl.store(s_reverse_scatter_idx_ptr + entry_idx, tl.where(mask, s_reverse_scatter_val, TK), mask=entry_idx < TK)
     tl.store(s_scatter_idx_ptr + s_reverse_scatter_val, entry_idx, mask=mask)
     tl.store(x_gather_idx_ptr + s_reverse_scatter_val, token_idx, mask=mask)
 
