@@ -199,7 +199,7 @@ def _reduce_scatter_kernel(
         tl.store(output_ptr + offs, acc, mask=mask)
 
 
-def reduce_scatter(x_symm, group, out=None):
+def reduce_scatter_triton(x_symm, group, out=None):
     """Sum-reduce-scatter via Triton + symm-mem (no NCCL).
 
     Equivalent to:
@@ -250,23 +250,37 @@ _A2A_PULL_CONFIGS = [
 # ============================================================================
 # Fused A2A dispatch (pull with permute) — replaces the
 # zero_() + scatter + barrier + all_to_all + barrier sequence with one kernel.
+# ----------------------------------------------------------------------------
+# Generic recv layout: the kernel takes a `recv_pos` tensor of length
+# TK_global. For each global slot f where dst_rank_flat[f] == my_rank, the
+# kernel writes the source row (peer x_symm[t_local]) into recv at row
+# `recv_pos[f]`. The caller chooses what layout `recv_pos` encodes:
+#
+#   * Legacy per-rank-slot layout (recv shape (W, TK_local, d)):
+#       recv_pos[f] = src_rank * TK_local + slot_per_rank[f]
+#     i.e. meta["a2a_token_indices"] from compute_dispatch_metadata.
+#
+#   * Expert-sorted (nogather) layout (recv shape (TK_global, d)):
+#       recv_pos[f] = s_reverse_local[f]
+#     where s_reverse_local comes from general_routing_router_metadata_triton
+#     and gives each slot's row in the expert-sorted x_compute tensor.
+#
+# Slots where dst != my_rank are no-ops; their recv positions retain whatever
+# was there before the call. Downstream GEMM tolerates garbage at sentinel
+# rows because combine reads outputs only at rows where dst == my_rank.
 # ============================================================================
 @triton.autotune(
     configs=_A2A_PULL_CONFIGS,
     key=["d", "world_size"],
     prune_configs_by={"early_config_prune": _prune_block_d_vs_d},
 )
-@triton.heuristics(
-    {
-        "EVEN_D": lambda args: args["d"] % args["BLOCK_D"] == 0,
-    }
-)
+@triton.heuristics({"EVEN_D": lambda args: args["d"] % args["BLOCK_D"] == 0})
 @triton.jit
 def _a2a_dispatch_pull_kernel(
     x_peer_tuple,  # tuple[(T_local, d) tensor, ...] for each peer
     dst_rank_flat_ptr,  # (TK_global,) int32
-    slot_flat_per_rank_ptr,  # (TK_global,) int32
-    recv_ptr,  # (W * TK_local, d) flat output
+    recv_pos_ptr,  # (TK_global,) int32 — destination row in recv per global slot
+    recv_ptr,  # flat (>= TK_global, d) output
     TK_local,  # = T_local * K
     my_rank: tl.constexpr,
     world_size: tl.constexpr,
@@ -290,12 +304,13 @@ def _a2a_dispatch_pull_kernel(
     if dst != my_rank:
         return  # invalid lane: no-op for this program
 
-    slot = tl.load(slot_flat_per_rank_ptr + orig_idx).to(tl.int64)
+    # Generic recv layout: caller-supplied per-slot destination row.
+    pos = tl.load(recv_pos_ptr + orig_idx).to(tl.int64)
     t_local = pid_tk // K
 
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     src_offs = t_local * d + offs_d
-    dst_offs = (src_rank.to(tl.int64) * TK_local + slot) * d + offs_d
+    dst_offs = pos * d + offs_d
 
     # Static dispatch over peers; only the matching i actually loads/stores.
     for i in tl.static_range(world_size):
@@ -398,42 +413,31 @@ def _gather_aggregation_kernel(
 #     Each program owns one (src_rank, tile) and processes BLOCK_TK slots
 #     in parallel. Writes:
 #       - dst_rank_flat[orig_idx]            = expert_global // E_local
-#       - within_tile_slot[orig_idx]         = exclusive count within this
-#                                              tile of slots heading to dst
 #       - tile_count[src_rank, t_idx, p]     = #slots in this tile heading
 #                                              to peer p
 #       - my_dst_rank, my_expert_local       (only if src_rank == my_rank)
-#     For W=8 T_local=32k K=8 with BLOCK_TK=512, n_tiles=512 — total
-#     programs 4096, ~30 H100 waves.
+#       - expert_local_padded                (sentinel for invalid lanes)
+#     Note: within_tile_slot is NOT materialized — phase 3 recomputes it
+#     from dst_rank_flat in registers, saving an 8 MB HBM round-trip at
+#     T=32k K=8 W=8.
 #
-#   Phase 2 (`_metadata_phase2_scan_kernel`, grid (W,)):
-#     Each program owns one source rank, loads the (n_tiles, W) slice of
-#     tile_count into registers, and computes:
-#       - tile_prefix[r, t, p]      = exclusive cumsum of tile_count
-#                                     along the n_tiles axis
-#       - peer_count_per_rank[r, p] = sum of tile_count along the n_tiles
-#                                     axis
-#     One Triton kernel — replaces three torch ops (sum, cumsum, subtract)
-#     that historically had CUDA-graph capture issues. tile_count fits in
-#     registers comfortably for the typical n_tiles ≤ 512: at W=8 that's
-#     a (512, 8) = 4096-int = 16KB tile, well within the register file.
+#   Phase 2 (`_metadata_phase2_scan_kernel`, grid (W, W)):
+#     Each program owns one (src_rank, peer) pair and does a 1-D cumsum
+#     of tile_count[src_rank, :, peer] of length n_tiles. Writes:
+#       - tile_prefix[r, t, p]      = exclusive cumsum along n_tiles axis
+#       - peer_count_per_rank[r, p] = sum along n_tiles axis (scalar per prog)
+#     Grid is (W, W) instead of (W,) for ~8× better SM utilization.
+#     Strided loads of stride W are L2-friendly for W ≤ 16.
 #
 #   Phase 3 (`_metadata_phase3_emit_kernel`, grid (W, n_tiles)):
-#     Same grid as Phase 1. Each program reloads dst_rank_flat and
-#     within_tile_slot for its tile, computes early_count[pid_r, :] inline
-#     from peer_count_per_rank (cumsum + masked-row-sum, same idiom as the
-#     prior _slot_global_kernel), and writes:
+#     Same grid as Phase 1. Each program reloads dst_rank_flat for its
+#     tile, RECOMPUTES within_tile_slot via the same one-hot cumsum that
+#     phase 1 used (register-only), and emits:
 #       - slot_per_rank = within_tile_slot + tile_prefix[r, t, dst]
 #       - slot_global   = slot_per_rank   + early_count[r, dst]
-#
-# Computing early_count inline in Phase 3 (rather than materializing it
-# in Phase 2) saves a (W, W) write+read round-trip and folds naturally
-# into the existing per-program one-hot-mul-sum gather.
-#
-# Correctness vs the prior two-kernel version: the within-tile +
-# cross-tile split of slot_per_rank, and the cross-rank prefix for
-# slot_global, are both reorganizations of the same exclusive cumsums.
-# Tested bit-exact in test_metadata_phase2.py.
+#       - a2a_token_indices = pid_r * TK_local + slot_per_rank
+#     `early_count[pid_r, :]` is computed inline from peer_count_per_rank
+#     (cumsum + masked-row-sum), avoiding a (W, W) materialization.
 # ============================================================================
 
 
@@ -441,7 +445,6 @@ def _gather_aggregation_kernel(
 def _metadata_phase1_reduce_kernel(
     topk_idx_g_ptr,  # (W, T_local, K) int32, contiguous
     out_dst_rank_flat_ptr,  # (TK_global,) int32
-    out_within_tile_slot_ptr,  # (TK_global,) int32
     out_tile_count_ptr,  # (W, n_tiles, W) int32
     out_my_dst_rank_ptr,  # (T_local, K) int32
     out_my_expert_local_ptr,  # (T_local, K) int32
@@ -468,21 +471,18 @@ def _metadata_phase1_reduce_kernel(
     one_hot = (dst[:, None] == peer_axis[None, :]).to(tl.int32)
     one_hot = tl.where(valid[:, None], one_hot, 0)
 
-    cumsum = tl.cumsum(one_hot, axis=0)
-    within_pos = tl.sum(cumsum * one_hot, axis=1) - 1
-
+    # Tile-level peer histogram (still needed by phase 2).
     tile_count_p = tl.sum(one_hot, axis=0)
 
     # expert_local_padded: real local expert when dst == my_rank,
-    # sentinel (flat_offs % E_local) otherwise. Absorbs 3 torch ops
-    # from ep.py (_moe_ep_forward_inner).
+    # sentinel (flat_offs % E_local) otherwise.
     local_expert = expert_global - dst * E_local
     sentinel = flat_offs % E_local
     padded = tl.where(dst == my_rank, local_expert, sentinel)
 
-    # Writes.
+    # Writes — within_tile_slot is intentionally NOT written; phase 3
+    # recomputes it from dst.
     tl.store(out_dst_rank_flat_ptr + flat_offs, dst, mask=valid)
-    tl.store(out_within_tile_slot_ptr + flat_offs, within_pos, mask=valid)
     tl.store(
         out_tile_count_ptr + pid_r * n_tiles * W + pid_tile * W + peer_axis,
         tile_count_p,
@@ -502,49 +502,46 @@ def _metadata_phase2_scan_kernel(
     W: tl.constexpr,
     BLOCK_NTILES: tl.constexpr,  # next_pow2(n_tiles), >= 2
 ):
-    """Per-source-rank cumsum + sum along the n_tiles axis.
+    """1-D cumsum over n_tiles for one (src_rank, peer) pair.
 
-    Grid (W,). Each program loads tile_count[pid_r, :, :] of shape
-    (BLOCK_NTILES, W) into registers (masked beyond actual n_tiles), runs
-    tl.cumsum on axis 0, and writes back tile_prefix and peer_count_per_rank
-    for that source rank.
+    Grid (W, W). Each program loads tile_count[pid_r, :, pid_p] of length
+    n_tiles into registers (masked beyond n_tiles), runs tl.cumsum, and
+    writes back tile_prefix[pid_r, :, pid_p] (exclusive) and a single
+    scalar peer_count_per_rank[pid_r, pid_p].
 
-    Replaces the three torch ops (sum, cumsum, subtract) the prior version
-    used. Single Triton launch is unconditionally CUDA-graph capturable,
-    whereas torch.cumsum has historically had issues with graph capture
-    across PyTorch versions (workspace allocations, multi-launch CUB
-    fallbacks, etc.).
+    Strided loads of stride W (typically 4–16) — L2-friendly. Compared
+    to the prior grid-(W,) version, this gives W× better SM utilization
+    at the cost of a strided memory pattern, which the H100 L2 absorbs.
     """
     pid_r = tl.program_id(0)
+    pid_p = tl.program_id(1)
 
     t_offs = tl.arange(0, BLOCK_NTILES)
-    p_offs = tl.arange(0, W)
     t_mask = t_offs < n_tiles
 
-    # Load tile_count[pid_r, :, :] of shape (BLOCK_NTILES, W).
-    addr = tile_count_ptr + pid_r * n_tiles * W + t_offs[:, None] * W + p_offs[None, :]
-    tc = tl.load(addr, mask=t_mask[:, None], other=0)  # (BLOCK_NTILES, W) int32
+    # Strided 1-D load: tile_count[pid_r, :, pid_p].
+    addr = tile_count_ptr + pid_r * n_tiles * W + t_offs * W + pid_p
+    tc = tl.load(addr, mask=t_mask, other=0)  # (BLOCK_NTILES,) int32
 
-    # Inclusive cumsum along the n_tiles axis, then subtract for exclusive.
+    # Inclusive cumsum, then subtract for exclusive.
     incl = tl.cumsum(tc, axis=0)
-    excl = incl - tc  # (BLOCK_NTILES, W)
+    excl = incl - tc  # (BLOCK_NTILES,)
 
-    # Per-rank totals = sum over n_tiles.
-    peer_count = tl.sum(tc, axis=0)  # (W,) int32
+    # Per-(rank, peer) total = sum over n_tiles.
+    peer_count = tl.sum(tc, axis=0)  # scalar
 
     # Stores.
     tl.store(
-        out_tile_prefix_ptr + pid_r * n_tiles * W + t_offs[:, None] * W + p_offs[None, :],
+        out_tile_prefix_ptr + pid_r * n_tiles * W + t_offs * W + pid_p,
         excl,
-        mask=t_mask[:, None],
+        mask=t_mask,
     )
-    tl.store(out_peer_count_per_rank_ptr + pid_r * W + p_offs, peer_count)
+    tl.store(out_peer_count_per_rank_ptr + pid_r * W + pid_p, peer_count)
 
 
 @triton.jit
 def _metadata_phase3_emit_kernel(
     dst_rank_flat_ptr,  # (TK_global,) int32
-    within_tile_slot_ptr,  # (TK_global,) int32
     tile_prefix_ptr,  # (W, n_tiles, W) int32, contiguous
     peer_count_per_rank_ptr,  # (W, W) int32, contiguous
     out_slot_per_rank_ptr,  # (TK_global,) int32
@@ -558,6 +555,8 @@ def _metadata_phase3_emit_kernel(
     pid_r = tl.program_id(0)
     pid_tile = tl.program_id(1)
 
+    # early_count[pid_r, :] = exclusive cumsum of peer_count_per_rank
+    # along source-rank axis, gathered for this rank's row.
     rs = tl.arange(0, W)[:, None]
     ps = tl.arange(0, W)[None, :]
     pc = tl.load(peer_count_per_rank_ptr + rs * W + ps)
@@ -569,13 +568,20 @@ def _metadata_phase3_emit_kernel(
     valid = tile_offs < TK_local
     flat_offs = pid_r * TK_local + tile_offs
 
+    # Reload dst for this tile.
     dst = tl.load(dst_rank_flat_ptr + flat_offs, mask=valid, other=0)
-    within_pos = tl.load(within_tile_slot_ptr + flat_offs, mask=valid, other=0)
 
+    # Recompute within_tile_slot from dst (same idiom as phase 1).
+    # No HBM intermediate — pure register work.
     p_offs = tl.arange(0, W)
+    one_hot = (dst[:, None] == p_offs[None, :]).to(tl.int32)
+    one_hot = tl.where(valid[:, None], one_hot, 0)
+    cumsum = tl.cumsum(one_hot, axis=0)
+    within_pos = tl.sum(cumsum * one_hot, axis=1) - 1
+
+    # Tile prefix for this (pid_r, pid_tile), gathered at dst.
     tp_row = tl.load(tile_prefix_ptr + pid_r * n_tiles * W + pid_tile * W + p_offs)
 
-    one_hot = (dst[:, None] == p_offs[None, :]).to(tl.int32)
     tp_at_dst = tl.sum(one_hot * tp_row[None, :], axis=1)
     ec_at_dst = tl.sum(one_hot * ec_row[None, :], axis=1)
 
@@ -583,7 +589,6 @@ def _metadata_phase3_emit_kernel(
     slot_gl = slot_pr + ec_at_dst
 
     # a2a_token_indices: src_rank * TK_local + slot_per_rank.
-    # Absorbs 3 torch ops from ep.py (A2A mode token_indices_padded).
     a2a_ti = pid_r * TK_local + slot_pr
 
     tl.store(out_slot_per_rank_ptr + flat_offs, slot_pr, mask=valid)
@@ -598,15 +603,19 @@ def compute_dispatch_metadata(
 ):
     """Three-phase parallel dispatch metadata, all-Triton (CUDA-graph safe).
 
-    Phase 1 emits dst_rank_flat, within_tile_slot, tile_count,
-    my_dst_rank, my_expert_local, and expert_local_padded. Phase 2
-    computes tile_prefix and peer_count_per_rank. Phase 3 emits
+    Phase 1 emits dst_rank_flat, tile_count, my_dst_rank, my_expert_local,
+    and expert_local_padded. Phase 2 computes tile_prefix and
+    peer_count_per_rank with a (W, W) grid. Phase 3 recomputes
+    within_tile_slot from dst_rank_flat in registers and emits
     slot_per_rank, slot_global, and a2a_token_indices.
 
-    expert_local_padded and a2a_token_indices absorb torch ops that were
-    previously computed in ep.py's _moe_ep_forward_inner, eliminating
-    3 + 3 torch kernel launches and two cached workspace patterns
-    (invalid_lane_expert, src_rank_pattern)."""
+    Optimization log:
+      - within_tile_slot is no longer materialized (recomputed in phase 3
+        — saves an 8 MB HBM round-trip at T=32k K=8 W=8).
+      - Phase 2 grid is (W, W) instead of (W,) for ~W× better SM
+        utilization.
+      - expert_local_padded and a2a_token_indices absorb torch ops that
+        were previously in ep.py's _moe_ep_forward_inner."""
     W, T_local, K = topk_idx_global.shape
     TK_local = T_local * K
     TK_global = W * TK_local
@@ -615,8 +624,8 @@ def compute_dispatch_metadata(
     BLOCK_TK = max(triton.next_power_of_2(TK_local), 64) if TK_local <= 256 else 512
     n_tiles = (TK_local + BLOCK_TK - 1) // BLOCK_TK
 
+    # Phase 1 outputs (within_tile_slot intentionally absent).
     dst_rank_flat = torch.empty(TK_global, dtype=torch.int32, device=device)
-    within_tile_slot = torch.empty(TK_global, dtype=torch.int32, device=device)
     tile_count = torch.empty((W, n_tiles, W), dtype=torch.int32, device=device)
     my_dst_rank = torch.empty((T_local, K), dtype=torch.int32, device=device)
     my_expert_local = torch.empty((T_local, K), dtype=torch.int32, device=device)
@@ -625,7 +634,6 @@ def compute_dispatch_metadata(
     _metadata_phase1_reduce_kernel[(W, n_tiles)](
         topk_idx_global,
         dst_rank_flat,
-        within_tile_slot,
         tile_count,
         my_dst_rank,
         my_expert_local,
@@ -638,10 +646,11 @@ def compute_dispatch_metadata(
         BLOCK_TK=BLOCK_TK,
     )
 
+    # Phase 2 outputs.
     tile_prefix = torch.empty_like(tile_count)
     peer_count_per_rank = torch.empty((W, W), dtype=torch.int32, device=device)
     BLOCK_NTILES = max(triton.next_power_of_2(n_tiles), 2)
-    _metadata_phase2_scan_kernel[(W,)](
+    _metadata_phase2_scan_kernel[(W, W)](
         tile_count,
         tile_prefix,
         peer_count_per_rank,
@@ -650,12 +659,12 @@ def compute_dispatch_metadata(
         BLOCK_NTILES=BLOCK_NTILES,
     )
 
+    # Phase 3 outputs.
     slot_per_rank = torch.empty(TK_global, dtype=torch.int32, device=device)
     slot_global = torch.empty(TK_global, dtype=torch.int32, device=device)
     a2a_token_indices = torch.empty(TK_global, dtype=torch.int32, device=device)
     _metadata_phase3_emit_kernel[(W, n_tiles)](
         dst_rank_flat,
-        within_tile_slot,
         tile_prefix,
         peer_count_per_rank,
         slot_per_rank,
@@ -709,7 +718,7 @@ def safe_block_size(chunk_numel: int, requested: int = 4096) -> int:
 # ============================================================================
 
 
-def all_gather(x_symm, group, out=None):
+def all_gather_triton(x_symm, group, out=None):
     hdl = rendezvous(x_symm, group)
     W = hdl.world_size
     numel = x_symm.numel()
@@ -726,24 +735,119 @@ def all_gather(x_symm, group, out=None):
     return out
 
 
-def a2a_dispatch_pull(
+class CEHandle:
+    __slots__ = ("out", "_streams")
+
+    def __init__(self, out, streams):
+        self.out = out
+        self._streams = streams
+
+    def wait(self):
+        main = torch.cuda.current_stream()
+        for s in self._streams:
+            main.wait_stream(s)
+        return self.out
+
+    def __call__(self):
+        return self.wait()
+
+
+_CE_STREAM_POOL: dict[tuple, list[torch.cuda.Stream]] = {}
+
+
+def _get_ce_streams(device, n):
+    """Return n cached high-priority CUDA streams for CE copies."""
+    key = (str(device), n)
+    pool = _CE_STREAM_POOL.get(key)
+    if pool is not None:
+        return pool
+    pool = [torch.cuda.Stream(device=device, priority=-1) for _ in range(n)]
+    _CE_STREAM_POOL[key] = pool
+    return pool
+
+
+def all_gather_copy_engine_async(x_symm, group, out=None, num_streams=2):
+    """All-gather via copy engines. Returns CEHandle (async).
+
+    Args:
+        x_symm:     symm-mem tensor, this rank's data. Shape (T_local, ...).
+        group:      process group.
+        out:        optional pre-allocated output (W*T_local, ...).
+        num_splits: number of CE streams. Copies are round-robin'd across them.
+                    1 = sequential on one stream.
+                    2 = two streams (default, good balance).
+                    W = one stream per peer (max concurrency).
+
+    Returns:
+        CEHandle with .out and .wait().
+
+    Caller contract: x_symm written + barrier issued before this call.
+
+    Example:
+        h = all_gather_ce(x_symm, group)
+        y = torch.mm(a, b)          # GEMM overlaps with CE copies
+        x_global = h.wait()         # sync
+    """
+    hdl = rendezvous(x_symm, group)
+    W = hdl.world_size
+    rank = hdl.rank
+
+    if out is None:
+        out = torch.empty(
+            (W * x_symm.shape[0],) + tuple(x_symm.shape[1:]),
+            dtype=x_symm.dtype,
+            device=x_symm.device,
+        )
+
+    num_streams = max(1, min(num_streams, W))
+    streams = _get_ce_streams(x_symm.device, num_streams)
+    chunks = out.chunk(W)
+    buf_tuple = tuple(hdl.get_buffer(r, tuple(x_symm.shape), x_symm.dtype) for r in range(W))
+
+    main = torch.cuda.current_stream()
+    for s in streams:
+        s.wait_stream(main)
+
+    # Round-robin copies across streams, self-copy first for locality.
+    order = [(rank + i) % W for i in range(W)]
+    for idx, r in enumerate(order):
+        s = streams[idx % num_streams]
+        with torch.cuda.stream(s):
+            chunks[r].copy_(buf_tuple[r])
+
+    return CEHandle(out, streams)
+
+
+def a2a_dispatch_pull_triton(
     x_symm: torch.Tensor,
     dst_rank_flat: torch.Tensor,
-    slot_flat_per_rank: torch.Tensor,
+    recv_pos: torch.Tensor,
     recv: torch.Tensor,
     K: int,
     group,
 ):
     """Fused A2A dispatch via NVLink reads from peer x_symm.
 
+    For each global slot f where dst_rank_flat[f] == my_rank, the kernel
+    reads peer.x_symm[t_local] (where t_local = (f % TK_local) // K and the
+    peer is the source rank f // TK_local) and writes it into recv at row
+    `recv_pos[f]`. Slots where dst != my_rank are no-ops; their recv rows
+    retain prior contents.
+
     Args:
         x_symm: this rank's x in symm-mem, shape (T_local, d).
-        dst_rank_flat: (TK_global,) int32. Destination peer for each global slot.
-        slot_flat_per_rank: (TK_global,) int32. Per-source-rank slot for each
-            global slot.
-        recv: local output buffer, shape (W, TK_local, d) or (W*TK_local, d).
-            Populated with the rows this rank consumes; unwritten positions
-            retain prior contents.
+        dst_rank_flat: (TK_global,) int32. Destination peer per global slot,
+            from compute_dispatch_metadata.
+        recv_pos: (TK_global,) int32. Caller-supplied destination row in recv
+            for each global slot. The kernel uses recv_pos[f] only when
+            dst_rank_flat[f] == my_rank; entries elsewhere are unread.
+            Common choices:
+              * meta["a2a_token_indices"]   → legacy (W, TK_local, d) layout
+              * metadata["s_reverse_local"] → expert-sorted (TK_global, d)
+                                              layout for nogather GEMM
+        recv: local output buffer. Any shape whose flat (rows, d) view has
+            >= TK_global rows; the kernel writes recv.view(-1, d)[recv_pos[f]]
+            for each f routed to my_rank.
         K: top-K experts per token.
         group: process group.
     """
@@ -754,13 +858,13 @@ def a2a_dispatch_pull(
     TK_global = W * TK_local
 
     x_peer_tuple = tuple(hdl.get_buffer(r, (T_local, d), x_symm.dtype) for r in range(W))
-    recv_flat = recv.view(W * TK_local, d)
+    recv_flat = recv.view(-1, d)
 
     grid = lambda META: (TK_global, triton.cdiv(d, META["BLOCK_D"]))
     _a2a_dispatch_pull_kernel[grid](
         x_peer_tuple,
         dst_rank_flat,
-        slot_flat_per_rank,
+        recv_pos,
         recv_flat,
         TK_local=TK_local,
         my_rank=hdl.rank,
@@ -771,7 +875,7 @@ def a2a_dispatch_pull(
     return recv
 
 
-def gather_aggregation(y_symm, s_reverse_symm, src_dst_rank, dispatch_pos, topk_scores, out, K, group):
+def gather_aggregation_triton(y_symm, s_reverse_symm, src_dst_rank, dispatch_pos, topk_scores, out, K, group):
     """gather + weighted-accumulate.
 
     Drop-in replacement for the prior two-pass version. Same caller

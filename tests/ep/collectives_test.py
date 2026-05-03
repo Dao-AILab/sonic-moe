@@ -24,11 +24,15 @@ import torch
 import torch.distributed as dist
 from torch.distributed import _symmetric_memory as _symm_mem
 
-from sonicmoe.functional.ep import a2a_dispatch_pull
-from sonicmoe.functional.ep import all_gather as triton_all_gather
-from sonicmoe.functional.ep import compute_dispatch_metadata, gather_aggregation
-from sonicmoe.functional.ep import reduce_scatter as triton_reduce_scatter
-from sonicmoe.functional.ep import rs_aggregation
+from sonicmoe.functional.ep import (
+    a2a_dispatch_pull_triton,
+    all_gather_copy_engine_async,
+    all_gather_triton,
+    compute_dispatch_metadata,
+    gather_aggregation_triton,
+    reduce_scatter_triton,
+    rs_aggregation,
+)
 from tests.test_commons import TestCommons
 
 
@@ -38,6 +42,13 @@ _SEED = 0
 def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def _symm_barrier(tensor: torch.Tensor) -> None:
+    """GPU-side barrier on a symm-mem tensor — cheaper than dist.barrier().
+    Required between a producer kernel and a Triton peer-read kernel; NCCL
+    collectives self-sync and don't need this."""
+    _symm_mem.rendezvous(tensor, group=dist.group.WORLD.group_name).barrier()
 
 
 # ============================================================================
@@ -159,12 +170,15 @@ def _worker_all_gather(rank, world_size, device):
             x = _alloc_symm((T_local, d), dtype, device)
             x.normal_()
             dist.barrier()
-            tri = triton_all_gather(x, dist.group.WORLD)
+            ce = all_gather_copy_engine_async(x, dist.group.WORLD).wait()
+            tri = all_gather_triton(x, dist.group.WORLD)
             ref = torch.empty(world_size * T_local, d, dtype=dtype, device=device)
             dist.all_gather_into_tensor(ref, x, group=dist.group.WORLD)
             if not torch.equal(tri, ref):
                 fails.append(f"AG T={T_local} d={d} dt={dtype}: {(tri != ref).sum().item()} differ")
-            del x, tri, ref
+            if not torch.equal(ce, ref):
+                fails.append(f"AG T={T_local} d={d} dt={dtype}: {(ce != ref).sum().item()} differ")
+            del x, tri, ref, ce
         torch.cuda.empty_cache()
     return fails
 
@@ -187,7 +201,7 @@ def _worker_reduce_scatter(rank, world_size, device):
             x.normal_()
             dist.barrier()
 
-            tri = triton_reduce_scatter(x, dist.group.WORLD)
+            tri = reduce_scatter_triton(x, dist.group.WORLD)
 
             # Algorithmic reference matching the kernel exactly: AG every
             # rank's x_symm, then sum the my_rank-th T_local slice over peers
@@ -200,7 +214,7 @@ def _worker_reduce_scatter(rank, world_size, device):
             # one bf16 ULP at magnitude 16). The AG-based reference shares
             # the kernel's precision and accumulation order, so torch.equal
             # is the right check.
-            x_all = triton_all_gather(x, dist.group.WORLD).view(world_size, world_size * T_local, d)
+            x_all = all_gather_triton(x, dist.group.WORLD).view(world_size, world_size * T_local, d)
             ref_fp32 = torch.zeros(T_local, d, dtype=torch.float32, device=device)
             for p in range(world_size):
                 ref_fp32 += x_all[p, rank * T_local : (rank + 1) * T_local].to(torch.float32)
@@ -239,11 +253,13 @@ def _worker_a2a_pull(rank, world_size, device):
             recv = torch.full((world_size, TK_local, d), SENTINEL, dtype=torch.bfloat16, device=device)
 
             dist.barrier()
-            a2a_dispatch_pull(x, meta["dst_rank_flat"], meta["slot_flat_per_rank"], recv, K=K, group=dist.group.WORLD)
+            a2a_dispatch_pull_triton(
+                x, meta["dst_rank_flat"], meta["a2a_token_indices"], recv, K=K, group=dist.group.WORLD
+            )
 
             # Reference: AG x_symm, then scatter rows. Slots not destined for
             # this rank should retain the sentinel (kernel early-returns).
-            x_all = triton_all_gather(x, dist.group.WORLD)
+            x_all = all_gather_triton(x, dist.group.WORLD)
             ref = torch.full_like(recv, SENTINEL)
             valid = torch.nonzero(meta["dst_rank_flat"] == rank).flatten()
             src = (valid // TK_local).long()
@@ -350,7 +366,7 @@ def _worker_gather_aggregation(rank, world_size, device):
             out = torch.empty(T_local, d, dtype=torch.bfloat16, device=device)
 
             dist.barrier()
-            gather_aggregation(
+            gather_aggregation_triton(
                 y,
                 sr,
                 meta["my_dst_rank"],
@@ -361,8 +377,8 @@ def _worker_gather_aggregation(rank, world_size, device):
                 group=dist.group.WORLD,
             )
 
-            y_all = triton_all_gather(y, dist.group.WORLD)
-            s_all = triton_all_gather(sr, dist.group.WORLD)
+            y_all = all_gather_triton(y, dist.group.WORLD)
+            s_all = all_gather_triton(sr, dist.group.WORLD)
             ref_acc = torch.zeros(T_local, d, dtype=torch.float32, device=device)
             for k in range(K):
                 peer = meta["my_dst_rank"][:, k].long()

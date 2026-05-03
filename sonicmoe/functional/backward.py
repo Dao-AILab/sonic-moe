@@ -220,7 +220,7 @@ def _down_projection_backward_act(
     a_prime: torch.Tensor,
     topk_scores: torch.Tensor,
     expert_frequency_offset: torch.Tensor,
-    x_gather_idx: torch.Tensor,
+    x_gather_idx: Optional[torch.Tensor],
     s_scatter_idx: torch.Tensor,
     activation_type: str,
 ) -> None:

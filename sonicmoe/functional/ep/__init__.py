@@ -8,10 +8,11 @@ import triton
 import triton.language as tl
 
 from .triton_comm import (
-    a2a_dispatch_pull,
-    all_gather,
+    a2a_dispatch_pull_triton,
+    all_gather_copy_engine_async,
+    all_gather_triton,
     compute_dispatch_metadata,
-    gather_aggregation,
-    reduce_scatter,
+    gather_aggregation_triton,
+    reduce_scatter_triton,
     rs_aggregation,
 )

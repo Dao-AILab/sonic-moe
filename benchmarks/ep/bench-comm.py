@@ -5,7 +5,7 @@
 #
 # Run (torchrun-launched):
 #
-#   torchrun --nproc_per_node=4 --standalone --local-ranks-filter 0 benchmarks/ep/bench-comm.py
+#   torchrun --nproc_per_node=4 --standalone benchmarks/ep/bench-comm.py
 #   torchrun --nproc_per_node=8 --standalone --local-ranks-filter 0 \
 #            benchmarks/ep/bench-comm.py --phase ag a2a_pull
 #
@@ -30,11 +30,16 @@ from torch.distributed import _symmetric_memory as _symm_mem
 
 from sonicmoe.enums import ActivationType
 from sonicmoe.ep import SymmMemManager, moe_ep_TC_softmax_topk_forward
-from sonicmoe.functional.ep import a2a_dispatch_pull
-from sonicmoe.functional.ep import all_gather as triton_all_gather
-from sonicmoe.functional.ep import compute_dispatch_metadata, gather_aggregation
-from sonicmoe.functional.ep import reduce_scatter as triton_reduce_scatter
-from sonicmoe.functional.ep import rs_aggregation
+from sonicmoe.functional.ep import (
+    a2a_dispatch_pull_triton,
+    all_gather_copy_engine_async,
+    all_gather_triton,
+    compute_dispatch_metadata,
+    gather_aggregation_triton,
+    reduce_scatter_triton,
+    rs_aggregation,
+)
+from sonicmoe.functional.triton_kernels import general_routing_router_metadata_triton
 
 
 # ============================================================================
@@ -57,7 +62,9 @@ def _setup_dist(rank: int, world_size: int, master_port: str = "29555") -> None:
 # ============================================================================
 
 
-def bench_fn(fn: Callable[[], None], *, warmup: int = 10, repeat: int = 50, cross_rank_max: bool = True) -> float:
+def bench_fn(
+    fn: Callable[[], None], *, warmup: int = 10, repeat: int = 50, cross_rank_max: bool = True, calls_per_iter=3
+) -> float:
     """Time `fn()` and return mean per-iter milliseconds."""
     for _ in range(warmup):
         fn()
@@ -67,13 +74,15 @@ def bench_fn(fn: Callable[[], None], *, warmup: int = 10, repeat: int = 50, cros
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(repeat):
-        fn()
-    end.record()
-    torch.cuda.synchronize()
-    local_ms = start.elapsed_time(end) / repeat
-
+    local_ms = 0
+    for _ in range(calls_per_iter):
+        start.record()
+        for _ in range(repeat):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        local_ms += start.elapsed_time(end) / repeat
+    local_ms /= calls_per_iter
     if cross_rank_max and dist.is_initialized():
         t = torch.tensor([local_ms], device="cuda")
         dist.all_reduce(t, op=dist.ReduceOp.MAX)
@@ -168,6 +177,43 @@ def _make_balanced_topk(
     return full
 
 
+def _build_nogather_recv_pos(
+    expert_local_padded: torch.Tensor,
+    TK_global: int,
+    E_local: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute the expert-sorted recv_pos tensor that the production A2A
+    nogather path uses.
+
+    Mirrors what _moe_ep_forward_inner's A2A branch does: runs
+    general_routing_router_metadata_triton on expert_local_padded to get
+    s_reverse_local, which assigns each global slot a unique row in the
+    expert-sorted x_compute layout (recv).
+    """
+    s_reverse_local = torch.empty(TK_global, dtype=torch.int32, device=device)
+    s_scatter_idx = torch.empty(TK_global, dtype=torch.int32, device=device)
+    expert_frequency = torch.empty(E_local, dtype=torch.int32, device=device)
+    expert_frequency_offset = torch.empty(E_local + 1, dtype=torch.int32, device=device)
+    x_gather_idx = torch.empty(TK_global, dtype=torch.int32, device=device)
+    num_offset = torch.empty(TK_global + 1, dtype=torch.int32, device=device)
+    token_indices = torch.arange(TK_global, dtype=torch.int32, device=device)
+
+    general_routing_router_metadata_triton(
+        token_indices,
+        expert_local_padded,
+        TK_global,
+        E_local,
+        expert_frequency,
+        expert_frequency_offset,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_local,
+        num_offset,
+    )
+    return s_reverse_local
+
+
 # ============================================================================
 # Phase: dispatch metadata
 # ============================================================================
@@ -191,6 +237,7 @@ def phase_metadata(rank: int, world_size: int, device: torch.device, args) -> No
     for cfg in _META_CONFIGS:
         if cfg.E % world_size != 0:
             continue
+        torch.cuda.empty_cache()
         E_local = cfg.E // world_size
 
         topk_idx_g = _make_balanced_topk(cfg.T_local, cfg.K, cfg.E, rank, world_size, device)
@@ -244,13 +291,17 @@ def phase_ag(rank: int, world_size: int, device: torch.device, args) -> None:
         x_symm.normal_()
         out_nccl = torch.empty(world_size * cfg.T_local, cfg.d, dtype=cfg.dtype, device=device)
 
+        def copy_engine_call():
+            all_gather_copy_engine_async(x_symm, dist.group.WORLD).wait()
+
         def triton_call():
-            triton_all_gather(x_symm, dist.group.WORLD)
+            all_gather_triton(x_symm, dist.group.WORLD)
 
         def nccl_call():
             dist.all_gather_into_tensor(out_nccl, x_symm, group=dist.group.WORLD)
 
         t_triton = bench_fn(triton_call, warmup=args.warmup, repeat=args.repeat)
+        t_ce = bench_fn(copy_engine_call, warmup=args.warmup, repeat=args.repeat)
         t_nccl = bench_fn(nccl_call, warmup=args.warmup, repeat=args.repeat)
 
         # AG is a pure network op. NVLink bytes = (W-1) chunks from peers.
@@ -261,22 +312,40 @@ def phase_ag(rank: int, world_size: int, device: torch.device, args) -> None:
                 f"{cfg.T_local}",
                 f"{cfg.d}",
                 f"{t_triton*1e3:.1f}",
+                f"{t_ce*1e3:.1f}",
                 f"{t_nccl*1e3:.1f}",
                 f"{t_nccl/t_triton:.2f}x",
                 f"{_gbps(nvlink_bytes, t_triton):.0f}",
+                f"{_gbps(nvlink_bytes, t_ce):.0f}",
                 f"{_gbps(nvlink_bytes, t_nccl):.0f}",
             ]
         )
     _print_table(
         rank,
         f"AG: Triton vs NCCL (W={world_size})",
-        ["name", "T_local", "d", "triton µs", "nccl µs", "speedup", "triton NVLink GB/s", "nccl NVLink GB/s"],
+        [
+            "name",
+            "T_local",
+            "d",
+            "triton µs",
+            "ce µs",
+            "nccl µs",
+            "nccl/triton time",
+            "triton NVLink GB/s",
+            "ce NVLink GB/s",
+            "nccl NVLink GB/s",
+        ],
         rows,
     )
 
 
 # ============================================================================
-# Phase: A2A pull (Triton vs NCCL)
+# Phase: A2A pull (Triton nogather vs NCCL)
+# ----------------------------------------------------------------------------
+# Production A2A dispatch: the pull writes peer rows directly into the
+# expert-sorted recv layout (TK_global, d) via recv_pos = s_reverse_local.
+# This is the exact layout consumed by the nogather (concat_layout=True)
+# GEMM in _moe_ep_forward_inner's A2A branch.
 # ============================================================================
 
 
@@ -306,15 +375,16 @@ def phase_a2a_pull(rank: int, world_size: int, device: torch.device, args) -> No
 
         x_symm = _alloc_symm((cfg.T_local, cfg.d), cfg.dtype, device)
         x_symm.normal_()
-        recv = torch.empty((world_size, TK_local, cfg.d), dtype=cfg.dtype, device=device)
+        # Nogather (contiguous, expert-sorted) recv layout.
+        recv = torch.empty((TK_global, cfg.d), dtype=cfg.dtype, device=device)
 
         topk_idx_g = _make_balanced_topk(cfg.T_local, cfg.K, cfg.E, rank, world_size, device)
         meta = compute_dispatch_metadata(topk_idx_g, my_rank=rank, E_local=E_local)
         dst_rank_flat = meta["dst_rank_flat"]
-        slot_flat_per_rank = meta["slot_flat_per_rank"]
+        recv_pos = _build_nogather_recv_pos(meta["expert_local_padded"], TK_global, E_local, device)
 
         def triton_call():
-            a2a_dispatch_pull(x_symm, dst_rank_flat, slot_flat_per_rank, recv, K=cfg.K, group=dist.group.WORLD)
+            a2a_dispatch_pull_triton(x_symm, dst_rank_flat, recv_pos, recv, K=cfg.K, group=dist.group.WORLD)
 
         send_nccl = torch.empty(world_size * TK_local, cfg.d, dtype=cfg.dtype, device=device)
         send_nccl.normal_()
@@ -347,7 +417,7 @@ def phase_a2a_pull(rank: int, world_size: int, device: torch.device, args) -> No
 
     _print_table(
         rank,
-        f"A2A pull: Triton vs NCCL (W={world_size})",
+        f"A2A pull (nogather layout): Triton vs NCCL (W={world_size})",
         [
             "name",
             "T_local",
@@ -365,7 +435,12 @@ def phase_a2a_pull(rank: int, world_size: int, device: torch.device, args) -> No
 
 
 # ============================================================================
-# Phase: AG-mode dispatch vs A2A-mode dispatch
+# Phase: AG-mode dispatch vs A2A-mode dispatch (nogather layout)
+# ----------------------------------------------------------------------------
+# Both rows reflect the production EP forward layouts:
+#   AG  → all_gather(x_symm) into (W*T_local, d) compute buffer.
+#   A2A → a2a_dispatch_pull_triton(x_symm, recv_pos=s_reverse_local) into
+#         (TK_global, d) expert-sorted compute buffer.
 # ============================================================================
 
 
@@ -376,24 +451,26 @@ def phase_ag_vs_a2a(rank: int, world_size: int, device: torch.device, args) -> N
             continue
         E_local = cfg.E // world_size
         TK_local = cfg.T_local * cfg.K
+        TK_global = world_size * TK_local
 
         x_symm_ag = _alloc_symm((cfg.T_local, cfg.d), cfg.dtype, device)
         x_symm_ag.normal_()
 
         def ag_call():
-            triton_all_gather(x_symm_ag, dist.group.WORLD)
+            all_gather_triton(x_symm_ag, dist.group.WORLD)
 
         x_symm_a2a = _alloc_symm((cfg.T_local, cfg.d), cfg.dtype, device)
         x_symm_a2a.normal_()
-        recv = torch.empty((world_size, TK_local, cfg.d), dtype=cfg.dtype, device=device)
+        # Nogather (contiguous) recv layout.
+        recv = torch.empty((TK_global, cfg.d), dtype=cfg.dtype, device=device)
 
         topk_idx_g = _make_balanced_topk(cfg.T_local, cfg.K, cfg.E, rank, world_size, device)
         meta = compute_dispatch_metadata(topk_idx_g, my_rank=rank, E_local=E_local)
         dst_rank_flat = meta["dst_rank_flat"]
-        slot_flat_per_rank = meta["slot_flat_per_rank"]
+        recv_pos = _build_nogather_recv_pos(meta["expert_local_padded"], TK_global, E_local, device)
 
         def a2a_call():
-            a2a_dispatch_pull(x_symm_a2a, dst_rank_flat, slot_flat_per_rank, recv, K=cfg.K, group=dist.group.WORLD)
+            a2a_dispatch_pull_triton(x_symm_a2a, dst_rank_flat, recv_pos, recv, K=cfg.K, group=dist.group.WORLD)
 
         t_ag = bench_fn(ag_call, warmup=args.warmup, repeat=args.repeat)
         t_a2a = bench_fn(a2a_call, warmup=args.warmup, repeat=args.repeat)
@@ -420,8 +497,91 @@ def phase_ag_vs_a2a(rank: int, world_size: int, device: torch.device, args) -> N
 
     _print_table(
         rank,
-        f"AG mode vs A2A mode dispatch (W={world_size})",
+        f"AG mode vs A2A mode dispatch — nogather layout (W={world_size})",
         ["name", "T_local", "d", "K", "E", "AG µs", "A2A µs", "A2A speedup", "AG NVLink GB/s", "A2A NVLink GB/s"],
+        rows,
+    )
+
+
+# ============================================================================
+# Phase: A2A pull layout comparison (legacy per-rank-slot vs nogather)
+# ----------------------------------------------------------------------------
+# Sanity check: the production path is the nogather layout, but we verify
+# that the layout choice itself doesn't change pull performance — both
+# variants move the same NVLink bytes; only the destination row computation
+# differs (a2a_token_indices vs s_reverse_local).
+# ============================================================================
+
+
+def phase_a2a_pull_layouts(rank: int, world_size: int, device: torch.device, args) -> None:
+    rows = []
+    for cfg in _A2A_PULL_CONFIGS:
+        if cfg.E % world_size != 0:
+            continue
+        E_local = cfg.E // world_size
+        TK_local = cfg.T_local * cfg.K
+        TK_global = world_size * TK_local
+
+        x_symm = _alloc_symm((cfg.T_local, cfg.d), cfg.dtype, device)
+        x_symm.normal_()
+
+        topk_idx_g = _make_balanced_topk(cfg.T_local, cfg.K, cfg.E, rank, world_size, device)
+        meta = compute_dispatch_metadata(topk_idx_g, my_rank=rank, E_local=E_local)
+        dst_rank_flat = meta["dst_rank_flat"]
+
+        # Legacy per-rank-slot layout: recv shape (W, TK_local, d), recv_pos
+        # = a2a_token_indices = src_rank * TK_local + slot_per_rank.
+        recv_legacy = torch.empty((world_size, TK_local, cfg.d), dtype=cfg.dtype, device=device)
+        recv_pos_legacy = meta["a2a_token_indices"]
+
+        # Nogather layout: recv shape (TK_global, d), recv_pos = s_reverse_local.
+        recv_nogather = torch.empty((TK_global, cfg.d), dtype=cfg.dtype, device=device)
+        recv_pos_nogather = _build_nogather_recv_pos(meta["expert_local_padded"], TK_global, E_local, device)
+
+        def legacy_call():
+            a2a_dispatch_pull_triton(
+                x_symm, dst_rank_flat, recv_pos_legacy, recv_legacy, K=cfg.K, group=dist.group.WORLD
+            )
+
+        def nogather_call():
+            a2a_dispatch_pull_triton(
+                x_symm, dst_rank_flat, recv_pos_nogather, recv_nogather, K=cfg.K, group=dist.group.WORLD
+            )
+
+        t_legacy = bench_fn(legacy_call, warmup=args.warmup, repeat=args.repeat)
+        t_nogather = bench_fn(nogather_call, warmup=args.warmup, repeat=args.repeat)
+
+        nvlink_bytes = (world_size - 1) / world_size * TK_local * cfg.d * x_symm.element_size()
+        rows.append(
+            [
+                cfg.name,
+                f"{cfg.T_local}",
+                f"{cfg.d}",
+                f"{cfg.K}",
+                f"{cfg.E}",
+                f"{t_legacy*1e3:.1f}",
+                f"{t_nogather*1e3:.1f}",
+                f"{t_legacy/t_nogather:.2f}x",
+                f"{_gbps(nvlink_bytes, t_legacy):.0f}",
+                f"{_gbps(nvlink_bytes, t_nogather):.0f}",
+            ]
+        )
+
+    _print_table(
+        rank,
+        f"A2A pull: legacy vs nogather layout (W={world_size})",
+        [
+            "name",
+            "T_local",
+            "d",
+            "K",
+            "E",
+            "legacy µs",
+            "nogather µs",
+            "nogather speedup",
+            "legacy NVLink GB/s",
+            "nogather NVLink GB/s",
+        ],
         rows,
     )
 
@@ -451,7 +611,7 @@ def phase_rs(rank: int, world_size: int, device: torch.device, args) -> None:
         out_nccl = torch.empty(cfg.T_local, cfg.d, dtype=cfg.dtype, device=device)
 
         def triton_call():
-            triton_reduce_scatter(x_symm, dist.group.WORLD)
+            reduce_scatter_triton(x_symm, dist.group.WORLD)
 
         def nccl_call():
             dist.reduce_scatter_tensor(out_nccl, x_symm, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
@@ -481,7 +641,7 @@ def phase_rs(rank: int, world_size: int, device: torch.device, args) -> None:
 
 
 # ============================================================================
-# Phase: gather_aggregation
+# Phase: gather_aggregation_triton
 # ============================================================================
 
 
@@ -500,7 +660,7 @@ _COMBINE_CONFIGS = [
 ]
 
 
-def phase_gather_aggregation(rank: int, world_size: int, device: torch.device, args) -> None:
+def phase_gather_aggregation_triton(rank: int, world_size: int, device: torch.device, args) -> None:
     rows = []
     for cfg in _COMBINE_CONFIGS:
         if cfg.E % world_size != 0:
@@ -526,7 +686,9 @@ def phase_gather_aggregation(rank: int, world_size: int, device: torch.device, a
         out = torch.empty(cfg.T_local, cfg.d, dtype=cfg.dtype, device=device)
 
         def call():
-            gather_aggregation(y_symm, s_rev_symm, rank_2d, pos_2d, topk_scores, out, K=cfg.K, group=dist.group.WORLD)
+            gather_aggregation_triton(
+                y_symm, s_rev_symm, rank_2d, pos_2d, topk_scores, out, K=cfg.K, group=dist.group.WORLD
+            )
 
         t = bench_fn(call, warmup=args.warmup, repeat=args.repeat)
         nvlink_bytes = (world_size - 1) / world_size * cfg.T_local * cfg.K * cfg.d * y_symm.element_size()
@@ -542,7 +704,10 @@ def phase_gather_aggregation(rank: int, world_size: int, device: torch.device, a
             ]
         )
     _print_table(
-        rank, f"gather_aggregation (W={world_size})", ["name", "T_local", "d", "K", "E", "µs", "NVLink GB/s"], rows
+        rank,
+        f"gather_aggregation_triton (W={world_size})",
+        ["name", "T_local", "d", "K", "E", "µs", "NVLink GB/s"],
+        rows,
     )
 
 
@@ -617,7 +782,7 @@ def phase_rs_aggregation(rank: int, world_size: int, device: torch.device, args)
         # 2b. Triton RS only (on pre-filled buffer; no producer-RS race
         # because rs_buf is read-only across iters).
         def call_rs_triton():
-            triton_reduce_scatter(rs_buf, dist.group.WORLD, out=out_rs)
+            reduce_scatter_triton(rs_buf, dist.group.WORLD, out=out_rs)
 
         t_rs_triton = bench_fn(call_rs_triton, warmup=args.warmup, repeat=args.repeat)
 
@@ -637,7 +802,7 @@ def phase_rs_aggregation(rank: int, world_size: int, device: torch.device, args)
                 y_symm, s_rev_symm, dst_rank_flat, scores_flat, rs_buf, cfg.K, cfg.T_local, group=dist.group.WORLD
             )
             _symm_barrier(rs_buf)
-            triton_reduce_scatter(rs_buf, dist.group.WORLD, out=out_rs)
+            reduce_scatter_triton(rs_buf, dist.group.WORLD, out=out_rs)
 
         t_pipe_triton = bench_fn(call_pipeline_triton, warmup=args.warmup, repeat=args.repeat)
 
@@ -684,19 +849,21 @@ def phase_rs_aggregation(rank: int, world_size: int, device: torch.device, args)
 
 
 # ============================================================================
-# Phase: gather_aggregation vs rs_aggregation pipeline (NCCL and Triton RS)
+# Phase: gather_aggregation_triton vs rs_aggregation pipeline (NCCL and Triton RS)
 # ----------------------------------------------------------------------------
-# gather_aggregation: fused NVLink-read kernel, total time = network time.
+# gather_aggregation_triton: fused NVLink-read kernel, total time = network time.
 # rs_aggregation pipeline: producer (HBM) + barrier + RS (NVLink). Network
 # time = RS only.
 #
-# We now report the rs+RS pipeline cost for BOTH RS backends. Triton pipeline
+# We report the rs+RS pipeline cost for BOTH RS backends. Triton pipeline
 # includes a symm-mem barrier between producer and RS, which is what real
 # pipeline code would do. NCCL doesn't need an explicit barrier.
 #
 # "best speedup" = t_gather / min(t_pipe_nccl, t_pipe_triton). >1 means the
 # best RS pipeline beats gather.
 # ============================================================================
+
+
 def phase_gather_vs_rs_aggregation(rank: int, world_size: int, device: torch.device, args) -> None:
     rows = []
     for cfg in _COMBINE_CONFIGS:
@@ -721,14 +888,14 @@ def phase_gather_vs_rs_aggregation(rank: int, world_size: int, device: torch.dev
         )
         scores_flat = scores_2d.view(-1)
 
-        # --- gather_aggregation ---
+        # --- gather_aggregation_triton ---
         rank_2d = meta["my_dst_rank"]
         pos_2d = (torch.arange(TK_local, device=device, dtype=torch.int32) + rank * TK_local).view(cfg.T_local, cfg.K)
         topk_scores = scores_2d[rank * cfg.T_local : (rank + 1) * cfg.T_local]
         out_gather = torch.empty(cfg.T_local, cfg.d, dtype=cfg.dtype, device=device)
 
         def call_gather():
-            gather_aggregation(
+            gather_aggregation_triton(
                 y_symm, s_rev_symm, rank_2d, pos_2d, topk_scores, out_gather, K=cfg.K, group=dist.group.WORLD
             )
 
@@ -749,7 +916,7 @@ def phase_gather_vs_rs_aggregation(rank: int, world_size: int, device: torch.dev
                 y_symm, s_rev_symm, dst_rank_flat, scores_flat, rs_buf, cfg.K, cfg.T_local, group=dist.group.WORLD
             )
             _symm_barrier(rs_buf)
-            triton_reduce_scatter(rs_buf, dist.group.WORLD, out=out_rs)
+            reduce_scatter_triton(rs_buf, dist.group.WORLD, out=out_rs)
 
         t_pipe_nccl = bench_fn(call_pipeline_nccl, warmup=args.warmup, repeat=args.repeat)
         t_pipe_triton = bench_fn(call_pipeline_triton, warmup=args.warmup, repeat=args.repeat)
@@ -767,7 +934,7 @@ def phase_gather_vs_rs_aggregation(rank: int, world_size: int, device: torch.dev
             dist.reduce_scatter_tensor(out_rs, rs_buf, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
 
         def call_rs_triton():
-            triton_reduce_scatter(rs_buf, dist.group.WORLD, out=out_rs)
+            reduce_scatter_triton(rs_buf, dist.group.WORLD, out=out_rs)
 
         t_rs_nccl = bench_fn(call_rs_nccl, warmup=args.warmup, repeat=args.repeat)
         t_rs_triton = bench_fn(call_rs_triton, warmup=args.warmup, repeat=args.repeat)
@@ -858,7 +1025,7 @@ def _make_e2e_inputs(cfg: E2ECfg, rank: int, world_size: int, device: torch.devi
     w2_full = 0.02 * torch.randn(E, H, I, generator=g, device=device, dtype=cfg.dtype)
 
     w1_local = w1_full[rank * E_local : (rank + 1) * E_local].permute(1, 2, 0)
-    w2_local = w2_full[rank * E_local : (rank + 1) * E_local].permute(1, 2, 0)
+    w2_local = w2_full[rank * E_local : (rank + 1) * E_local].permute(0, 2, 1).contiguous()
     return x, router_w, w1_local, w2_local
 
 
@@ -909,7 +1076,7 @@ def phase_e2e(rank: int, world_size: int, device: torch.device, args) -> None:
 
     _print_table(
         rank,
-        f"End-to-end EP forward: AG vs A2A (W={world_size})",
+        f"End-to-end EP forward: AG (gather GEMM) vs A2A (nogather GEMM) (W={world_size})",
         ["name", "T_local", "d", "n", "K", "E", "AG µs", "A2A µs", "A2A speedup"],
         rows,
     )
@@ -924,8 +1091,9 @@ _PHASES = {
     "ag": phase_ag,
     "rs": phase_rs,
     "a2a_pull": phase_a2a_pull,
+    "a2a_pull_layouts": phase_a2a_pull_layouts,
     "ag_vs_a2a": phase_ag_vs_a2a,
-    "gather_aggregation": phase_gather_aggregation,
+    "gather_aggregation_triton": phase_gather_aggregation_triton,
     "rs_aggregation": phase_rs_aggregation,
     "gather_vs_rs_aggregation": phase_gather_vs_rs_aggregation,
     "e2e": phase_e2e,
@@ -966,7 +1134,7 @@ def main() -> int:
         "--phase", nargs="+", default=["all"], help="phases to run: " + ", ".join(_PHASES.keys()) + ", all"
     )
     parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--repeat", type=int, default=50)
+    parser.add_argument("--repeat", type=int, default=200)
     args = parser.parse_args()
 
     if not _under_torchrun():

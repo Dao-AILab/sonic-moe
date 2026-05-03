@@ -132,19 +132,20 @@ class _UpProjection(torch.autograd.Function):
         ctx.is_glu_activation = is_glu_activation
         ctx.concat_layout = concat_layout
 
-        ctx.save_for_backward(
-            x,
-            w1,
-            b1,
-            expert_frequency_offset,
-            x_gather_idx,
-            s_scatter_idx,
-            s_reverse_scatter_idx,
-            num_activated_expert_per_token_offset,
-        )
+        if not is_inference_mode_enabled:
+            ctx.save_for_backward(
+                x,
+                w1,
+                b1,
+                expert_frequency_offset,
+                x_gather_idx,
+                s_scatter_idx,
+                s_reverse_scatter_idx,
+                num_activated_expert_per_token_offset,
+            )
 
-        ctx.mark_non_differentiable(a)
-        ctx.set_materialize_grads(False)
+            ctx.mark_non_differentiable(a)
+            ctx.set_materialize_grads(False)
 
         return a, h
 

@@ -22,9 +22,9 @@
 # Usage (torchrun-launched):
 #
 #   torchrun --nproc_per_node=4 --standalone --local-ranks-filter 0 \
-#            tests/test_ep.py
+#            tests/moe_ep_test.py
 #   torchrun --nproc_per_node=8 --standalone --local-ranks-filter 0 \
-#            tests/test_ep.py --concat-layout
+#            tests/moe_ep_test.py --concat-layout
 #
 # torchrun sets RANK / WORLD_SIZE / LOCAL_RANK / MASTER_ADDR / MASTER_PORT in
 # each child; we just read them. --standalone picks a free master port; use
@@ -80,23 +80,23 @@ class Shape:
 
 SHAPES: List[Shape] = [
     # Smoke / baseline
-    Shape("smoke_K4_E32", T=2048, H=1024, I=512, E=32, K=4),
+    Shape("smoke_K4_E32", T=1024, H=1024, I=512, E=32, K=4),
     # K edge cases
-    Shape("K_eq_1", T=2048, H=1024, I=512, E=32, K=1),
-    Shape("K_eq_2", T=2048, H=2048, I=1024, E=32, K=2),
-    Shape("K_eq_4", T=2048, H=2048, I=1024, E=32, K=4),
+    Shape("K_eq_1", T=1024, H=1024, I=512, E=32, K=1),
+    Shape("K_eq_2", T=1024, H=2048, I=1024, E=32, K=2),
+    Shape("K_eq_4", T=1024, H=2048, I=1024, E=32, K=4),
     Shape("K_eq_8", T=4096, H=2048, I=1024, E=64, K=8),
-    Shape("K_eq_10", T=2048, H=2048, I=512, E=64, K=10),
+    Shape("K_eq_10", T=1024, H=2048, I=512, E=64, K=10),
     # H / I aspect ratios
-    Shape("H_gt_I", T=2048, H=4096, I=1024, E=64, K=8),
-    Shape("H_eq_I", T=2048, H=1024, I=1024, E=32, K=4),
-    Shape("H_lt_I_4x", T=2048, H=1024, I=4096, E=32, K=4),
+    Shape("H_gt_I", T=1024, H=4096, I=1024, E=64, K=8),
+    Shape("H_eq_I", T=1024, H=1024, I=1024, E=32, K=4),
+    Shape("H_lt_I_4x", T=1024, H=1024, I=4096, E=32, K=4),
     # T non-divisible by common pow-2 block sizes
     Shape("T_nondiv", T=3072, H=1024, I=512, E=32, K=4),
     # Large E
-    Shape("E_eq_128", T=4096, H=4096, I=1024, E=128, K=8),
-    Shape("E_eq_256", T=2048, H=2304, I=512, E=256, K=8),
-    Shape("E_eq_512", T=2048, H=2048, I=512, E=512, K=10),
+    Shape("E_eq_128", T=1024, H=4096, I=1024, E=128, K=8),
+    Shape("E_eq_256", T=1024, H=2304, I=512, E=256, K=8),
+    Shape("E_eq_512", T=1024, H=2048, I=512, E=512, K=10),
 ]
 
 
@@ -224,14 +224,8 @@ def _run_one_shape(
     seed: int,
 ) -> ShapeStats:
     T, H, I, E, K = shape.T, shape.H, shape.I, shape.E, shape.K
-    if T % world_size != 0:
-        if rank == 0:
-            print(f"[skip {shape.name}] T={T} not divisible by W={world_size}")
-        return ShapeStats(shape.name)
-    if E % world_size != 0:
-        if rank == 0:
-            print(f"[skip {shape.name}] E={E} not divisible by W={world_size}")
-        return ShapeStats(shape.name)
+    assert T % world_size == 0, f"T ({T}) must be divisible by world_size ({world_size})."
+    assert E % world_size == 0, f"E ({E}) must be divisible by world_size ({world_size})."
 
     T_local = T // world_size
     E_local = E // world_size
@@ -267,8 +261,15 @@ def _run_one_shape(
     b2_with = moe.c_proj.bias  # (E, H)
     router_w = moe.router.weight  # (E, H)
 
-    w1_local = w1_full[e_slc].transpose(1, 2).contiguous().permute(2, 1, 0)
-    w2_local = w2_full[e_slc].permute(1, 2, 0).contiguous()
+    # EP-sharded weights (per-rank expert slice). Layout matches the benchmark
+    # in benchmarks/ep/moe-ep.py:
+    #   w1: (E_local, 2I, H) → permute(1, 2, 0) → (2I, H, E_local) view,
+    #       strides (H, 1, 2I·H). Non-contiguous on purpose; the GEMM kernel
+    #       requires the middle dim to have stride 1.
+    #   w2: (E_local, H, I)  → permute(0, 2, 1).contiguous() → (E_local, I, H)
+    #       contig.
+    w1_local = w1_full[e_slc].permute(1, 2, 0)
+    w2_local = w2_full[e_slc].permute(0, 2, 1).contiguous()
     b1_local_with = b1_with[e_slc].contiguous()
     b2_local_with = b2_with[e_slc].contiguous()
 
@@ -462,6 +463,12 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+
+    # Match the benchmark's numerics: disable TF32 so the fp32 reference path
+    # (F.linear in _per_expert_reference) is genuinely fp32 and not silently
+    # downcast on Ampere+.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group(
