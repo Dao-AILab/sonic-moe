@@ -34,6 +34,7 @@ import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
+from cuda.bindings import driver
 from torch.distributed import _symmetric_memory as symm_mem
 
 
@@ -199,7 +200,7 @@ def _reduce_scatter_kernel(
         tl.store(output_ptr + offs, acc, mask=mask)
 
 
-def reduce_scatter_triton(x_symm, group, out=None):
+def reduce_scatter_triton(x_symm, group, out=None, hdl=None):
     """Sum-reduce-scatter via Triton + symm-mem (no NCCL).
 
     Equivalent to:
@@ -216,7 +217,8 @@ def reduce_scatter_triton(x_symm, group, out=None):
     Caller contract: x_symm has been written and a barrier has been issued
     before the call (peers read this rank's bytes via NVLink).
     """
-    hdl = rendezvous(x_symm, group)
+    if hdl is None:
+        hdl = rendezvous(x_symm, group)
     W = hdl.world_size
     rank = hdl.rank
     assert x_symm.shape[0] % W == 0, f"reduce_scatter: x_symm.shape[0]={x_symm.shape[0]} not divisible by W={W}"
@@ -331,7 +333,11 @@ def _a2a_dispatch_pull_kernel(
 # Design (one kernel):
 #   grid (T_local, cdiv(d, BLOCK_D)). One program per (t, BLOCK_D-tile).
 #   Inside, the K-loop is statically unrolled. For each k in 0..K:
-#     1. Load peer = src_dst_rank[t, k], pos = dispatch_pos[t, k], score.
+#     1. Load peer = src_dst_rank[t, k], score.
+#        pos = my_rank * TK_local + t * K + k is computed inline (each rank
+#        owns the contiguous [my_rank * TK_local, (my_rank+1) * TK_local)
+#        slice of every peer's TK_global-sized buffer; no per-(t, k) lookup
+#        needed).
 #     2. Load peer.s_reverse[pos] via NVLink to get the row in peer.y_symm
 #        (this is the work the prior _resolve_peer_rows pre-pass did, folded
 #        inline — saves a kernel launch and a barrier; the extra NVLink
@@ -360,46 +366,57 @@ _GATHER_AGGREGATION_CONFIGS = [
 def _gather_aggregation_kernel(
     peer_y_tuple,
     peer_s_reverse_tuple,
-    src_dst_rank_ptr,  # (TK_local,) int32, peer rank for each (t, k)
-    dispatch_pos_ptr,  # (TK_local,) int32, global flat slot index
-    scores_ptr,  # (TK_local,) dtype, topk score per (t, k)
-    y_local_ptr,  # (T_local, d) output, same dtype as y_symm
+    src_dst_rank_ptr,
+    scores_ptr,  # only read when WITH_SCORES is True
+    y_local_ptr,
+    my_rank_offset,  # int64 scalar: my_rank * TK_local
     K: tl.constexpr,
     d: tl.constexpr,
     world_size: tl.constexpr,
     BLOCK_D: tl.constexpr,
     EVEN_D: tl.constexpr,
+    WITH_SCORES: tl.constexpr,
 ):
     """One program per (t, BLOCK_D-tile). K-serial inner loop with inline
-    s_reverse resolve, register fp32 accumulator, single non-atomic store."""
-    pid_t = tl.program_id(0)
-    pid_d = tl.program_id(1)
+    s_reverse resolve, register fp32 accumulator, single non-atomic store.
+    """
+    pid_t = tl.program_id(0).to(tl.int64)
+    pid_d = tl.program_id(1).to(tl.int64)
 
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = offs_d < d  # const-True for EVEN_D
     acc = tl.zeros([BLOCK_D], dtype=tl.float32)
     base = pid_t * K
+    pos_base = my_rank_offset.to(tl.int64) + base  # = my_rank*TK_local + t*K
 
+    # Branch-free pattern: fold peer-match into load mask, accumulate
+    # unconditionally. Triton's SSA optimizer can miscompile `if peer == i:`
+    # inside tl.static_range when the body has multiple loads (s_reverse +
+    # y_row), producing nondeterministic results. See _rs_aggregation_kernel
+    # for the same pattern.
     for k in tl.static_range(K):
         peer = tl.load(src_dst_rank_ptr + base + k)
-        pos = tl.load(dispatch_pos_ptr + base + k).to(tl.int64)
-        score = tl.load(scores_ptr + base + k).to(tl.float32)
+        pos = pos_base + k
+        if WITH_SCORES:
+            score = tl.load(scores_ptr + base + k).to(tl.float32)
         for i in tl.static_range(world_size):
-            if peer == i:
-                # Inline resolve: peer.s_reverse[pos] → row in peer.y_symm.
-                s_peer = tl.load(peer_s_reverse_tuple[i] + pos).to(tl.int64)
-                row_offs = s_peer * d + offs_d
-                if EVEN_D:
-                    row = tl.load(peer_y_tuple[i] + row_offs).to(tl.float32)
-                else:
-                    d_mask = offs_d < d
-                    row = tl.load(peer_y_tuple[i] + row_offs, mask=d_mask, other=0.0).to(tl.float32)
+            is_match = peer == i  # scalar bool
+            # When peer != i, s_peer load is masked → 0; subsequent y_row
+            # load reads peer_y_tuple[i] row 0 but is also masked → 0.
+            # The accumulator gets 0 contribution, equivalent to skipping.
+            s_peer = tl.load(peer_s_reverse_tuple[i] + pos, mask=is_match, other=0).to(tl.int64)
+            row_offs = s_peer * d + offs_d
+            m = is_match & d_mask
+            row = tl.load(peer_y_tuple[i] + row_offs, mask=m, other=0.0).to(tl.float32)
+            if WITH_SCORES:
                 acc += row * score
+            else:
+                acc += row
 
     out_offs = pid_t * d + offs_d
     if EVEN_D:
         tl.store(y_local_ptr + out_offs, acc)
     else:
-        d_mask = offs_d < d
         tl.store(y_local_ptr + out_offs, acc, mask=d_mask)
 
 
@@ -471,17 +488,11 @@ def _metadata_phase1_reduce_kernel(
     one_hot = (dst[:, None] == peer_axis[None, :]).to(tl.int32)
     one_hot = tl.where(valid[:, None], one_hot, 0)
 
-    # Tile-level peer histogram (still needed by phase 2).
     tile_count_p = tl.sum(one_hot, axis=0)
 
-    # expert_local_padded: real local expert when dst == my_rank,
-    # sentinel (flat_offs % E_local) otherwise.
     local_expert = expert_global - dst * E_local
-    sentinel = flat_offs % E_local
-    padded = tl.where(dst == my_rank, local_expert, sentinel)
+    padded = tl.where(dst == my_rank, local_expert, E_local)
 
-    # Writes — within_tile_slot is intentionally NOT written; phase 3
-    # recomputes it from dst.
     tl.store(out_dst_rank_flat_ptr + flat_offs, dst, mask=valid)
     tl.store(
         out_tile_count_ptr + pid_r * n_tiles * W + pid_tile * W + peer_axis,
@@ -718,12 +729,17 @@ def safe_block_size(chunk_numel: int, requested: int = 4096) -> int:
 # ============================================================================
 
 
-def all_gather_triton(x_symm, group, out=None):
-    hdl = rendezvous(x_symm, group)
+def all_gather_triton(x_symm, group, out=None, hdl=None):
+    if hdl is None:
+        hdl = rendezvous(x_symm, group)
     W = hdl.world_size
     numel = x_symm.numel()
     if out is None:
-        out = torch.empty((W * x_symm.shape[0],) + tuple(x_symm.shape[1:]), dtype=x_symm.dtype, device=x_symm.device)
+        out = torch.empty(
+            (W * x_symm.shape[0],) + tuple(x_symm.shape[1:]),
+            dtype=x_symm.dtype,
+            device=x_symm.device,
+        )
     buf_tuple = tuple(hdl.get_buffer(r, tuple(x_symm.shape), x_symm.dtype) for r in range(W))
     grid = lambda META: (W, triton.cdiv(numel, META["BLOCK_SIZE"]))
     _all_gather_kernel[grid](
@@ -733,6 +749,39 @@ def all_gather_triton(x_symm, group, out=None):
         world_size=W,
     )
     return out
+
+
+# ============================================================================
+# AllGather via Copy Engine (cuMemcpyAsync direct).
+# ----------------------------------------------------------------------------
+# Routes peer copies through the GPU's Copy Engines instead of a SM-side
+# copy kernel. The driver dispatches intra-device P2P cuMemcpyAsync to a
+# CE; torch.Tensor.copy_ falls through to a SM kernel even on P2P-mapped
+# tensors, which is why the prior implementation of this function failed
+# to actually use the CE despite the name. We bypass torch.copy_ by issuing
+# the copies through cuda-python driver bindings directly.
+#
+# Caller contract: x_symm has been written AND a barrier (NCCL or symm-mem)
+# has been issued before the call, so peer reads observe valid data.
+# Same contract as all_gather_triton.
+# ============================================================================
+
+
+def _check(result):
+    """Unwrap cuda-python driver returns; raise on error."""
+    if not isinstance(result, tuple):
+        return result
+    err, *rest = result
+    if err != driver.CUresult.CUDA_SUCCESS:
+        _, name = driver.cuGetErrorName(err)
+        _, msg = driver.cuGetErrorString(err)
+        decode = lambda b: b.decode() if isinstance(b, bytes) else b
+        raise RuntimeError(f"CUDA error {decode(name)}: {decode(msg)}")
+    if len(rest) == 0:
+        return None
+    if len(rest) == 1:
+        return rest[0]
+    return tuple(rest)
 
 
 class CEHandle:
@@ -767,26 +816,44 @@ def _get_ce_streams(device, n):
 
 
 def all_gather_copy_engine_async(x_symm, group, out=None, num_streams=2):
-    """All-gather via copy engines. Returns CEHandle (async).
-
+    """All-gather routed through the Copy Engines via cuMemcpyAsync.
+ 
+    For each remote rank r, issues
+        cuMemcpyAsync(out[r], peer[r].x_symm, ...)
+    on a dedicated CUDA stream. The local chunk is filled via cuMemcpyAsync
+    on the torch stream (intra-device, no NVLink). Going through the driver
+    bindings rather than torch.Tensor.copy_ ensures the driver picks the
+    Copy Engine path; torch.copy_ launches a SM copy kernel even on
+    P2P-mapped tensors. To verify CE usage in practice:
+        ncu --metrics lts__t_sectors_srcunit_l1ces_op_read.sum,\\
+                     lts__t_sectors_srcunit_tex_op_read.sum
+    The L1ces counter should account for the (W-1) cross-rank chunks; tex
+    should be near-zero for those copies.
+ 
+    Caller contract:
+        x_symm has been written AND a barrier (NCCL or symm-mem) has been
+        issued before the call. The CE streams take a wait_stream
+        dependency on the torch stream, so peer reads observe the
+        barrier's completion.
+ 
     Args:
-        x_symm:     symm-mem tensor, this rank's data. Shape (T_local, ...).
-        group:      process group.
-        out:        optional pre-allocated output (W*T_local, ...).
-        num_splits: number of CE streams. Copies are round-robin'd across them.
-                    1 = sequential on one stream.
-                    2 = two streams (default, good balance).
-                    W = one stream per peer (max concurrency).
-
+        x_symm:      symm-mem tensor, this rank's data, shape (T_local, ...).
+                     Must be contiguous.
+        group:       process group used at rendezvous.
+        out:         optional pre-allocated output (W*T_local, ...) and
+                     matching dtype/device. If None, allocated here.
+        num_streams: number of CE streams. Default 2. More streams = more
+                     concurrent peer copies; past 4 the host overhead
+                     usually outweighs the parallelism on a single NVLink
+                     island.
+ 
     Returns:
-        CEHandle with .out and .wait().
-
-    Caller contract: x_symm written + barrier issued before this call.
-
+        CEHandle. Use .wait() to sync, then access .out (or call() it).
+ 
     Example:
-        h = all_gather_ce(x_symm, group)
-        y = torch.mm(a, b)          # GEMM overlaps with CE copies
-        x_global = h.wait()         # sync
+        h = all_gather_copy_engine_async(x_symm, group)
+        y = some_gemm(...)              # overlaps with CE copies
+        x_global = h.wait()
     """
     hdl = rendezvous(x_symm, group)
     W = hdl.world_size
@@ -803,17 +870,41 @@ def all_gather_copy_engine_async(x_symm, group, out=None, num_streams=2):
     streams = _get_ce_streams(x_symm.device, num_streams)
     chunks = out.chunk(W)
     buf_tuple = tuple(hdl.get_buffer(r, tuple(x_symm.shape), x_symm.dtype) for r in range(W))
+    bytes_per_chunk = x_symm.numel() * x_symm.element_size()
 
     main = torch.cuda.current_stream()
+    # CE streams wait on whatever was last enqueued on the torch stream
+    # (typically the caller's barrier), so peer reads observe valid data.
     for s in streams:
         s.wait_stream(main)
 
-    # Round-robin copies across streams, self-copy first for locality.
-    order = [(rank + i) % W for i in range(W)]
-    for idx, r in enumerate(order):
+    # Self-copy on the torch stream — intra-device, no NVLink. Goes
+    # through the driver here too, for consistency. The cross-stream
+    # parallelism is enough that this isn't on the critical path.
+    _check(
+        driver.cuMemcpyAsync(
+            chunks[rank].data_ptr(),
+            x_symm.data_ptr(),
+            bytes_per_chunk,
+            main.cuda_stream,
+        )
+    )
+
+    # Cross-rank pulls via cuMemcpyAsync on dedicated CE streams. Round-
+    # robin across the pool. Self-skipped (handled above). Iteration
+    # order starts at (rank+1) to spread the initial requests across
+    # peers — at large W this avoids transient hot-spotting on rank 0.
+    peers = [(rank + i) % W for i in range(1, W)]
+    for idx, r in enumerate(peers):
         s = streams[idx % num_streams]
-        with torch.cuda.stream(s):
-            chunks[r].copy_(buf_tuple[r])
+        _check(
+            driver.cuMemcpyAsync(
+                chunks[r].data_ptr(),
+                buf_tuple[r].data_ptr(),
+                bytes_per_chunk,
+                s.cuda_stream,
+            )
+        )
 
     return CEHandle(out, streams)
 
@@ -825,6 +916,7 @@ def a2a_dispatch_pull_triton(
     recv: torch.Tensor,
     K: int,
     group,
+    hdl=None,
 ):
     """Fused A2A dispatch via NVLink reads from peer x_symm.
 
@@ -851,7 +943,8 @@ def a2a_dispatch_pull_triton(
         K: top-K experts per token.
         group: process group.
     """
-    hdl = rendezvous(x_symm, group)
+    if hdl is None:
+        hdl = rendezvous(x_symm, group)
     W = hdl.world_size
     T_local, d = x_symm.shape
     TK_local = T_local * K
@@ -875,41 +968,53 @@ def a2a_dispatch_pull_triton(
     return recv
 
 
-def gather_aggregation_triton(y_symm, s_reverse_symm, src_dst_rank, dispatch_pos, topk_scores, out, K, group):
-    """gather + weighted-accumulate.
+# ============================================================================
+# gather_aggregation_triton — NVLink combine of K (peer.y_symm, peer.s_reverse)
+# rows per local token, with optional per-(t,k) scoring.
+# ============================================================================
+#
+# Each rank consumes the contiguous [my_rank * TK_local, (my_rank+1) * TK_local)
+# slice of every peer's TK_global-sized s_reverse / score buffer. The
+# kernel computes that slot index inline as `my_rank*TK_local + pid_t*K + k`
+# from `pid_t` and a single int64 scalar (`my_rank_offset = my_rank*TK_local`),
+# so callers no longer need to materialize a per-(t, k) `dispatch_pos`
+# tensor (which was just `arange(TK_local) + my_rank*TK_local` reshaped).
+# ============================================================================
+def gather_aggregation_triton(
+    y_symm: torch.Tensor,
+    s_reverse_symm: torch.Tensor,
+    src_dst_rank: torch.Tensor,
+    topk_scores: Optional[torch.Tensor],
+    out: torch.Tensor,
+    K,
+    group,
+    hdl_y=None,
+    hdl_s=None,
+):
+    """gather + (optionally weighted) accumulate.
 
-    Drop-in replacement for the prior two-pass version. Same caller
-    signature; semantics unchanged.
-
-    Caller contract:
-      * Barrier on y_symm AND s_reverse_symm has been issued before this
-        call (the kernel reads both via NVLink).
-      * y_symm shape (TK_global, d), s_reverse_symm shape (TK_global,) —
-        both symm-mem tensors allocated by SymmMemManager.
-      * src_dst_rank (T_local, K): peer rank for each (t, k) assignment.
-      * dispatch_pos (T_local, K): the GLOBAL flat slot index for (t, k) —
-        i.e. my_rank * TK_local + t * K + k. Used to index peer.s_reverse.
-      * topk_scores (T_local, K): score per (t, k).
-      * out (T_local, d): output, same dtype as y_symm. Written directly
-        (cast from in-register fp32 acc).
-
-    No atomics: the K-fold sum lives in a Triton register block, and the
-    final store is a single non-atomic write per (t, BLOCK_D-tile). This
-    is bitwise deterministic — repeated calls with identical inputs
-    produce identical outputs to the bit. See the combine module-level
-    docstring for why this design beat the atomic-add restructure on H100
-    and is preferred for determinism even where atomic-add helps (B300).
+    Forward combine passes per-(t, k) scores; backward dx combine passes
+    None (score-less). The kernel branches on WITH_SCORES at compile time.
     """
-    hdl_y = rendezvous(y_symm, group)
-    hdl_s = rendezvous(s_reverse_symm, group)
+    if hdl_y is None:
+        hdl_y = rendezvous(y_symm, group)
+    if hdl_s is None:
+        hdl_s = rendezvous(s_reverse_symm, group)
     W = hdl_y.world_size
+    my_rank = dist.get_rank(group)
     d = y_symm.shape[1]
     T_local = src_dst_rank.shape[0]
     TK_global = W * T_local * K
+    my_rank_offset = my_rank * T_local * K  # int64 in kernel
 
     src_flat = src_dst_rank.view(-1)
-    pos_flat = dispatch_pos.view(-1)
-    scores_flat = topk_scores.view(-1)
+
+    with_scores = topk_scores is not None
+    if with_scores:
+        scores_flat = topk_scores.view(-1)
+    else:
+        scores_flat = src_flat  # unused when WITH_SCORES is False
+
     s_buf = tuple(hdl_s.get_buffer(r, (TK_global,), s_reverse_symm.dtype) for r in range(W))
     y_buf = tuple(hdl_y.get_buffer(r, (TK_global, d), y_symm.dtype) for r in range(W))
 
@@ -918,12 +1023,13 @@ def gather_aggregation_triton(y_symm, s_reverse_symm, src_dst_rank, dispatch_pos
         y_buf,
         s_buf,
         src_flat,
-        pos_flat,
         scores_flat,
         out,
+        my_rank_offset,
         K=K,
         d=d,
         world_size=W,
+        WITH_SCORES=with_scores,
     )
 
 
@@ -966,7 +1072,7 @@ def _rs_aggregation_kernel(
     y_symm_ptr,  # (TK_global, d) expert output, flat
     s_reverse_ptr,  # (TK_global,) int32, dispatch slot -> row index
     dst_rank_flat_ptr,  # (TK_global,) int32, destination rank per slot
-    scores_ag_ptr,  # (TK_global,) float32, score per slot
+    scores_ag_ptr,  # only read when WITH_SCORES is True
     rs_buf_ptr,  # (W * T_local, d) float32 output, flat
     T_local,
     my_rank: tl.constexpr,
@@ -975,17 +1081,23 @@ def _rs_aggregation_kernel(
     d: tl.constexpr,
     BLOCK_D: tl.constexpr,
     EVEN_D: tl.constexpr,
+    WITH_SCORES: tl.constexpr,
 ):
     """One program per (home_rank, home_t, d-tile). Walks K expert slots,
-    accumulates score*row in registers for those routed to my_rank,
+    accumulates row contributions in registers for those routed to my_rank,
     stores once. No atomics, no zero_().
 
-    KEY DESIGN POINT -- no `if dst == my_rank` block. Triton SSA merging
-    for `if` inside tl.static_range can miscompile (acc updates from
-    earlier iterations don't propagate forward). Instead we do a masked
-    load where the mask folds in `is_mine`. When is_mine is False the load
-    returns 0 (other=0.0), so score*row = 0 and acc is unaffected -- same
-    semantics, no conditional update."""
+    WITH_SCORES=True  → score-weighted sum (forward RS combine).
+    WITH_SCORES=False → identity-weighted sum (backward dx RS combine);
+                        the score load and multiply are elided at compile
+                        time.
+
+    KEY DESIGN POINT — the dst-vs-my_rank check is ALWAYS folded into the
+    load mask (m = is_mine & d_mask, other=0.0), independent of
+    WITH_SCORES. This is what makes the K-loop branch-free and avoids
+    Triton SSA merging issues with `if` inside tl.static_range. Score-less
+    mode just drops the multiply, not the mask.
+    """
     pid_ht = tl.program_id(0).to(tl.int64)
     pid_d = tl.program_id(1)
 
@@ -1001,15 +1113,21 @@ def _rs_aggregation_kernel(
         dst = tl.load(dst_rank_flat_ptr + f)
         is_mine = dst == my_rank  # scalar bool
 
-        score = tl.load(scores_ag_ptr + f).to(tl.float32)
+        if WITH_SCORES:
+            score = tl.load(scores_ag_ptr + f).to(tl.float32)
         row_idx = tl.load(s_reverse_ptr + f).to(tl.int64)
         row_offs = row_idx * d + offs_d
 
         # Vector mask: True where (valid d lane) AND (routed to my_rank).
+        # When is_mine is False the load returns 0, so the contribution is
+        # 0 regardless of WITH_SCORES — no conditional update.
         m = is_mine & d_mask
         row = tl.load(y_symm_ptr + row_offs, mask=m, other=0.0).to(tl.float32)
 
-        acc += score * row
+        if WITH_SCORES:
+            acc += score * row
+        else:
+            acc += row
 
     out_offs = pid_ht * d + offs_d
     if EVEN_D:
@@ -1022,46 +1140,37 @@ def rs_aggregation(
     y_symm: torch.Tensor,
     s_reverse: torch.Tensor,
     dst_rank_flat: torch.Tensor,
-    scores_ag: torch.Tensor,
+    scores_ag: Optional[torch.Tensor],
     rs_buf: torch.Tensor,
     K: int,
     T_local: int,
     group: dist.ProcessGroup,
 ) -> None:
-    """Writes rs_buf[home_rank * T_local + home_t, :] =
-        sum_{k where dst[f] == my_rank} score[f] * y_symm[s_reverse[f], :]
-    for each (home_rank, home_t) pair, where f = (home_rank*T_local + home_t)*K + k.
+    """Writes
+        rs_buf[home_rank * T_local + home_t, :] =
+            sum_{k where dst[f] == my_rank}
+                w[f] * y_symm[s_reverse[f], :]
+    for each (home_rank, home_t) pair, where
+        f    = (home_rank*T_local + home_t)*K + k
+        w[f] = scores_ag[f]   if scores_ag is not None     (forward combine)
+             = 1              otherwise                    (backward dx combine)
 
     No atomic_add. No zero_() needed — the kernel writes every output row
-    exactly once (zero accumulator → zero store when no k matched).
-
-    Intended call pattern in the EP forward (when rs combine is wired up):
-        topk_idx_g, topk_scores_g = _ag_routing_decision(
-            ws.idx_symm, topk_idx_l, grp,
-            scores_symm=ws.scores_symm, topk_scores_l=topk_scores_l,
-        )                                          # topk_scores_g: (W*T_local, K) fp32
-        ...
-        rs_aggregation(y_symm, s_reverse, meta["dst_rank_flat"],
-                       topk_scores_g, rs_buf, K, T_local, group=grp)
-        barrier(rs_buf, grp)
-        out = reduce_scatter(rs_buf, grp)
+    exactly once.
 
     Args:
-        y_symm: (TK_global, d) expert output. Reads are local — symm-mem
-            allocation only matters for the subsequent reduce_scatter.
+        y_symm: (TK_global, d) expert output.
         s_reverse: (TK_global,) int32, dispatch slot → row in y_symm.
         dst_rank_flat: (TK_global,) int32, destination rank per slot.
-            From compute_dispatch_metadata.
-        scores_ag: GLOBAL all-gathered scores, fp32. Accepted shapes:
-            (TK_global,) flat, or (W*T_local, K) — the natural output of
-            all_gather(scores_symm). Flattened internally; no copy when
-            already contiguous.
+        scores_ag: GLOBAL all-gathered scores OR None for score-less mode.
+            Accepted shapes when not None: (TK_global,) flat, or
+            (W*T_local, K) — the natural output of all_gather(scores_symm).
+            Flattened internally; no copy when already contiguous.
         rs_buf: (W*T_local, d) fp32 output buffer. Should be symm-mem so it
             can feed reduce_scatter directly. Written in-place.
         K: top-K experts per token.
         T_local: tokens per rank.
-        group: the EP process group. Used to query my_rank consistently
-            with the rest of the EP collective stack.
+        group: the EP process group.
     """
     assert rs_buf.ndim == 2, f"rs_buf must be 2D (W*T_local, d), got shape {tuple(rs_buf.shape)}."
     WT, d = rs_buf.shape
@@ -1069,16 +1178,26 @@ def rs_aggregation(
     my_rank = dist.get_rank(group)
     assert WT == W * T_local, f"rs_buf.shape[0]={WT} != W*T_local={W*T_local} (W from group)"
 
+    with_scores = scores_ag is not None
+    if with_scores:
+        scores_flat = scores_ag.view(-1)
+    else:
+        # Triton needs a concrete pointer arg even though the kernel never
+        # reads it when WITH_SCORES=False. Reuse `dst_rank_flat` — its
+        # type and content are irrelevant since the load is compiled out.
+        scores_flat = dst_rank_flat
+
     grid = lambda META: (W * T_local, triton.cdiv(d, META["BLOCK_D"]))
     _rs_aggregation_kernel[grid](
         y_symm,
         s_reverse,
         dst_rank_flat,
-        scores_ag.view(-1),
+        scores_flat,
         rs_buf,
         T_local=T_local,
         my_rank=my_rank,
         world_size=W,
         K=K,
         d=d,
+        WITH_SCORES=with_scores,
     )

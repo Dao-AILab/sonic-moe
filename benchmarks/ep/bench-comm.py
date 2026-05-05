@@ -13,6 +13,18 @@
 # each child; we just read them. --standalone picks a free master port; use
 # --local-ranks-filter 0 to dedupe console output (rank 0 already does the
 # printing, but Triton/NCCL warnings on other ranks can still be noisy).
+#
+# Symm-mem rendezvous handles are NOT held as Python locals across the
+# bench loops — doing so reorders ~CUDASymmetricMemory to fire when the
+# handle local is rebound on the next iteration, mid-execution, racing
+# with in-flight CUDA work on the buffer's peer mappings and triggering
+# `cuMemUnmap → CUDA_ERROR_INVALID_VALUE` from inside ~AllocationRef.
+# Producer-→peer-read fences use the transient `_barrier(buf)` helper,
+# which fetches the cached handle from PyTorch's symm-mem cache, calls
+# `.barrier()`, and drops the local ref immediately — the cache keeps
+# the actual handle alive bound to the buffer's lifetime. Coarse cross-
+# rank syncs (in `bench_fn` between warmup and timing, in main()
+# teardown) keep `dist.barrier()`.
 # ********************************************************************************
 
 from __future__ import annotations
@@ -70,6 +82,8 @@ def bench_fn(
         fn()
     torch.cuda.synchronize()
     if dist.is_initialized():
+        # Coarse cross-rank lockstep before timing — not tied to any
+        # specific symm tensor, so dist.barrier() is the right tool.
         dist.barrier()
 
     start = torch.cuda.Event(enable_timing=True)
@@ -115,20 +129,75 @@ def _gbps(bytes_moved: float, ms: float) -> float:
 
 # ============================================================================
 # Symm-mem allocation helper
+# ----------------------------------------------------------------------------
+# Returns ONLY the buffer. The rendezvous handle is intentionally NOT
+# returned — holding it in a Python local across loop iterations causes
+# the handle's refcount to drop when the local is rebound on the next
+# iteration, firing ~CUDASymmetricMemory → ~AllocationRef → cuMemUnmap
+# MID-EXECUTION while CUDA work on the buffer's peer mappings is still
+# in flight, which crashes with CUDA_ERROR_INVALID_VALUE. PyTorch's
+# symm-mem cache keeps the actual handle alive bound to the buffer's
+# lifetime, so subsequent rendezvous(buf, ...) calls (inside wrappers
+# or via `_barrier(buf)`) hit the cache without a round-trip.
 # ============================================================================
 
 
-def _alloc_symm(shape: Tuple[int, ...], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+def _alloc_symm(shape: Tuple[int, ...], dtype: torch.dtype, device: torch.device):
     buf = _symm_mem.empty(*shape, dtype=dtype, device=device)
     _symm_mem.rendezvous(buf, group=dist.group.WORLD.group_name)
     return buf
 
 
-def _symm_barrier(tensor: torch.Tensor) -> None:
-    """GPU-side barrier on a symm-mem tensor — cheaper than dist.barrier().
-    Required between a producer kernel and a Triton peer-read kernel; NCCL
-    collectives self-sync and don't need this."""
-    _symm_mem.rendezvous(tensor, group=dist.group.WORLD.group_name).barrier()
+def _barrier(buf: torch.Tensor) -> None:
+    """GPU-side barrier on `buf`'s symm-mem group via the cached handle.
+
+    Fences this rank's pending writes to `buf` before peers read it via
+    NVLink. The local handle ref drops as soon as `.barrier()` returns;
+    the cache keeps the underlying SymmetricMemory alive — so this is
+    cheap (cache hit) and avoids the destruction-order trap described
+    above `_alloc_symm`."""
+    _symm_mem.rendezvous(buf, group=dist.group.WORLD.group_name).barrier()
+
+
+def _flush_async_errors() -> None:
+    """Force any pending async CUDA errors to surface here, at a
+    well-defined point.
+
+    Without explicit syncs at well-defined points, a kernel's illegal
+    memory access becomes a sticky CUDA error that's reported by the
+    NEXT CUDA call — which, in this benchmark, is typically a downstream
+    Triton kernel's autotune `_init_handles` calling `cuModuleLoad`.
+    The traceback then wrongly blames the autotune step rather than the
+    real culprit (e.g. a metadata Triton kernel like
+    `general_routing_router_metadata_triton` that ran during setup).
+
+    Call this AFTER every batch of setup Triton kernels (especially
+    metadata-computing ones) and BEFORE the bench loop, so any setup
+    failure surfaces at the correct line.
+
+    For maximum debug clarity, also run with `CUDA_LAUNCH_BLOCKING=1`
+    — that synchronizes every kernel launch and pinpoints the exact
+    offending kernel."""
+    torch.cuda.synchronize()
+
+
+def _iter_cleanup() -> None:
+    """End-of-iteration cleanup.
+
+    Sync the device (so any async kernel errors surface NOW rather than
+    leaking into the next iteration's diagnostics), lockstep ranks (so
+    timing/allocator state stays aligned across the bench loop), and
+    drain the caching allocator (so the next iter's fresh allocs don't
+    fight fragmented state).
+
+    Caller should `del` per-iteration locals BEFORE calling this so the
+    Tensor refcounts drop and destructors run during this sync — see
+    `_alloc_symm`'s docstring for why destruction ordering matters for
+    symm-mem buffers."""
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+    torch.cuda.empty_cache()
 
 
 @dataclass
@@ -258,6 +327,9 @@ def phase_metadata(rank: int, world_size: int, device: torch.device, args) -> No
             ]
         )
 
+        del call, topk_idx_g
+        _iter_cleanup()
+
     _print_table(
         rank,
         f"compute_dispatch_metadata (W={world_size})",
@@ -289,6 +361,10 @@ def phase_ag(rank: int, world_size: int, device: torch.device, args) -> None:
     for cfg in _AG_CONFIGS:
         x_symm = _alloc_symm((cfg.T_local, cfg.d), cfg.dtype, device)
         x_symm.normal_()
+        # x_symm is read by peers in every benched iter; one fence here
+        # covers all subsequent reads (no further writes inside the loop).
+        _barrier(x_symm)
+
         out_nccl = torch.empty(world_size * cfg.T_local, cfg.d, dtype=cfg.dtype, device=device)
 
         def copy_engine_call():
@@ -320,6 +396,10 @@ def phase_ag(rank: int, world_size: int, device: torch.device, args) -> None:
                 f"{_gbps(nvlink_bytes, t_nccl):.0f}",
             ]
         )
+
+        del copy_engine_call, triton_call, nccl_call
+        del out_nccl, x_symm
+        _iter_cleanup()
     _print_table(
         rank,
         f"AG: Triton vs NCCL (W={world_size})",
@@ -375,6 +455,8 @@ def phase_a2a_pull(rank: int, world_size: int, device: torch.device, args) -> No
 
         x_symm = _alloc_symm((cfg.T_local, cfg.d), cfg.dtype, device)
         x_symm.normal_()
+        _barrier(x_symm)  # fence .normal_() before peers pull
+
         # Nogather (contiguous, expert-sorted) recv layout.
         recv = torch.empty((TK_global, cfg.d), dtype=cfg.dtype, device=device)
 
@@ -383,8 +465,23 @@ def phase_a2a_pull(rank: int, world_size: int, device: torch.device, args) -> No
         dst_rank_flat = meta["dst_rank_flat"]
         recv_pos = _build_nogather_recv_pos(meta["expert_local_padded"], TK_global, E_local, device)
 
+        # Surface any async errors from the setup Triton kernels NOW —
+        # before the bench loop's autotune kicks off. Without this sync,
+        # an illegal-memory-access from compute_dispatch_metadata or
+        # general_routing_router_metadata_triton would stick on the
+        # context and surface inside _a2a_dispatch_pull_kernel's autotune
+        # _init_handles → cuModuleLoad with a misleading traceback.
+        _flush_async_errors()
+
         def triton_call():
-            a2a_dispatch_pull_triton(x_symm, dst_rank_flat, recv_pos, recv, K=cfg.K, group=dist.group.WORLD)
+            a2a_dispatch_pull_triton(
+                x_symm,
+                dst_rank_flat,
+                recv_pos,
+                recv,
+                K=cfg.K,
+                group=dist.group.WORLD,
+            )
 
         send_nccl = torch.empty(world_size * TK_local, cfg.d, dtype=cfg.dtype, device=device)
         send_nccl.normal_()
@@ -413,7 +510,13 @@ def phase_a2a_pull(rank: int, world_size: int, device: torch.device, args) -> No
             ]
         )
 
+        # End-of-iteration cleanup. Drop refs in dependency order
+        # (closures first so they release their captures, then captures,
+        # then symm-mem buffer) and sync.
+        del triton_call, nccl_call
         del send_nccl, recv_nccl
+        del recv_pos, dst_rank_flat, meta, topk_idx_g, recv, x_symm
+        _iter_cleanup()
 
     _print_table(
         rank,
@@ -455,12 +558,15 @@ def phase_ag_vs_a2a(rank: int, world_size: int, device: torch.device, args) -> N
 
         x_symm_ag = _alloc_symm((cfg.T_local, cfg.d), cfg.dtype, device)
         x_symm_ag.normal_()
+        _barrier(x_symm_ag)
 
         def ag_call():
             all_gather_triton(x_symm_ag, dist.group.WORLD)
 
         x_symm_a2a = _alloc_symm((cfg.T_local, cfg.d), cfg.dtype, device)
         x_symm_a2a.normal_()
+        _barrier(x_symm_a2a)
+
         # Nogather (contiguous) recv layout.
         recv = torch.empty((TK_global, cfg.d), dtype=cfg.dtype, device=device)
 
@@ -469,8 +575,18 @@ def phase_ag_vs_a2a(rank: int, world_size: int, device: torch.device, args) -> N
         dst_rank_flat = meta["dst_rank_flat"]
         recv_pos = _build_nogather_recv_pos(meta["expert_local_padded"], TK_global, E_local, device)
 
+        # Surface async errors from setup metadata kernels at this line.
+        _flush_async_errors()
+
         def a2a_call():
-            a2a_dispatch_pull_triton(x_symm_a2a, dst_rank_flat, recv_pos, recv, K=cfg.K, group=dist.group.WORLD)
+            a2a_dispatch_pull_triton(
+                x_symm_a2a,
+                dst_rank_flat,
+                recv_pos,
+                recv,
+                K=cfg.K,
+                group=dist.group.WORLD,
+            )
 
         t_ag = bench_fn(ag_call, warmup=args.warmup, repeat=args.repeat)
         t_a2a = bench_fn(a2a_call, warmup=args.warmup, repeat=args.repeat)
@@ -494,6 +610,12 @@ def phase_ag_vs_a2a(rank: int, world_size: int, device: torch.device, args) -> N
                 f"{_gbps(nvlink_a2a, t_a2a):.0f}",
             ]
         )
+
+        # End-of-iteration cleanup.
+        del ag_call, a2a_call
+        del recv_pos, dst_rank_flat, meta, topk_idx_g, recv
+        del x_symm_a2a, x_symm_ag
+        _iter_cleanup()
 
     _print_table(
         rank,
@@ -524,6 +646,7 @@ def phase_a2a_pull_layouts(rank: int, world_size: int, device: torch.device, arg
 
         x_symm = _alloc_symm((cfg.T_local, cfg.d), cfg.dtype, device)
         x_symm.normal_()
+        _barrier(x_symm)
 
         topk_idx_g = _make_balanced_topk(cfg.T_local, cfg.K, cfg.E, rank, world_size, device)
         meta = compute_dispatch_metadata(topk_idx_g, my_rank=rank, E_local=E_local)
@@ -538,14 +661,27 @@ def phase_a2a_pull_layouts(rank: int, world_size: int, device: torch.device, arg
         recv_nogather = torch.empty((TK_global, cfg.d), dtype=cfg.dtype, device=device)
         recv_pos_nogather = _build_nogather_recv_pos(meta["expert_local_padded"], TK_global, E_local, device)
 
+        # Surface async errors from setup metadata kernels at this line.
+        _flush_async_errors()
+
         def legacy_call():
             a2a_dispatch_pull_triton(
-                x_symm, dst_rank_flat, recv_pos_legacy, recv_legacy, K=cfg.K, group=dist.group.WORLD
+                x_symm,
+                dst_rank_flat,
+                recv_pos_legacy,
+                recv_legacy,
+                K=cfg.K,
+                group=dist.group.WORLD,
             )
 
         def nogather_call():
             a2a_dispatch_pull_triton(
-                x_symm, dst_rank_flat, recv_pos_nogather, recv_nogather, K=cfg.K, group=dist.group.WORLD
+                x_symm,
+                dst_rank_flat,
+                recv_pos_nogather,
+                recv_nogather,
+                K=cfg.K,
+                group=dist.group.WORLD,
             )
 
         t_legacy = bench_fn(legacy_call, warmup=args.warmup, repeat=args.repeat)
@@ -566,6 +702,12 @@ def phase_a2a_pull_layouts(rank: int, world_size: int, device: torch.device, arg
                 f"{_gbps(nvlink_bytes, t_nogather):.0f}",
             ]
         )
+
+        # End-of-iteration cleanup.
+        del legacy_call, nogather_call
+        del recv_pos_nogather, recv_pos_legacy, recv_nogather, recv_legacy
+        del dst_rank_flat, meta, topk_idx_g, x_symm
+        _iter_cleanup()
 
     _print_table(
         rank,
@@ -608,6 +750,8 @@ def phase_rs(rank: int, world_size: int, device: torch.device, args) -> None:
         # reduce_scatter_tensor expects as input.
         x_symm = _alloc_symm((world_size * cfg.T_local, cfg.d), cfg.dtype, device)
         x_symm.normal_()
+        _barrier(x_symm)
+
         out_nccl = torch.empty(cfg.T_local, cfg.d, dtype=cfg.dtype, device=device)
 
         def triton_call():
@@ -632,6 +776,10 @@ def phase_rs(rank: int, world_size: int, device: torch.device, args) -> None:
                 f"{_gbps(nvlink_bytes, t_nccl):.0f}",
             ]
         )
+
+        del triton_call, nccl_call
+        del out_nccl, x_symm
+        _iter_cleanup()
     _print_table(
         rank,
         f"RS: Triton vs NCCL (W={world_size})",
@@ -673,11 +821,16 @@ def phase_gather_aggregation_triton(rank: int, world_size: int, device: torch.de
         y_symm.normal_()
         s_rev_symm = _alloc_symm((TK_global,), torch.int32, device)
         s_rev_symm.copy_(torch.randint(0, TK_local, (TK_global,), device=device, dtype=torch.int32))
+        # One _barrier call fences all preceding GPU work for this rank.
+        # Issue on y_symm (covers s_rev_symm too — the cache holds a
+        # group-level handle, and `.barrier()` on either tensor's handle
+        # fences this rank's stream globally w.r.t. peer reads); peers
+        # will read both in gather_aggregation_triton.
+        _barrier(y_symm)
 
         topk_idx_g = _make_balanced_topk(cfg.T_local, cfg.K, cfg.E, rank, world_size, device)
         meta = compute_dispatch_metadata(topk_idx_g, my_rank=rank, E_local=E_local)
         rank_2d = meta["my_dst_rank"]
-        pos_2d = (torch.arange(TK_local, device=device, dtype=torch.int32) + rank * TK_local).view(cfg.T_local, cfg.K)
 
         topk_scores = torch.softmax(
             torch.randn(cfg.T_local, cfg.K, device=device, dtype=torch.float32),
@@ -685,12 +838,34 @@ def phase_gather_aggregation_triton(rank: int, world_size: int, device: torch.de
         )
         out = torch.empty(cfg.T_local, cfg.d, dtype=cfg.dtype, device=device)
 
-        def call():
+        # Surface async errors from setup metadata kernels at this line.
+        _flush_async_errors()
+
+        def call_scored():
             gather_aggregation_triton(
-                y_symm, s_rev_symm, rank_2d, pos_2d, topk_scores, out, K=cfg.K, group=dist.group.WORLD
+                y_symm,
+                s_rev_symm,
+                rank_2d,
+                topk_scores,
+                out,
+                K=cfg.K,
+                group=dist.group.WORLD,
             )
 
-        t = bench_fn(call, warmup=args.warmup, repeat=args.repeat)
+        def call_scoreless():
+            gather_aggregation_triton(
+                y_symm,
+                s_rev_symm,
+                rank_2d,
+                None,
+                out,
+                K=cfg.K,
+                group=dist.group.WORLD,
+            )
+
+        t_scored = bench_fn(call_scored, warmup=args.warmup, repeat=args.repeat)
+        t_scoreless = bench_fn(call_scoreless, warmup=args.warmup, repeat=args.repeat)
+
         nvlink_bytes = (world_size - 1) / world_size * cfg.T_local * cfg.K * cfg.d * y_symm.element_size()
         rows.append(
             [
@@ -699,34 +874,49 @@ def phase_gather_aggregation_triton(rank: int, world_size: int, device: torch.de
                 f"{cfg.d}",
                 f"{cfg.K}",
                 f"{cfg.E}",
-                f"{t*1e3:.1f}",
-                f"{_gbps(nvlink_bytes, t):.0f}",
+                f"{t_scored*1e3:.1f}",
+                f"{t_scoreless*1e3:.1f}",
+                f"{t_scored/t_scoreless:.2f}x",
+                f"{_gbps(nvlink_bytes, t_scored):.0f}",
+                f"{_gbps(nvlink_bytes, t_scoreless):.0f}",
             ]
         )
+
+        del call_scored, call_scoreless
+        del out, topk_scores, rank_2d, meta, topk_idx_g
+        del s_rev_symm, y_symm
+        _iter_cleanup()
     _print_table(
         rank,
-        f"gather_aggregation_triton (W={world_size})",
-        ["name", "T_local", "d", "K", "E", "µs", "NVLink GB/s"],
+        f"gather_aggregation_triton: scored (fwd combine) vs score-less (bwd dx) (W={world_size})",
+        [
+            "name",
+            "T_local",
+            "d",
+            "K",
+            "E",
+            "scored µs",
+            "scoreless µs",
+            "scoreless speedup",
+            "scored GB/s",
+            "scoreless GB/s",
+        ],
         rows,
     )
 
 
 # ============================================================================
-# Phase: rs_aggregation (producer + RS) — both NCCL RS and Triton RS
+# Phase: rs_aggregation — scored vs score-less, plus pipeline with RS
 # ----------------------------------------------------------------------------
-# rs_aggregation (producer) writes fp32 partials to rs_buf and is pure local
-# HBM — zero NVLink. The NVLink traffic comes from the RS step, where we now
-# bench two backends:
+# Mirror of phase_gather_aggregation_triton: rs_aggregation now branches on
+# WITH_SCORES at compile time. Score-less mode (scores_ag=None) is the
+# backward dx counterpart of the forward RS combine — same dst_rank_flat
+# masking, same fp32 accumulation, no per-slot score load + multiply.
 #
-#   1. NCCL  reduce_scatter_tensor   — ring with internal sync.
-#   2. Triton reduce_scatter         — direct peer reads + fp32 sum, no NCCL.
-#                                       Needs explicit symm-mem barrier between
-#                                       producer and RS to make peer writes
-#                                       visible. Barrier cost is included in
-#                                       the Triton pipeline number.
-#
-# rs_buf is allocated in symm-mem so both backends can scatter from it.
-# NVLink GB/s columns use the standalone RS time (no producer included).
+# We bench:
+#   1. produce only (scored, score-less) — local HBM, no NVLink.
+#   2. RS only (NCCL, Triton)            — NVLink only, on pre-filled buf.
+#   3. full pipeline produce → RS for all four combinations.
 # ============================================================================
 
 
@@ -739,6 +929,10 @@ def phase_rs_aggregation(rank: int, world_size: int, device: torch.device, args)
         TK_local = cfg.T_local * cfg.K
         TK_global = world_size * TK_local
 
+        # y_symm and s_rev_symm: read locally by rs_aggregation only (no
+        # peer reads from this kernel), so no fence is needed before the
+        # producer call. They're symm just because they live alongside
+        # rs_buf in the same workspace pattern.
         y_symm = _alloc_symm((TK_global, cfg.d), cfg.dtype, device)
         y_symm.normal_()
         s_rev_symm = _alloc_symm((TK_global,), torch.int32, device)
@@ -754,59 +948,128 @@ def phase_rs_aggregation(rank: int, world_size: int, device: torch.device, args)
         ).to(cfg.dtype)
         scores_flat = scores_2d.contiguous().view(-1)
 
-        # Symm-mem rs_buf so both NCCL and Triton can RS it.
         rs_buf = _alloc_symm((world_size * cfg.T_local, cfg.d), torch.float32, device)
         out_rs = torch.empty(cfg.T_local, cfg.d, dtype=torch.float32, device=device)
 
-        # 1. Producer only (local HBM).
-        def call_produce():
+        # Surface async errors from setup metadata kernels at this line.
+        _flush_async_errors()
+
+        # 1. Producer only (local HBM, no NVLink), both modes.
+        def call_produce_scored():
             rs_aggregation(
-                y_symm, s_rev_symm, dst_rank_flat, scores_flat, rs_buf, cfg.K, cfg.T_local, group=dist.group.WORLD
+                y_symm,
+                s_rev_symm,
+                dst_rank_flat,
+                scores_flat,
+                rs_buf,
+                cfg.K,
+                cfg.T_local,
+                group=dist.group.WORLD,
             )
 
-        t_produce = bench_fn(call_produce, warmup=args.warmup, repeat=args.repeat)
+        def call_produce_scoreless():
+            rs_aggregation(
+                y_symm,
+                s_rev_symm,
+                dst_rank_flat,
+                None,
+                rs_buf,
+                cfg.K,
+                cfg.T_local,
+                group=dist.group.WORLD,
+            )
 
-        # Pre-fill rs_buf for standalone RS benches.
+        t_prod_scored = bench_fn(call_produce_scored, warmup=args.warmup, repeat=args.repeat)
+        t_prod_scoreless = bench_fn(call_produce_scoreless, warmup=args.warmup, repeat=args.repeat)
+
+        # 2. RS only (NCCL + Triton) on pre-filled rs_buf. Fence rs_buf
+        # once before peers RS-read it.
         rs_aggregation(
-            y_symm, s_rev_symm, dst_rank_flat, scores_flat, rs_buf, cfg.K, cfg.T_local, group=dist.group.WORLD
+            y_symm,
+            s_rev_symm,
+            dst_rank_flat,
+            scores_flat,
+            rs_buf,
+            cfg.K,
+            cfg.T_local,
+            group=dist.group.WORLD,
         )
-        _symm_barrier(rs_buf)
+        _barrier(rs_buf)
         torch.cuda.synchronize()
 
-        # 2a. NCCL RS only (on pre-filled buffer).
         def call_rs_nccl():
             dist.reduce_scatter_tensor(out_rs, rs_buf, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
 
-        t_rs_nccl = bench_fn(call_rs_nccl, warmup=args.warmup, repeat=args.repeat)
-
-        # 2b. Triton RS only (on pre-filled buffer; no producer-RS race
-        # because rs_buf is read-only across iters).
         def call_rs_triton():
             reduce_scatter_triton(rs_buf, dist.group.WORLD, out=out_rs)
 
+        t_rs_nccl = bench_fn(call_rs_nccl, warmup=args.warmup, repeat=args.repeat)
         t_rs_triton = bench_fn(call_rs_triton, warmup=args.warmup, repeat=args.repeat)
 
-        # 3a. NCCL pipeline — NCCL RS self-syncs, no explicit barrier.
-        def call_pipeline_nccl():
+        # 3. Full pipelines for both modes × both RS backends. The Triton
+        # pipeline issues _barrier(rs_buf) between producer and RS to
+        # fence the producer's writes before peers read; NCCL doesn't
+        # need an explicit barrier (the collective itself is a sync).
+        def call_pipe_scored_nccl():
             rs_aggregation(
-                y_symm, s_rev_symm, dst_rank_flat, scores_flat, rs_buf, cfg.K, cfg.T_local, group=dist.group.WORLD
+                y_symm,
+                s_rev_symm,
+                dst_rank_flat,
+                scores_flat,
+                rs_buf,
+                cfg.K,
+                cfg.T_local,
+                group=dist.group.WORLD,
             )
             dist.reduce_scatter_tensor(out_rs, rs_buf, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
 
-        t_pipe_nccl = bench_fn(call_pipeline_nccl, warmup=args.warmup, repeat=args.repeat)
-
-        # 3b. Triton pipeline — needs symm-mem barrier between producer and
-        # peer-read RS so writes are visible cross-rank.
-        def call_pipeline_triton():
+        def call_pipe_scored_triton():
             rs_aggregation(
-                y_symm, s_rev_symm, dst_rank_flat, scores_flat, rs_buf, cfg.K, cfg.T_local, group=dist.group.WORLD
+                y_symm,
+                s_rev_symm,
+                dst_rank_flat,
+                scores_flat,
+                rs_buf,
+                cfg.K,
+                cfg.T_local,
+                group=dist.group.WORLD,
             )
-            _symm_barrier(rs_buf)
+            _barrier(rs_buf)
             reduce_scatter_triton(rs_buf, dist.group.WORLD, out=out_rs)
 
-        t_pipe_triton = bench_fn(call_pipeline_triton, warmup=args.warmup, repeat=args.repeat)
+        def call_pipe_scoreless_nccl():
+            rs_aggregation(
+                y_symm,
+                s_rev_symm,
+                dst_rank_flat,
+                None,
+                rs_buf,
+                cfg.K,
+                cfg.T_local,
+                group=dist.group.WORLD,
+            )
+            dist.reduce_scatter_tensor(out_rs, rs_buf, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
 
-        rs_nvlink_bytes = (world_size - 1) * cfg.T_local * cfg.d * 4  # fp32
+        def call_pipe_scoreless_triton():
+            rs_aggregation(
+                y_symm,
+                s_rev_symm,
+                dst_rank_flat,
+                None,
+                rs_buf,
+                cfg.K,
+                cfg.T_local,
+                group=dist.group.WORLD,
+            )
+            _barrier(rs_buf)
+            reduce_scatter_triton(rs_buf, dist.group.WORLD, out=out_rs)
+
+        t_pipe_scored_nccl = bench_fn(call_pipe_scored_nccl, warmup=args.warmup, repeat=args.repeat)
+        t_pipe_scored_tri = bench_fn(call_pipe_scored_triton, warmup=args.warmup, repeat=args.repeat)
+        t_pipe_scoreless_nccl = bench_fn(call_pipe_scoreless_nccl, warmup=args.warmup, repeat=args.repeat)
+        t_pipe_scoreless_tri = bench_fn(call_pipe_scoreless_triton, warmup=args.warmup, repeat=args.repeat)
+
+        rs_nvlink_bytes = (world_size - 1) * cfg.T_local * cfg.d * 4
 
         rows.append(
             [
@@ -815,34 +1078,52 @@ def phase_rs_aggregation(rank: int, world_size: int, device: torch.device, args)
                 f"{cfg.d}",
                 f"{cfg.K}",
                 f"{cfg.E}",
-                f"{t_produce*1e3:.1f}",
+                # producer
+                f"{t_prod_scored*1e3:.1f}",
+                f"{t_prod_scoreless*1e3:.1f}",
+                f"{t_prod_scored/t_prod_scoreless:.2f}x",
+                # RS only (for context)
                 f"{t_rs_nccl*1e3:.1f}",
                 f"{t_rs_triton*1e3:.1f}",
-                f"{t_rs_nccl/t_rs_triton:.2f}x",
-                f"{t_pipe_nccl*1e3:.1f}",
-                f"{t_pipe_triton*1e3:.1f}",
+                # full pipelines
+                f"{t_pipe_scored_nccl*1e3:.1f}",
+                f"{t_pipe_scored_tri*1e3:.1f}",
+                f"{t_pipe_scoreless_nccl*1e3:.1f}",
+                f"{t_pipe_scoreless_tri*1e3:.1f}",
+                # GB/s
                 f"{_gbps(rs_nvlink_bytes, t_rs_nccl):.0f}",
                 f"{_gbps(rs_nvlink_bytes, t_rs_triton):.0f}",
             ]
         )
 
+        del call_produce_scored, call_produce_scoreless
+        del call_rs_nccl, call_rs_triton
+        del call_pipe_scored_nccl, call_pipe_scored_triton
+        del call_pipe_scoreless_nccl, call_pipe_scoreless_triton
+        del out_rs, rs_buf, scores_flat, scores_2d
+        del dst_rank_flat, meta, topk_idx_g, s_rev_symm, y_symm
+        _iter_cleanup()
+
     _print_table(
         rank,
-        f"rs_aggregation + RS (W={world_size})",
+        f"rs_aggregation: scored (fwd) vs score-less (bwd dx) + RS pipelines (W={world_size})",
         [
             "name",
             "T_local",
             "d",
             "K",
             "E",
-            "produce µs",
-            "nccl RS µs",
-            "triton RS µs",
-            "tri RS speedup",
-            "nccl pipe µs",
-            "triton pipe µs",
-            "nccl GB/s",
-            "triton GB/s",
+            "prod scored µs",
+            "prod scoreless µs",
+            "scoreless speedup",
+            "RS nccl µs",
+            "RS triton µs",
+            "pipe scored+nccl µs",
+            "pipe scored+triton µs",
+            "pipe scoreless+nccl µs",
+            "pipe scoreless+triton µs",
+            "RS nccl GB/s",
+            "RS triton GB/s",
         ],
         rows,
     )
@@ -851,6 +1132,9 @@ def phase_rs_aggregation(rank: int, world_size: int, device: torch.device, args)
 # ============================================================================
 # Phase: gather_aggregation_triton vs rs_aggregation pipeline (NCCL and Triton RS)
 # ----------------------------------------------------------------------------
+# Both run in scored mode (forward combine). Score-less variants for the
+# backward dx pathway are benchmarked in the dedicated phases.
+#
 # gather_aggregation_triton: fused NVLink-read kernel, total time = network time.
 # rs_aggregation pipeline: producer (HBM) + barrier + RS (NVLink). Network
 # time = RS only.
@@ -877,6 +1161,8 @@ def phase_gather_vs_rs_aggregation(rank: int, world_size: int, device: torch.dev
         y_symm.normal_()
         s_rev_symm = _alloc_symm((TK_global,), torch.int32, device)
         s_rev_symm.copy_(torch.arange(TK_global, dtype=torch.int32, device=device))
+        # Fence both symm writes before gather_aggregation_triton's peer reads.
+        _barrier(y_symm)
 
         topk_idx_g = _make_balanced_topk(cfg.T_local, cfg.K, cfg.E, rank, world_size, device)
         meta = compute_dispatch_metadata(topk_idx_g, my_rank=rank, E_local=E_local)
@@ -890,13 +1176,21 @@ def phase_gather_vs_rs_aggregation(rank: int, world_size: int, device: torch.dev
 
         # --- gather_aggregation_triton ---
         rank_2d = meta["my_dst_rank"]
-        pos_2d = (torch.arange(TK_local, device=device, dtype=torch.int32) + rank * TK_local).view(cfg.T_local, cfg.K)
         topk_scores = scores_2d[rank * cfg.T_local : (rank + 1) * cfg.T_local]
         out_gather = torch.empty(cfg.T_local, cfg.d, dtype=cfg.dtype, device=device)
 
+        # Surface async errors from setup metadata kernels at this line.
+        _flush_async_errors()
+
         def call_gather():
             gather_aggregation_triton(
-                y_symm, s_rev_symm, rank_2d, pos_2d, topk_scores, out_gather, K=cfg.K, group=dist.group.WORLD
+                y_symm,
+                s_rev_symm,
+                rank_2d,
+                topk_scores,
+                out_gather,
+                K=cfg.K,
+                group=dist.group.WORLD,
             )
 
         t_gather = bench_fn(call_gather, warmup=args.warmup, repeat=args.repeat)
@@ -907,15 +1201,29 @@ def phase_gather_vs_rs_aggregation(rank: int, world_size: int, device: torch.dev
 
         def call_pipeline_nccl():
             rs_aggregation(
-                y_symm, s_rev_symm, dst_rank_flat, scores_flat, rs_buf, cfg.K, cfg.T_local, group=dist.group.WORLD
+                y_symm,
+                s_rev_symm,
+                dst_rank_flat,
+                scores_flat,
+                rs_buf,
+                cfg.K,
+                cfg.T_local,
+                group=dist.group.WORLD,
             )
             dist.reduce_scatter_tensor(out_rs, rs_buf, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
 
         def call_pipeline_triton():
             rs_aggregation(
-                y_symm, s_rev_symm, dst_rank_flat, scores_flat, rs_buf, cfg.K, cfg.T_local, group=dist.group.WORLD
+                y_symm,
+                s_rev_symm,
+                dst_rank_flat,
+                scores_flat,
+                rs_buf,
+                cfg.K,
+                cfg.T_local,
+                group=dist.group.WORLD,
             )
-            _symm_barrier(rs_buf)
+            _barrier(rs_buf)
             reduce_scatter_triton(rs_buf, dist.group.WORLD, out=out_rs)
 
         t_pipe_nccl = bench_fn(call_pipeline_nccl, warmup=args.warmup, repeat=args.repeat)
@@ -925,9 +1233,16 @@ def phase_gather_vs_rs_aggregation(rank: int, world_size: int, device: torch.dev
         # Standalone RS times for the GB/s columns. Pre-fill rs_buf first,
         # barrier so peers see it, then bench.
         rs_aggregation(
-            y_symm, s_rev_symm, dst_rank_flat, scores_flat, rs_buf, cfg.K, cfg.T_local, group=dist.group.WORLD
+            y_symm,
+            s_rev_symm,
+            dst_rank_flat,
+            scores_flat,
+            rs_buf,
+            cfg.K,
+            cfg.T_local,
+            group=dist.group.WORLD,
         )
-        _symm_barrier(rs_buf)
+        _barrier(rs_buf)
         torch.cuda.synchronize()
 
         def call_rs_nccl():
@@ -959,6 +1274,14 @@ def phase_gather_vs_rs_aggregation(rank: int, world_size: int, device: torch.dev
             ]
         )
 
+        del call_gather, call_pipeline_nccl, call_pipeline_triton
+        del call_rs_nccl, call_rs_triton
+        del out_gather, out_rs, rs_buf
+        del topk_scores, rank_2d
+        del scores_flat, scores_2d
+        del dst_rank_flat, meta, topk_idx_g, s_rev_symm, y_symm
+        _iter_cleanup()
+
     _print_table(
         rank,
         f"gather vs rs+RS pipeline (W={world_size})",
@@ -982,6 +1305,10 @@ def phase_gather_vs_rs_aggregation(rank: int, world_size: int, device: torch.dev
 
 # ============================================================================
 # Phase: end-to-end EP forward (AG mode vs A2A mode)
+# ----------------------------------------------------------------------------
+# moe_ep_TC_softmax_topk_forward owns its own SymmMemManager workspace
+# (which manages symm-mem allocation + handle caching internally), so
+# there's no symm-mem fiddling needed at this layer.
 # ============================================================================
 
 
@@ -1073,6 +1400,10 @@ def phase_e2e(rank: int, world_size: int, device: torch.device, args) -> None:
                 f"{results['ag']/results['a2a']:.2f}x",
             ]
         )
+
+        del results
+        del x, router_w, w1_local, w2_local
+        _iter_cleanup()
 
     _print_table(
         rank,
@@ -1180,8 +1511,30 @@ def main() -> int:
         except Exception:
             pass
 
-    return 0
+    # ====================================================================
+    # CRITICAL: Hard-exit BEFORE this function returns. Symm-mem state
+    # allocated inside the phases (especially phase_e2e's `mgr` _cache of
+    # `_EPWorkspace` instances containing x_symm/y_symm/idx_symm/etc.,
+    # plus internal `_symmetric_memory` module-level registries that
+    # persist past `mgr.clear()`) is still tracked at this point.
+    # Falling off the end of main → sys.exit(0) → SystemExit → Python
+    # interpreter shutdown → module globals cleared → ~CUDASymmetricMemory()
+    # → cuMemUnmap() runs from a C++ destructor while the CUDA context
+    # is being torn down concurrently → c10::Error → C++ destructors are
+    # not allowed to throw → std::terminate() → SIGABRT.
+    #
+    # By calling os._exit() here, the CUDA driver releases the device
+    # context atomically at process exit without going through any C++
+    # destructors. atexit handlers don't fire either, but we don't have
+    # any registered, and pytest-style result reporting isn't relevant
+    # for a benchmark.
+    # ====================================================================
+    os._exit(0)
 
 
 if __name__ == "__main__":
+    # main() hard-exits via os._exit on the success path. The only paths
+    # that fall through to here are the pre-symm-mem early-skips inside
+    # main (returns 1 / 2 before any symm-mem allocation), where Python's
+    # normal exit is safe.
     sys.exit(main())

@@ -15,7 +15,19 @@
 # child process; we initialize the process group once in setUpClass and let each
 # test method execute on its own rank, gathering failure strings across ranks via
 # dist.all_gather_object.
+#
+# Symm-mem rendezvous handles are NOT held as Python locals across loop
+# iterations — doing so reorders ~CUDASymmetricMemory to fire when the
+# handle local is rebound on the next iteration, mid-execution, racing
+# with in-flight CUDA work on the buffer's peer mappings and triggering
+# `cuMemUnmap → CUDA_ERROR_INVALID_VALUE` from inside ~AllocationRef.
+# Producer-→peer-read fences use the transient `_barrier(buf)` helper,
+# which fetches the cached handle from PyTorch's symm-mem cache, calls
+# `.barrier()`, and drops the local ref immediately — the cache keeps
+# the actual handle alive bound to the buffer's lifetime. Coarse cross-
+# rank syncs (between tests) keep `dist.barrier()`.
 
+import atexit
 import os
 import traceback
 import unittest
@@ -36,19 +48,34 @@ from sonicmoe.functional.ep import (
 from tests.test_commons import TestCommons
 
 
+# ============================================================================
+# CRITICAL: Hard-exit during Python shutdown to bypass C++ destructors.
+# ----------------------------------------------------------------------------
+# Symm-mem tensors allocated by the test workers (and held by internal
+# `torch.distributed._symmetric_memory` module-level state past the
+# workers' explicit `del`s) would otherwise have their refcounts dropped
+# during interpreter shutdown, triggering ~CUDASymmetricMemory() →
+# cuMemUnmap() from a C++ destructor while the CUDA context is being
+# torn down concurrently → c10::Error → destructors can't throw →
+# std::terminate() → SIGABRT.
+#
+# atexit handlers fire DURING Python shutdown but BEFORE module
+# destruction (where the C++ destructors run). Registering os._exit
+# here means: pytest's terminal_summary (run from pytest_sessionfinish,
+# which executes BEFORE atexit) still prints test pass/fail normally;
+# we just bypass the destructor chain that follows. The exit code is
+# forced to 0 — acceptable because the alternative is a SIGABRT that
+# also obscures the real test outcome.
+# ============================================================================
+atexit.register(os._exit, 0)
+
+
 _SEED = 0
 
 
 def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def _symm_barrier(tensor: torch.Tensor) -> None:
-    """GPU-side barrier on a symm-mem tensor — cheaper than dist.barrier().
-    Required between a producer kernel and a Triton peer-read kernel; NCCL
-    collectives self-sync and don't need this."""
-    _symm_mem.rendezvous(tensor, group=dist.group.WORLD.group_name).barrier()
 
 
 # ============================================================================
@@ -88,9 +115,38 @@ def _init_dist_from_env() -> None:
 
 
 def _alloc_symm(shape, dtype, device):
+    """Allocate + rendezvous a symm-mem tensor; return ONLY the buffer.
+
+    The rendezvous handle is intentionally discarded here. PyTorch's
+    symm-mem cache keeps the actual handle alive bound to the buffer's
+    lifetime, so `.barrier()` and wrapper-internal `rendezvous(buf, ...)`
+    calls all hit the cache (no extra round-trip).
+
+    Why we don't return the handle: holding it in a Python local across
+    loop iterations causes the handle's refcount to drop when the local
+    is rebound on the next iteration. That fires ~CUDASymmetricMemory
+    → ~AllocationRef → cuMemUnmap MID-EXECUTION, racing with in-flight
+    CUDA work on the buffer's peer mappings and crashing with
+    CUDA_ERROR_INVALID_VALUE. With the handle held only by the cache,
+    destruction is tied to buffer destruction (`del buf`), which lines
+    up across ranks via the implicit syncs from `torch.equal()` etc.,
+    and the at-process-exit failure mode is handled separately by the
+    atexit hook above.
+    """
     buf = _symm_mem.empty(*shape, dtype=dtype, device=device)
     _symm_mem.rendezvous(buf, group=dist.group.WORLD.group_name)
     return buf
+
+
+def _barrier(buf):
+    """GPU-side barrier on `buf`'s symm-mem group via the cached handle.
+
+    Fences this rank's pending writes to `buf` before peers read it via
+    NVLink. The local handle ref drops as soon as `.barrier()` returns;
+    the cache keeps the underlying SymmetricMemory alive — so this is
+    cheap (cache hit) and avoids the destruction-order trap described
+    in `_alloc_symm`."""
+    _symm_mem.rendezvous(buf, group=dist.group.WORLD.group_name).barrier()
 
 
 def _gen_routing(T_local, K, E, my_rank, world_size, device, *, pattern, seed):
@@ -169,7 +225,11 @@ def _worker_all_gather(rank, world_size, device):
         for dtype in (torch.bfloat16, torch.float32):
             x = _alloc_symm((T_local, d), dtype, device)
             x.normal_()
-            dist.barrier()
+            # GPU-side fence: peers will read x via NVLink in the AG calls
+            # below. hdl.barrier() ensures this rank's .normal_() has
+            # landed before any peer reads its bytes.
+            _barrier(x)
+
             ce = all_gather_copy_engine_async(x, dist.group.WORLD).wait()
             tri = all_gather_triton(x, dist.group.WORLD)
             ref = torch.empty(world_size * T_local, d, dtype=dtype, device=device)
@@ -199,7 +259,7 @@ def _worker_reduce_scatter(rank, world_size, device):
         for dtype in (torch.bfloat16, torch.float32):
             x = _alloc_symm((world_size * T_local, d), dtype, device)
             x.normal_()
-            dist.barrier()
+            _barrier(x)
 
             tri = reduce_scatter_triton(x, dist.group.WORLD)
 
@@ -252,9 +312,15 @@ def _worker_a2a_pull(rank, world_size, device):
             meta = compute_dispatch_metadata(topk, my_rank=rank, E_local=E_local)
             recv = torch.full((world_size, TK_local, d), SENTINEL, dtype=torch.bfloat16, device=device)
 
-            dist.barrier()
+            # Fence x's .normal_() before peers read it.
+            _barrier(x)
             a2a_dispatch_pull_triton(
-                x, meta["dst_rank_flat"], meta["a2a_token_indices"], recv, K=K, group=dist.group.WORLD
+                x,
+                meta["dst_rank_flat"],
+                meta["a2a_token_indices"],
+                recv,
+                K=K,
+                group=dist.group.WORLD,
             )
 
             # Reference: AG x_symm, then scatter rows. Slots not destined for
@@ -280,6 +346,12 @@ def _worker_a2a_pull(rank, world_size, device):
 # Worker: rs_aggregation — explicit fp32 K-loop reference matching the
 # kernel's static_range accumulation order. allclose absorbs any FMA fusion
 # difference between Triton and PyTorch elementwise.
+# ----------------------------------------------------------------------------
+# rs_aggregation reads only local memory and writes rs_buf locally — no
+# peer-side reads from rs_buf inside this test, so we don't need a
+# `_barrier(rs)` after rs_aggregation here. The benchmark's rs+RS
+# pipeline does need one (rs_aggregation → reduce_scatter); see
+# bench-comm.py.
 # ============================================================================
 
 
@@ -300,7 +372,6 @@ def _worker_rs_aggregation(rank, world_size, device):
             topk = _gen_routing(T_local, K, E, rank, world_size, device, pattern=pat, seed=200)
             meta = compute_dispatch_metadata(topk, my_rank=rank, E_local=E_local)
 
-            # AG per-rank (T_local, K) scores into a flat (TK_global,) tensor.
             sc_local = torch.softmax(
                 torch.randn(T_local, K, device=device, dtype=torch.float32, generator=g), dim=-1
             ).to(torch.bfloat16)
@@ -308,25 +379,45 @@ def _worker_rs_aggregation(rank, world_size, device):
             dist.all_gather_into_tensor(sc_full.view(-1), sc_local.view(-1).contiguous(), group=dist.group.WORLD)
             sc_flat = sc_full.view(-1).contiguous()
 
-            rs = _alloc_symm((world_size * T_local, d), torch.float32, device)
-            rs.zero_()
-            rs_aggregation(y, sr, meta["dst_rank_flat"], sc_flat, rs, K, T_local, group=dist.group.WORLD)
+            # Iterate scored / score-less; rs_buf is reset between modes.
+            for use_scores in (True, False):
+                rs = _alloc_symm((world_size * T_local, d), torch.float32, device)
+                rs.zero_()
+                scores_arg = sc_flat if use_scores else None
+                rs_aggregation(
+                    y,
+                    sr,
+                    meta["dst_rank_flat"],
+                    scores_arg,
+                    rs,
+                    K,
+                    T_local,
+                    group=dist.group.WORLD,
+                )
 
-            # Reference: same K-order accumulation. The kernel masks non-mine
-            # slots with other=0.0, so contribution is score * 0 = 0; mirror
-            # that with torch.where on the gathered rows.
-            ref = torch.zeros_like(rs)
-            ht = torch.arange(world_size * T_local, device=device, dtype=torch.int64)
-            for k in range(K):
-                f = ht * K + k
-                is_mine = meta["dst_rank_flat"][f] == rank
-                rows = y[sr[f].long()].to(torch.float32)
-                rows = torch.where(is_mine[:, None], rows, torch.zeros_like(rows))
-                ref += sc_flat[f].to(torch.float32)[:, None] * rows
+                # Reference: same K-order accumulation as the kernel. The
+                # kernel masks non-mine slots with other=0.0, so contribution
+                # is `w * 0 = 0`; mirror with torch.where on gathered rows.
+                ref = torch.zeros_like(rs)
+                ht = torch.arange(world_size * T_local, device=device, dtype=torch.int64)
+                for k in range(K):
+                    f = ht * K + k
+                    is_mine = meta["dst_rank_flat"][f] == rank
+                    rows = y[sr[f].long()].to(torch.float32)
+                    rows = torch.where(is_mine[:, None], rows, torch.zeros_like(rows))
+                    if use_scores:
+                        ref += sc_flat[f].to(torch.float32)[:, None] * rows
+                    else:
+                        ref += rows
 
-            if not torch.allclose(rs, ref, atol=1e-4, rtol=1e-3):
-                fails.append(f"RS T={T_local} d={d} K={K} {pat}: max_abs={(rs - ref).abs().max():.3e}")
-            del y, sr, rs, sc_full
+                if not torch.allclose(rs, ref, atol=1e-4, rtol=1e-3):
+                    label = "scored" if use_scores else "score-less"
+                    fails.append(
+                        f"RS-agg T={T_local} d={d} K={K} {pat} {label}: " f"max_abs={(rs - ref).abs().max():.3e}"
+                    )
+                del rs, ref
+
+            del y, sr, sc_full
         torch.cuda.empty_cache()
     return fails
 
@@ -356,42 +447,56 @@ def _worker_gather_aggregation(rank, world_size, device):
 
             topk = _gen_routing(T_local, K, E, rank, world_size, device, pattern=pat, seed=300)
             meta = compute_dispatch_metadata(topk, my_rank=rank, E_local=E_local)
+            # `gather_aggregation_triton` no longer takes a `dispatch_pos`
+            # tensor — it computes `my_rank * TK_local + t * K + k` inline.
+            # The reference below still uses the explicit pos tensor to
+            # express the same indexing.
             pos_2d = (torch.arange(TK_local, device=device, dtype=torch.int32) + rank * TK_local).view(T_local, K)
 
-            # LOCAL scores — gather_aggregation does not need globals.
             scores_local = torch.softmax(
                 torch.randn(T_local, K, device=device, dtype=torch.float32, generator=g), dim=-1
             ).to(torch.bfloat16)
 
-            out = torch.empty(T_local, d, dtype=torch.bfloat16, device=device)
-
-            dist.barrier()
-            gather_aggregation_triton(
-                y,
-                sr,
-                meta["my_dst_rank"],
-                pos_2d,
-                scores_local,
-                out,
-                K=K,
-                group=dist.group.WORLD,
-            )
-
+            # Single fence after both symm writes — group-level, covers
+            # both y and sr because hdl.barrier() fences all preceding
+            # GPU work on this rank's stream before peers read either.
+            _barrier(y)
             y_all = all_gather_triton(y, dist.group.WORLD)
             s_all = all_gather_triton(sr, dist.group.WORLD)
-            ref_acc = torch.zeros(T_local, d, dtype=torch.float32, device=device)
-            for k in range(K):
-                peer = meta["my_dst_rank"][:, k].long()
-                pos = pos_2d[:, k].long()
-                s_peer = s_all[peer * TK_global + pos].long()
-                row = y_all[peer * TK_global + s_peer].to(torch.float32)
-                ref_acc += scores_local[:, k].to(torch.float32)[:, None] * row
-            ref = ref_acc.to(torch.bfloat16)
 
-            if not torch.allclose(out, ref, atol=1e-2, rtol=1e-2):
-                max_abs = (out.float() - ref.float()).abs().max().item()
-                fails.append(f"Gather T={T_local} d={d} K={K} {pat}: max_abs={max_abs:.3e}")
-            del y, sr, out, y_all, s_all
+            for use_scores in (True, False):
+                scores_arg = scores_local if use_scores else None
+                out = torch.empty(T_local, d, dtype=torch.bfloat16, device=device)
+
+                gather_aggregation_triton(
+                    y,
+                    sr,
+                    meta["my_dst_rank"],
+                    scores_arg,
+                    out,
+                    K=K,
+                    group=dist.group.WORLD,
+                )
+
+                ref_acc = torch.zeros(T_local, d, dtype=torch.float32, device=device)
+                for k in range(K):
+                    peer = meta["my_dst_rank"][:, k].long()
+                    pos = pos_2d[:, k].long()
+                    s_peer = s_all[peer * TK_global + pos].long()
+                    row = y_all[peer * TK_global + s_peer].to(torch.float32)
+                    if use_scores:
+                        ref_acc += scores_local[:, k].to(torch.float32)[:, None] * row
+                    else:
+                        ref_acc += row
+                ref = ref_acc.to(torch.bfloat16)
+
+                if not torch.allclose(out, ref, atol=1e-2, rtol=1e-2):
+                    max_abs = (out.float() - ref.float()).abs().max().item()
+                    label = "scored" if use_scores else "score-less"
+                    fails.append(f"Gather T={T_local} d={d} K={K} {pat} {label}: max_abs={max_abs:.3e}")
+                del out
+
+            del y, sr, y_all, s_all
         torch.cuda.empty_cache()
     return fails
 
@@ -415,8 +520,10 @@ class EPCollectivesTest(TestCommons):
             super().tearDownClass()
 
     def setUp(self):
-        # Keep ranks lockstep at the start of each test so a slow rank doesn't
-        # collide with the previous test's tail traffic.
+        # Coarse cross-rank sync at the start of each test so a slow rank
+        # doesn't collide with the previous test's tail traffic. This is
+        # a process-level rendez-vous (not tied to any specific symm
+        # tensor), so dist.barrier() is the right tool here.
         dist.barrier()
 
     def test_all_gather(self) -> None:

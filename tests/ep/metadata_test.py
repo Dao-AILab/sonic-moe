@@ -44,11 +44,17 @@ def _ref_compute_dispatch_metadata(topk_idx_g: torch.Tensor, my_rank: int, E_loc
     s, e = my_rank * TK_local, (my_rank + 1) * TK_local
     my_dst = dst[s:e].view(T_local, K)
 
-    # expert_local_padded: real local expert when dst == my_rank,
-    # sentinel (global_idx % E_local) otherwise.
+    # expert_local_padded: real local expert when dst == my_rank, OOB
+    # sentinel (== E_local) otherwise. Downstream
+    # general_routing_router_metadata_triton interprets values >= E_local
+    # as "padding bucket" and routes them to expert_frequency_offset[E_local]
+    # so they don't pollute any real expert's row count.
     local_exp = (flat - dst.long() * E_local).to(torch.int32)
-    sentinel = (torch.arange(TK_global, device=device) % E_local).to(torch.int32)
-    expert_local_padded = torch.where(dst == my_rank, local_exp, sentinel)
+    expert_local_padded = torch.where(
+        dst == my_rank,
+        local_exp,
+        torch.full_like(local_exp, E_local),
+    )
 
     # a2a_token_indices: src_rank * TK_local + slot_per_rank.
     a2a_token_indices = (r_idx * TK_local + slot_pr.long()).to(torch.int32)
@@ -104,6 +110,36 @@ def _assert_slot_global_permutation(test_case: TestCommons, out: dict, W: int):
         )
 
 
+def _assert_padded_sentinel(test_case: TestCommons, out: dict, my_rank: int, E_local: int):
+    """expert_local_padded must be:
+       - in [0, E_local) at slots where dst == my_rank, equal to expert_global % E_local
+       - exactly E_local everywhere else (the OOB sentinel consumed by
+         general_routing_router_metadata_triton).
+
+    Independent of the reference function — guards the semantic contract
+    rather than just self-consistency."""
+    dst = out["dst_rank_flat"]
+    padded = out["expert_local_padded"]
+    is_mine = dst == my_rank
+
+    # Sentinel slots: every non-mine entry must be exactly E_local.
+    sentinel_vals = padded[~is_mine]
+    if sentinel_vals.numel() > 0:
+        test_case.assertTrue(
+            torch.all(sentinel_vals == E_local),
+            f"sentinel value mismatch: expected all == {E_local}, "
+            f"got min={sentinel_vals.min().item()}, max={sentinel_vals.max().item()}",
+        )
+
+    # Mine slots: in-range and equal to my_expert_local flattened.
+    mine_vals = padded[is_mine]
+    if mine_vals.numel() > 0:
+        test_case.assertTrue(
+            torch.all((mine_vals >= 0) & (mine_vals < E_local)),
+            f"mine values out of range [0, {E_local}): " f"min={mine_vals.min().item()}, max={mine_vals.max().item()}",
+        )
+
+
 class DispatchMetadataTest(TestCommons):
     @parameterized.expand(
         TestCommons.make_args_matrix(
@@ -146,6 +182,7 @@ class DispatchMetadataTest(TestCommons):
             out = compute_dispatch_metadata(topk, my_rank=my_rank, E_local=E_local)
             _assert_metadata_equal(self, out, ref)
             _assert_slot_global_permutation(self, out, W)
+            _assert_padded_sentinel(self, out, my_rank, E_local)
 
     def test_all_to_peer_0(self) -> None:
         """Every slot routes to peer 0 — degenerate distribution."""
@@ -159,12 +196,14 @@ class DispatchMetadataTest(TestCommons):
             out = compute_dispatch_metadata(topk, my_rank=my_rank, E_local=E_local)
             _assert_metadata_equal(self, out, ref)
             _assert_slot_global_permutation(self, out, W)
+            _assert_padded_sentinel(self, out, my_rank, E_local)
 
         self.assertEqual(out["peer_count_per_rank"][:, 0].sum().item(), W * T_local * K)
         self.assertEqual(out["peer_count_per_rank"][:, 1:].sum().item(), 0)
 
     def test_none_to_me(self) -> None:
-        """All routing goes to peer 0; my_rank=1 receives nothing."""
+        """All routing goes to peer 0; my_rank=1 receives nothing.
+        Every entry of expert_local_padded must equal the OOB sentinel."""
         _set_seed(_SEED)
         W, T_local, K, E_local = 4, 256, 4, 16
         device = torch.device("cuda")
@@ -175,13 +214,19 @@ class DispatchMetadataTest(TestCommons):
         out = compute_dispatch_metadata(topk, my_rank=my_rank, E_local=E_local)
         _assert_metadata_equal(self, out, ref)
         _assert_slot_global_permutation(self, out, W)
+        _assert_padded_sentinel(self, out, my_rank, E_local)
 
         self.assertEqual(out["peer_count_per_rank"][:, my_rank].sum().item(), 0)
 
-        # expert_local_padded should be all sentinels for my_rank=1
-        # (nothing routes to rank 1).
+        # Nothing routes to rank 1, so dst is never my_rank.
         dst = out["dst_rank_flat"]
         self.assertEqual((dst == my_rank).sum().item(), 0)
+
+        # Stronger: every entry of expert_local_padded must be E_local.
+        self.assertTrue(
+            torch.all(out["expert_local_padded"] == E_local),
+            "expected all sentinel values == E_local when nothing routes to my_rank",
+        )
 
     def test_all_to_last_peer(self) -> None:
         """Every slot routes to the highest-numbered peer."""
@@ -196,6 +241,7 @@ class DispatchMetadataTest(TestCommons):
         out = compute_dispatch_metadata(topk, my_rank=my_rank, E_local=E_local)
         _assert_metadata_equal(self, out, ref)
         _assert_slot_global_permutation(self, out, W)
+        _assert_padded_sentinel(self, out, my_rank, E_local)
 
         self.assertEqual(out["peer_count_per_rank"][:, W - 1].sum().item(), W * T_local * K)
 
@@ -233,3 +279,4 @@ class DispatchMetadataTest(TestCommons):
                 f"seed={seed} W={W} T={T_local} K={K} E_l={E_local} my_rank={my_rank}: mismatch",
             )
             _assert_slot_global_permutation(self, out, W)
+            _assert_padded_sentinel(self, out, my_rank, E_local)
