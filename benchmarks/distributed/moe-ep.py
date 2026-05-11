@@ -5,10 +5,12 @@
 # with local (non-EP) baselines for exposed network latency estimation.
 #
 # T in --thiek is the GLOBAL token count; each rank processes T // W tokens.
-# Reported EP wall-times are MAX across ranks (slowest rank dictates collective
-# throughput). Local baselines run independently per rank and are reported from
-# rank 0. TFLOPS use the global token count for EP and per-rank/full token count
-# for local, so numbers are directly comparable in the summary table.
+# Reported EP wall-times are rank-0's measured time; the NCCL collectives
+# inside the EP forward implicitly serialize all ranks, so rank 0's time
+# tracks the slowest-rank latency. Local baselines run independently per rank
+# and are reported from rank 0. TFLOPS use the global token count for EP and
+# per-rank / full token count for local, so numbers are directly comparable
+# in the summary table.
 #
 # Backward correctness: a single-GPU autograd reference (token-by-expert loop
 # computed in pure bf16, mirroring the EP precision exactly) is built on rank
@@ -18,10 +20,15 @@
 # partial drouter_w from its slice of x), dW1/dW2/db1/db2 via gather then
 # concat — and compared against the reference per-tensor.
 #
+# Mode selection: the bench profiles with ``NetworkProfiler`` to pick both
+# the dispatch mode and the combine mode at runtime. ``--mode`` and
+# ``--agg_mode``, when given, override the profiler's pick (useful for
+# isolating a specific primitive or reproducing a prior run).
+#
 # Launch with torchrun:
 #
 #   torchrun --nproc-per-node=8 --standalone \
-#       benchmarks/ep/moe-ep.py --thiek 131072,4096,1536,128,8
+#       benchmarks/distributed/moe-ep.py --thiek 131072,4096,1536,128,8
 # ********************************************************************************
 
 import argparse
@@ -31,9 +38,67 @@ import sys
 import time
 from functools import partial
 
+import quack.autotuner
+import torch
+
+
+# !!!!!!!! sometimes there is a broken pipe issue when QuACK compile worker > 1 !!!!!!!!
+os.environ["QUACK_COMPILE_WORKERS"] = "1"
+
+
+# ─────────────── Monkey-patch: similar M shapes map to the same cached config during QuACK autotuning ───────────────
+
+M_QUANT = 4096
+
+
+def _make_quantized_key(self, args, kwargs):
+    all_args = {**dict(zip(self.arg_names, args)), **kwargs}
+    _args = {k: v for k, v in all_args.items() if k in self.arg_names}
+    key = [str(_args[k]) for k in self.keys if k in _args]
+    for _, arg in _args.items():
+        if isinstance(arg, torch.Tensor):
+            s = list(arg.shape)
+            # Quantize the M (first) dimension
+            if s and s[0] >= M_QUANT:
+                s[0] = ((s[0] + M_QUANT - 1) // M_QUANT) * M_QUANT
+            key.append(str(tuple(s)))
+            key.append(str([x if x in {0, 1} else 2 for x in arg.stride()]))
+            key.append(str(arg.dtype))
+    return tuple(key)
+
+
+_orig_call = quack.autotuner.Autotuner.__call__
+
+
+@torch.compiler.disable
+def _patched_call(self, *args, **kwargs):
+    if len(self.configs) > 1:
+        qkey = _make_quantized_key(self, args, kwargs)
+        if qkey in self.cache:
+            # Cache hit on quantized key — skip autotuning
+            config = self.cache[qkey]
+            self.best_config = config
+            self.nargs = dict(zip(self.arg_names, args))
+            ret = self.fn.__call__(*args, **kwargs, **config.all_kwargs())
+            self.nargs = None
+            return ret
+
+    # Cache miss — fall through to original autotuning
+    ret = _orig_call(self, *args, **kwargs)
+
+    # Store result under quantized key so future similar-M calls hit cache
+    if len(self.configs) > 1 and hasattr(self, "best_config"):
+        qkey = _make_quantized_key(self, args, kwargs)
+        self.cache[qkey] = self.best_config
+
+    return ret
+
+
+quack.autotuner.Autotuner.__call__ = _patched_call
+# ─────────────── Monkey-patch ends ───────────────
+
 # ─────────────── Monkey-patch: reduce SM100 autotuning ───────────────
 import quack.gemm_config as _gc
-import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from quack.autotuner import AutotuneConfig
@@ -42,24 +107,10 @@ from quack.gemm_interface import gemm_dgated_tuned, gemm_gated_tuned, gemm_tuned
 from rich import print as print0
 from triton.testing import do_bench
 
-from sonicmoe import MoE
-from sonicmoe.enums import ActivationType, is_glu
-
-# Private helper — used to print which mode "auto" resolved to.
-from sonicmoe.ep import _select_dispatch_mode  # type: ignore
-from sonicmoe.ep import SymmMemManager, moe_ep_TC_softmax_topk_forward
-from sonicmoe.functional import TC_Softmax_Topk_Router_Function  # for diag
-from sonicmoe.functional import moe_TC_softmax_topk_layer
-
 
 def _fast_sm100_configs(epilogue=None):
     tile_n_vals = [128, 160, 192, 256]
-    tile_mn_cluster_vals = (
-        [(128, tile_n, (1, 2)) for tile_n in tile_n_vals]
-        + [(128, tile_n, (2, 1)) for tile_n in tile_n_vals]
-        + [(256, tile_n, (2, 1)) for tile_n in tile_n_vals]
-        + [(256, 512, (2, 1))]
-    )
+    tile_mn_cluster_vals = [(256, tile_n, (2, 1)) for tile_n in tile_n_vals] + [(256, 512, (2, 1))]
     swap_ab_vals = [False, True]
     if epilogue in ["lse", "gated"]:
         swap_ab_vals = [False]
@@ -96,6 +147,20 @@ _patch_autotuner_configs(gemm_gated_tuned)
 _patch_autotuner_configs(gemm_dgated_tuned)
 gemm_gated_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_configs("gated")]
 gemm_dgated_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_configs("gated")]
+
+
+from sonicmoe import MoE
+from sonicmoe.distributed_utils import (
+    CombineMode,
+    DispatchMode,
+    NetworkProfiler,
+    RuntimeEPConfig,
+    _is_ag_dispatch_mode,
+    _is_rank_dedup_dispatch_mode,
+)
+from sonicmoe.enums import ActivationType, is_glu
+from sonicmoe.functional import TC_Softmax_Topk_Router_Function, moe_TC_softmax_topk_layer
+from sonicmoe.functional.ep import SymmMemManager, moe_ep_TC_softmax_topk_forward
 
 
 def swiglu(h: torch.Tensor, concat_layout: bool = False) -> torch.Tensor:
@@ -152,11 +217,35 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--concat_layout", action="store_true", default=False)
     parser.add_argument(
         "--mode",
-        choices=["ag", "a2a", "auto"],
-        default="auto",
+        choices=["AG_TRITON", "A2A_TRITON", "RANK_DEDUP_DISPATCH_TRITON"],
+        default=None,
+        help="Manual dispatch-mode override. When unset, the profiled "
+        "winner from NetworkProfiler.profile() is used.",
+    )
+    parser.add_argument(
+        "--agg_mode",
+        choices=["A2A_TRITON", "RS_COMBINE_TRITON", "RANK_DEDUP_COMBINE_TRITON"],
+        default=None,
+        help="Manual combine-mode override. When unset, the profiled "
+        "winner from NetworkProfiler.profile() is used.",
     )
     parser.add_argument("--skip_local_T", action="store_true", default=False)
-    parser.add_argument("--redispatch_x_in_backward", action="store_true", default=False)
+    parser.add_argument(
+        "--redispatch_x_in_backward",
+        action="store_true",
+        default=False,
+        help="Save x_local (T_local·d) instead of x_compute and re-dispatch x via "
+        "AG-CE (Copy-Engine all-gather) on a side stream in backward — overlaps the "
+        "rest of the backward at the cost of one extra NVLink AG of x.",
+    )
+    parser.add_argument(
+        "--CPU_sync_on_runtime",
+        action="store_true",
+        default=False,
+        help="One D2H sync on expert_frequency_offset[E_local] hoisted to before dispatch, so "
+        "per-call h, a, and the A2A dispatch recv buffer get allocated at the actual populated "
+        "row count instead of the structural ceiling. Skipped under inference mode.",
+    )
     parser.add_argument("--skip_bench_bwd", action="store_true", default=False)
     args = parser.parse_args()
     if len(args.thiek) != 5:
@@ -169,15 +258,9 @@ def _require_torchrun_env() -> None:
     if not all(v in os.environ for v in needed):
         sys.exit(
             "ERROR: this script must be launched with torchrun. Example:\n"
-            "  torchrun --nproc-per-node=4 benchmarks/ep/moe-ep.py "
+            "  torchrun --nproc-per-node=4 benchmarks/distributed/moe-ep.py "
             "--thiek 32768,2048,1024,64,8"
         )
-
-
-def _max_across_ranks(value_ms: float, device: torch.device) -> float:
-    t = torch.tensor([value_ms], device=device, dtype=torch.float64)
-    dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    return t.item()
 
 
 def _all_gather_y(y_local: torch.Tensor, world_size: int) -> torch.Tensor:
@@ -313,6 +396,7 @@ def _bench_ep_fwd_bwd(
     dout_local,
     fwd_kwargs,
     redispatch_x_in_backward,
+    CPU_sync_on_runtime,
     warmup,
     repeats,
 ):
@@ -326,6 +410,7 @@ def _bench_ep_fwd_bwd(
             b2_grad,
             is_inference_mode_enabled=False,
             redispatch_x_in_backward=redispatch_x_in_backward,
+            CPU_sync_on_runtime=CPU_sync_on_runtime,
             **fwd_kwargs,
         )
         torch.autograd.grad(o, grad_inputs, grad_outputs=dout_local, retain_graph=False)
@@ -338,10 +423,7 @@ def _bench_ep_fwd_bwd(
 def run(args: argparse.Namespace) -> None:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
-    W = world_size = int(os.environ["WORLD_SIZE"])
-
-    if rank == 0:
-        print("[moe-ep.py vHARD-EXIT-15 — fp32 ref_o_global buffer (the actual fix)]", flush=True)
+    world_size = int(os.environ["WORLD_SIZE"])
 
     # `keep_alive` is a container that lives in run()'s scope. _run_impl
     # appends `mgr` (and any other object whose destructor invokes CUDA
@@ -397,31 +479,39 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     concat_layout = args.concat_layout
     norm_topk_probs = args.norm_topk_probs
     add_bias = args.add_bias
-    mode = args.mode
     redispatch_x_in_backward = args.redispatch_x_in_backward
+    CPU_sync_on_runtime = args.CPU_sync_on_runtime
 
     T, H, I, E, K = args.thiek
 
     assert W >= 2, f"EP world size should be greater than 2."
-    assert T % world_size == 0, f"T ({T}) must be divisible by world_size ({world_size})."
-    assert E % world_size == 0, f"E ({E}) must be divisible by world_size ({world_size})."
+    assert T % W == 0, f"T ({T}) must be divisible by world_size ({W})."
+    assert E % W == 0, f"E ({E}) must be divisible by world_size ({W})."
 
-    T_local = T // world_size
-    E_local = E // world_size
+    T_local = T // W
+    E_local = E // W
 
-    resolved_mode = _select_dispatch_mode(world_size, K) if mode == "auto" else mode
+    # NetworkProfiler picks dispatch + combine by default; --mode and
+    # --agg_mode (when set) override the profiler's choice.
+    mode_override = DispatchMode(args.mode) if args.mode is not None else None
+    agg_mode_override = CombineMode(args.agg_mode) if args.agg_mode is not None else None
 
     if rank == 0:
         routing_mode = "softmax_over_topk" if is_softmax_over_topk else f"topk_over_softmax (norm={norm_topk_probs})"
         layout_mode = "concat [gate; up]" if concat_layout else "interleaved [g0, u0, g1, u1, ...]"
-        mode_str = f"{mode} (resolved → {resolved_mode})" if mode == "auto" else mode
+        mode_status = f"override={mode_override.value}" if mode_override is not None else "auto (via NetworkProfiler)"
+        agg_status = (
+            f"override={agg_mode_override.value}" if agg_mode_override is not None else "auto (via NetworkProfiler)"
+        )
         print0(
-            f"[bold]EP forward+backward + local baselines[/bold]  W {world_size}, "
+            f"[bold]EP forward+backward + local baselines[/bold]  W {W}, "
             f"T {T} (T_local {T_local}), H {H}, I {I}, "
             f"E {E} (E_local {E_local}), K {K}, "
-            f"dtype {args.dtype}, mode {mode_str}, "
+            f"dtype {args.dtype}, mode {mode_status}, agg_mode {agg_status}, "
             f"routing: {routing_mode}, w1 layout: {layout_mode}, "
-            f"bias: {add_bias}, redispatch_x_in_backward: {redispatch_x_in_backward}"
+            f"bias: {add_bias}, "
+            f"redispatch_x_in_backward: {redispatch_x_in_backward}, "
+            f"CPU_sync_on_runtime: {CPU_sync_on_runtime}"
         )
 
     torch.manual_seed(1111)
@@ -478,6 +568,38 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     # Required to survive symm-mem destructor failure during exception unwind.
     keep_alive.append(mgr)
 
+    # Profile the three dispatch primitives once on this hardware and
+    # build a RuntimeEPConfig. ``--mode`` / ``--agg_mode``, when given,
+    # override the profiler's pick.
+    profiler = NetworkProfiler(
+        mgr,
+        T_local=T_local,
+        H=H,
+        K=K,
+        dtype=torch_dtype,
+        warmup=10,
+        repeat=50,
+    )
+    profiled_cfg = profiler.profile()
+    # Settle after the profiler's many warmup + timed iterations so the
+    # actual EP throughput measurements below start from a quiesced
+    # state across all ranks (GPU clocks / NVLink fabric / NCCL channels
+    # all benefit from a brief idle window).
+    dist.barrier()
+    time.sleep(0.5)
+
+    final_mode = mode_override if mode_override is not None else profiled_cfg.mode
+    final_agg_mode = agg_mode_override if agg_mode_override is not None else profiled_cfg.agg_mode
+    ep_cfg = RuntimeEPConfig(mode=final_mode, W=W, K=K, agg_mode=final_agg_mode)
+    resolved_mode = ep_cfg.mode
+    if rank == 0:
+        dispatch_src = "override" if mode_override is not None else "profiled"
+        agg_src = "override" if agg_mode_override is not None else "profiled"
+        print0(
+            f"[bold]Final config[/bold]: dispatch={final_mode.value} ({dispatch_src}), "
+            f"agg={final_agg_mode.value} ({agg_src})"
+        )
+
     fwd_kwargs = dict(
         K=K,
         E=E,
@@ -486,7 +608,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         is_softmax_over_topk=is_softmax_over_topk,
         norm_topk_probs=norm_topk_probs,
         concat_layout=concat_layout,
-        mode=mode,
+        ep_config=ep_cfg,
     )
 
     local_kwargs = dict(
@@ -521,6 +643,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             b2_t,
             is_inference_mode_enabled=False,
             redispatch_x_in_backward=redispatch_x_in_backward,
+            CPU_sync_on_runtime=CPU_sync_on_runtime,
             **fwd_kwargs,
         )
 
@@ -535,36 +658,12 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         if add_bias:
             grad_inputs += [b1_t, b2_t]
         grads = torch.autograd.grad(o_local, grad_inputs, grad_outputs=dout_local, retain_graph=False)
-        dx_local, drouter_w_local, dw1_local, dw2_local = grads[:4]
+        dx_local, drouter_w, dw1_local, dw2_local = grads[:4]
         db1_local = grads[4] if add_bias else None
         db2_local = grads[5] if add_bias else None
 
         o_global = _all_gather_y(o_local.detach(), world_size)
         dx_global = _all_gather_y(dx_local, world_size)
-        drouter_w_full = drouter_w_local.clone()
-        dist.all_reduce(drouter_w_full, op=dist.ReduceOp.SUM)
-
-        # Cross-rank identity check on EP-side drouter_w_full.
-        #
-        # After dist.all_reduce(SUM), every rank should hold the same
-        # bf16 tensor (NCCL ring/tree reduction is deterministic given
-        # the same world size, ranking, and stream — every rank goes
-        # through the same algorithmic steps). Verify it explicitly:
-        # broadcast rank 0's copy and check no rank deviates. If this
-        # ever fires it points to a non-deterministic reduction (very
-        # rare on NCCL with the default config) or to a torn write
-        # somewhere, both of which would invalidate the comparison
-        # against the reference. This is a one-time correctness guard,
-        # not a hot-path operation.
-        drouter_w_full_r0 = drouter_w_full.clone()
-        dist.broadcast(drouter_w_full_r0, src=0)
-        cross_rank_diff = (drouter_w_full - drouter_w_full_r0).abs().max()
-        if cross_rank_diff.item() != 0.0:
-            raise RuntimeError(
-                f"[rank {rank}] EP drouter_w_full differs from rank 0 by "
-                f"{cross_rank_diff.item():.6e} after all_reduce — NCCL "
-                f"reduction was non-deterministic; comparison invalid."
-            )
 
         dw1_gathered = _gather_to_rank0(dw1_local, world_size, rank)
         dw2_gathered = _gather_to_rank0(dw2_local, world_size, rank)
@@ -578,7 +677,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         # ============================================================
         with torch.no_grad():
             ep_router_logits = F.linear(x, router_w)
-            ep_topk_scores_l, ep_topk_idx_l = TC_Softmax_Topk_Router_Function.apply(
+            _, ep_topk_idx_l = TC_Softmax_Topk_Router_Function.apply(
                 ep_router_logits,
                 world_size * E_local,
                 K,
@@ -591,31 +690,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             ep_topk_idx_l.view(-1).contiguous(),
             group=dist.group.WORLD,
         )
-
-        # ============================================================
-        # PER-RANK SCORES DIAGNOSTIC.
-        # ============================================================
-        if rank == 0:
-            with torch.no_grad():
-                if is_softmax_over_topk:
-                    diag_topk_logits_local = torch.gather(ep_router_logits, 1, ep_topk_idx_l.long())
-                    diag_scores_local = diag_topk_logits_local.softmax(dim=-1, dtype=torch.float32)
-                else:
-                    diag_probs_local = ep_router_logits.softmax(dim=-1, dtype=torch.float32)
-                    diag_scores_local = torch.gather(diag_probs_local, 1, ep_topk_idx_l.long())
-                    if norm_topk_probs:
-                        diag_scores_local = diag_scores_local / diag_scores_local.sum(dim=-1, keepdim=True)
-            ep_scores_f = ep_topk_scores_l.float()
-            test_scores_f = diag_scores_local.float()
-            scores_diff = (ep_scores_f - test_scores_f).abs()
-            print(
-                f"\n[diag-rank0] topk_scores: "
-                f"ep|max|={ep_scores_f.abs().max():.4e} "
-                f"test|max|={test_scores_f.abs().max():.4e} "
-                f"diff|max|={scores_diff.max():.4e} "
-                f"diff|mean|={scores_diff.mean():.4e}",
-                flush=True,
-            )
 
         dist.barrier()
 
@@ -631,88 +705,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
                 ActivationType.REGLU: reglu,
             }[activation]
 
-            # === LOCALIZATION DIAGNOSTIC (per-K bisection on token 0, rank 0) ===
-            with torch.no_grad():
-                ep_router_logits_diag = F.linear(x, router_w)
-                ep_scores_diag, ep_idx_diag = TC_Softmax_Topk_Router_Function.apply(
-                    ep_router_logits_diag,
-                    world_size * E_local,
-                    K,
-                    is_softmax_over_topk,
-                    norm_topk_probs,
-                )
-                experts_for_t0 = ep_idx_diag[0].long()
-                scores_for_t0 = ep_scores_diag[0].float()
-                ep_o0 = o_local[0].float()
-
-                print(f"\n[BISECT-K] per-K progression on (rank 0, token 0):")
-                print(f"  EP final           |max|={ep_o0.abs().max():.6f}")
-                print(f"  EP[0][:10] = {ep_o0[:10].tolist()}")
-                partial = torch.zeros(H, device=device, dtype=torch.float32)
-                for k in range(K):
-                    e = experts_for_t0[k].item()
-                    s = scores_for_t0[k].item()
-                    ref_h = F.linear(x[0:1].float(), w1_full[e].float())
-                    if is_glu(activation):
-                        ref_h = act_func(ref_h, concat_layout=concat_layout)
-                    else:
-                        ref_h = act_func(ref_h)
-                    ref_y = F.linear(ref_h, w2_full[e].float())
-                    contrib = (ref_y[0] * s).float()
-                    partial += contrib
-                    print(
-                        f"  after K={k} expert={e:3d} dst_rank={e // E_local} "
-                        f"score={s:.4f} contrib|max|={contrib.abs().max():.6f}  "
-                        f"|EP - sum(K0..K{k})|max = {(ep_o0 - partial).abs().max():.6f}"
-                    )
-
-                # Permutation: does EP[0] equal expected[t'] for some other t'?
-                # If so, we have a metadata permutation bug.
-                print(f"\n[BISECT-PERM] does EP[0] match expected[t'] for some t'?")
-                for t_check in [0, 1, 7, 64, T_local // 4, T_local // 2, 3 * T_local // 4, T_local - 8, T_local - 1]:
-                    e_o = torch.zeros(H, device=device, dtype=torch.float32)
-                    for k in range(K):
-                        e_id = ep_idx_diag[t_check][k].item()
-                        s = ep_scores_diag[t_check][k].float().item()
-                        ref_h = F.linear(x[t_check : t_check + 1].float(), w1_full[e_id].float())
-                        if is_glu(activation):
-                            ref_h = act_func(ref_h, concat_layout=concat_layout)
-                        else:
-                            ref_h = act_func(ref_h)
-                        ref_y = F.linear(ref_h, w2_full[e_id].float())
-                        e_o += (ref_y[0] * s).float()
-                    diff = (ep_o0 - e_o).abs().max()
-                    print(f"  EP[0] vs expected[t'={t_check:5d}]: max diff = {diff:.6f}")
-
-                # Same-rank vs cross-rank K split — does EP[0] match
-                # expected if we only sum the K terms whose expert is on rank 0
-                # (same-rank, no NVLink), vs only the cross-rank ones?
-                same_rank_partial = torch.zeros(H, device=device, dtype=torch.float32)
-                cross_rank_partial = torch.zeros(H, device=device, dtype=torch.float32)
-                my_rank_id = rank
-                for k in range(K):
-                    e = experts_for_t0[k].item()
-                    s = scores_for_t0[k].item()
-                    ref_h = F.linear(x[0:1].float(), w1_full[e].float())
-                    if is_glu(activation):
-                        ref_h = act_func(ref_h, concat_layout=concat_layout)
-                    else:
-                        ref_h = act_func(ref_h)
-                    contrib = (F.linear(ref_h, w2_full[e].float())[0] * s).float()
-                    if (e // E_local) == my_rank_id:
-                        same_rank_partial += contrib
-                    else:
-                        cross_rank_partial += contrib
-                print(f"\n[BISECT-RANK-SPLIT]")
-                print(f"  same_rank only  |EP - sum|max = {(ep_o0 - same_rank_partial).abs().max():.6f}")
-                print(f"  cross_rank only |EP - sum|max = {(ep_o0 - cross_rank_partial).abs().max():.6f}")
-                print(
-                    f"  full sum        |EP - sum|max = {(ep_o0 - same_rank_partial - cross_rank_partial).abs().max():.6f}"
-                )
-                print(f"  same_rank|max|  = {same_rank_partial.abs().max():.6f}")
-                print(f"  cross_rank|max| = {cross_rank_partial.abs().max():.6f}")
-
-            # === END DIAGNOSTIC ===
             # Reference parameters: keep ref_x / ref_w1 / ref_w2 / ref_b* in
             # production dtype so the per-expert MoE forward (inside the
             # autocast(fp32) block below) sees the same input bytes EP did.
@@ -851,15 +843,19 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             ref_db1 = ref_grads[4] if add_bias else None
             ref_db2 = ref_grads[5] if add_bias else None
 
+            # All diff lines share a left-aligned 32-char label column
+            # so the numbers line up regardless of variable name length.
+            LBL = 32
+
             o_diff = (o_global.float() - ref_o_global).abs()
-            print(f"max ref o val {ref_o_global.abs().max():.6f}")
-            print(f"mean ref o val {ref_o_global.abs().mean():.6f}")
-            print(f"max abs diff on o {o_diff.max():.6f}")
-            print(f"mean rel diff on o {(o_diff / (ref_o_global.abs() + 1e-6)).mean():.6f}\n")
+            print(f"{'max ref o val':<{LBL}} {ref_o_global.abs().max():.6f}")
+            print(f"{'mean ref o val':<{LBL}} {ref_o_global.abs().mean():.6f}")
+            print(f"{'max abs diff on o':<{LBL}} {o_diff.max():.6f}")
+            print(f"{'mean rel diff on o':<{LBL}} {(o_diff / (ref_o_global.abs() + 1e-6)).mean():.6f}\n")
 
             test_triple_list = [
                 ("dx", dx_global, ref_dx),
-                ("drouter_w", drouter_w_full, ref_drouter_w),
+                ("drouter_w", drouter_w, ref_drouter_w),
                 ("dw1", ep_dw1, ref_dw1.permute(1, 2, 0)),
                 ("dw2", ep_dw2, ref_dw2.permute(0, 2, 1)),
             ]
@@ -871,60 +867,13 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
 
             for n, our, ref in test_triple_list:
                 diff = (our.float() - ref.float()).abs()
-                print(f"max abs ref value {n} {ref.abs().max():.6f}")
-                print(f"mean abs ref value {n} {ref.abs().mean():.6f}")
-                print(f"max abs diff on {n} {diff.max():.6f}")
-                print(f"mean rel diff on {n} {(diff / (ref.abs() + 1e-6)).mean():.6f}\n")
-
-        # Cross-rank symmetric check on drouter_w: broadcast rank 0's
-        # ref_drouter_w to every rank and verify (drouter_w_full -
-        # ref_drouter_w) gives the same per-rank diff everywhere.
-        #
-        # Why this matters: the user's correctness contract is that
-        # drouter_w must be identical across all ranks (it's a
-        # replicated parameter, every rank sees the same gradient after
-        # all_reduce). The EP path achieves this via dist.all_reduce on
-        # bf16 tensors (NCCL ring/tree). The reference is computed only
-        # on rank 0 via single-process autograd. If our EP-vs-ref diff
-        # were measured only on rank 0, we couldn't catch a bug where
-        # NCCL's reduction is non-deterministic across ranks (very rare
-        # but possible) or where some rank holds a torn copy of
-        # drouter_w_full.
-        #
-        # By broadcasting ref_drouter_w out to every rank and computing
-        # (drouter_w_full - ref_drouter_w_bcast).abs().max() per rank,
-        # then all_reducing min/max across ranks, we verify both
-        # aggregations yield the same comparison on every rank.
-        ref_drouter_w_bcast = torch.empty(E, H, device=device, dtype=router_w.dtype)
-        if rank == 0:
-            ref_drouter_w_bcast.copy_(ref_drouter_w)
-        dist.broadcast(ref_drouter_w_bcast, src=0)
-
-        per_rank_diff = (drouter_w_full.float() - ref_drouter_w_bcast.float()).abs().max()
-        per_rank_diff_max = per_rank_diff.clone()
-        per_rank_diff_min = per_rank_diff.clone()
-        dist.all_reduce(per_rank_diff_max, op=dist.ReduceOp.MAX)
-        dist.all_reduce(per_rank_diff_min, op=dist.ReduceOp.MIN)
-        if (per_rank_diff_max - per_rank_diff_min).abs().item() > 1e-9:
-            raise RuntimeError(
-                f"[rank {rank}] EP-vs-ref drouter_w diff is rank-dependent: "
-                f"local={per_rank_diff.item():.6e}, "
-                f"min_across_ranks={per_rank_diff_min.item():.6e}, "
-                f"max_across_ranks={per_rank_diff_max.item():.6e}. "
-                f"This means either drouter_w_full differs across ranks "
-                f"(NCCL all_reduce non-deterministic) or ref broadcast "
-                f"didn't fan out cleanly. Either way, the comparison is "
-                f"not symmetric — investigate the aggregation."
-            )
-        if rank == 0:
-            print(
-                f"[cross-rank check] drouter_w EP-vs-ref diff "
-                f"identical on all {world_size} ranks: "
-                f"{per_rank_diff.item():.6e}"
-            )
+                print(f"{f'max abs ref value {n}':<{LBL}} {ref.abs().max():.6f}")
+                print(f"{f'mean abs ref value {n}':<{LBL}} {ref.abs().mean():.6f}")
+                print(f"{f'max abs diff on {n}':<{LBL}} {diff.max():.6f}")
+                print(f"{f'mean rel diff on {n}':<{LBL}} {(diff / (ref.abs() + 1e-6)).mean():.6f}\n")
 
         del x_t, router_w_t, w1_t, w2_t, b1_t, b2_t
-        del o_local, dx_local, drouter_w_local, dw1_local, dw2_local, db1_local, db2_local
+        del o_local, dx_local, drouter_w, dw1_local, dw2_local, db1_local, db2_local
         torch.cuda.empty_cache()
 
     dist.barrier()
@@ -973,6 +922,103 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     dist.barrier()
 
     # ====================================================================
+    # Saved-activation cache audit (training, no redispatch)
+    # ====================================================================
+    # Targets (per rank, in elements):
+    #   X cache:   min(K, W) * T_local * d      (AG mode K>=W: W·T_local·d;
+    #                                            A2A mode K<W: K·T_local·d)
+    #   h cache:   TK_global / W  ·  h_dim2     (= TK_local · 2I for SwiGLU)
+    #
+    # The X target equals the dispatched x_compute under AG mode. Under A2A
+    # the dispatched buffer is shape (W, TK_local, d) = TK_global·d, which
+    # is a factor W over the target — only ~TK_local rows are valid.
+    #
+    # For h, the merged _MoeEPFunction holds (TK_global, h_dim2) but
+    # gemm_gated only writes the first expert_frequency_offset[E_local]
+    # (~TK_local) rows under cu_seqlens_m, so the cache is over by a
+    # factor of ~W in both modes (the tradeoff that buys uniform shape
+    # in the off-path E_local < K case and removes the reinflate dance).
+    saved_info: list = []
+
+    def _pack_hook(t):
+        saved_info.append((tuple(t.shape), str(t.dtype).replace("torch.", ""), t.numel() * t.element_size()))
+        return t
+
+    def _unpack_hook(t):
+        return t
+
+    def _strided_clone(t: torch.Tensor) -> torch.Tensor:
+        # quack's gemm requires the (E_local, K, N) strided layout from
+        # empty_strided + permute; a plain .clone() reverts to default
+        # contiguous strides and trips the gemm's stride check.
+        out = torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device)
+        return out.copy_(t).requires_grad_(True)
+
+    x_audit = x.clone().detach().requires_grad_(True)
+    router_w_audit = router_w.clone().detach().requires_grad_(True)
+    w1_audit = _strided_clone(w1)
+    w2_audit = _strided_clone(w2)
+    b1_audit = b1.clone().detach().requires_grad_(True) if add_bias else None
+    b2_audit = b2.clone().detach().requires_grad_(True) if add_bias else None
+
+    with torch.autograd.graph.saved_tensors_hooks(_pack_hook, _unpack_hook):
+        _o_audit = moe_ep_TC_softmax_topk_forward(
+            x_audit,
+            router_w_audit,
+            w1_audit,
+            b1_audit,
+            w2_audit,
+            b2_audit,
+            is_inference_mode_enabled=False,
+            redispatch_x_in_backward=redispatch_x_in_backward,
+            CPU_sync_on_runtime=CPU_sync_on_runtime,
+            **fwd_kwargs,
+        )
+
+    if rank == 0:
+        h_dim2 = (2 * I) if is_glu(activation) else I
+
+        # Classify saved tensors by SHAPE + NBYTES rank. The pack_hook
+        # captures every save_for_backward in the autograd graph (the
+        # router's x and router_w, the topk function's saves, and the
+        # EP function's saves), so save-order alone can't isolate the
+        # EP's x_compute / h. The two saves that dominate cache cost
+        # are h (largest with shape[1] == h_dim2) and x_compute (largest
+        # with shape[1] == H, excluding h's slot when H == h_dim2).
+        # Index into ``saved_info`` is the disambiguator — when H ==
+        # h_dim2 the candidate pools coincide and we exclude h's
+        # specific position so x picks the next-largest distinct entry.
+        candidates = [
+            (i, shape, nbytes)
+            for i, (shape, dtype_str, nbytes) in enumerate(saved_info)
+            if (dtype_str.startswith("bfloat16") or dtype_str.startswith("float16")) and len(shape) == 2
+        ]
+        h_matches = [c for c in candidates if c[1][1] == h_dim2]
+        x_matches = [c for c in candidates if c[1][1] == H]
+        h_pick = max(h_matches, key=lambda c: c[2], default=(None, None, 0))
+        h_idx = h_pick[0]
+        x_pool = [c for c in x_matches if c[0] != h_idx]
+        x_pick = max(x_pool, key=lambda c: c[2], default=(None, None, 0))
+
+        print0(
+            "\n[bold]══ Saved-activation cache audit (training, redispatch_x={}, CPU_sync={}) ══[/bold]".format(
+                redispatch_x_in_backward, CPU_sync_on_runtime
+            )
+        )
+        LBL = 18
+        total_bytes = x_pick[2] + h_pick[2]
+        print0(
+            f"  {'X cache:':<{LBL}} {x_pick[2]/(1024 ** 3):>8.2f} GiB  shape={x_pick[1]}\n"
+            f"  {'h cache:':<{LBL}} {h_pick[2]/(1024 ** 3):>8.2f} GiB  shape={h_pick[1]}\n"
+            f"  {'Total:':<{LBL}} {total_bytes/(1024 ** 3):>8.2f} GiB"
+        )
+
+    del x_audit, router_w_audit, w1_audit, w2_audit, b1_audit, b2_audit, _o_audit
+    saved_info.clear()
+    torch.cuda.empty_cache()
+    dist.barrier()
+
+    # ====================================================================
     # 1) EP Fwd inference
     # ====================================================================
     time.sleep(0.5)
@@ -995,9 +1041,10 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     if rank == 0:
         tflops = fwd_flops_global / (ep_fwd_inf_ms * 1e9)
         local_tflops = fwd_flops_local / (ep_fwd_inf_ms * 1e9)
+        print0("\n[bold]── EP throughput ──[/bold]")
         print0(
-            f" EP Fwd (inference mode) Average time: {ep_fwd_inf_ms:.3f} ms, "
-            f"Local TFLOPS: {local_tflops:.1f}, Net TFLOPS: {tflops:.1f}"
+            f" EP Fwd (inference mode) Average time: {ep_fwd_inf_ms:<8.2f} ms, "
+            f"Per-rank TFLOPS: {local_tflops:<5.0f}, Net EP TFLOPS: {tflops:<5.0f}"
         )
 
     # ====================================================================
@@ -1024,8 +1071,8 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         tflops = fwd_flops_global / (ep_fwd_train_ms * 1e9)
         local_tflops = fwd_flops_local / (ep_fwd_train_ms * 1e9)
         print0(
-            f" EP Fwd (training mode)  Average time: {ep_fwd_train_ms:.3f} ms, "
-            f"Local TFLOPS: {local_tflops:.1f}, Net TFLOPS: {tflops:.1f}"
+            f" EP Fwd (training mode)  Average time: {ep_fwd_train_ms:<8.2f} ms, "
+            f"Per-rank TFLOPS: {local_tflops:<5.0f}, Net EP TFLOPS: {tflops:<5.0f}"
         )
 
     # ====================================================================
@@ -1067,6 +1114,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             dout_bench_local,
             fwd_kwargs,
             redispatch_x_in_backward,
+            CPU_sync_on_runtime,
             warmup=warmup,
             repeats=repeats,
         )
@@ -1078,12 +1126,12 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             bwd_tflops = bwd_flops_global / (ep_bwd_ms * 1e9) if ep_bwd_ms > 0 else 0.0
             bwd_local_tflops = bwd_flops_local / (ep_bwd_ms * 1e9) if ep_bwd_ms > 0 else 0.0
             print0(
-                f" EP Fwd+Bwd              Average time: {ep_fwdbwd_ms:.3f} ms, "
-                f"Local TFLOPS: {fwdbwd_local_tflops:.1f}, Net TFLOPS: {fwdbwd_tflops:.1f}"
+                f" EP Fwd+Bwd              Average time: {ep_fwdbwd_ms:<8.2f} ms, "
+                f"Per-rank TFLOPS: {fwdbwd_local_tflops:<5.0f}, Net EP TFLOPS: {fwdbwd_tflops:<5.0f}"
             )
             print0(
-                f" EP Bwd (derived)        Average time: {ep_bwd_ms:.3f} ms, "
-                f"Local TFLOPS: {bwd_local_tflops:.1f}, Net TFLOPS: {bwd_tflops:.1f}"
+                f" EP Bwd (derived)        Average time: {ep_bwd_ms:<8.2f} ms, "
+                f"Per-rank TFLOPS: {bwd_local_tflops:<5.0f}, Net EP TFLOPS: {bwd_tflops:<5.0f}"
             )
 
         del x_g, router_w_g, w1_g, w2_g, b1_g, b2_g
@@ -1094,7 +1142,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     # 4) Local baselines T_local
     # ====================================================================
     if rank == 0:
-        print0(f"\n[bold]── Local baselines (T_local={T_local}, no communication) ──[/bold]")
+        print0(f"\n[bold]── Per-rank baselines (T_local={T_local}, no communication) ──[/bold]")
 
     x_local_nograd = x.clone().detach()
     x_local_grad = x.clone().detach().requires_grad_(True)
@@ -1102,25 +1150,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     time.sleep(0.5)
     torch.cuda.synchronize()
     dist.barrier()
-
-    local_fwd_inf_Tl_ms = _bench_local_fwd(
-        x_local_nograd,
-        router_w,
-        w1_local_fmt,
-        b1_full,
-        w2_local_fmt,
-        b2_full,
-        is_inference=True,
-        warmup=warmup,
-        repeats=repeats,
-        **local_kwargs,
-    )
-    if rank == 0:
-        tflops = fwd_flops_local / (local_fwd_inf_Tl_ms * 1e9)
-        print0(
-            f" Local Fwd (T_local={T_local}, inference) "
-            f"Average time: {local_fwd_inf_Tl_ms:.3f} ms, TFLOPS: {tflops:.1f}"
-        )
 
     local_fwd_train_Tl_ms = _bench_local_fwd(
         x_local_nograd,
@@ -1137,8 +1166,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     if rank == 0:
         tflops = fwd_flops_local / (local_fwd_train_Tl_ms * 1e9)
         print0(
-            f" Local Fwd (T_local={T_local}, training)  "
-            f"Average time: {local_fwd_train_Tl_ms:.3f} ms, TFLOPS: {tflops:.1f}"
+            f" {f'Per-rank Fwd (T_local={T_local}, training)':<42} Average time: {local_fwd_train_Tl_ms:<8.2f} ms, TFLOPS: {tflops:<5.0f}"
         )
 
     local_bwd_Tl_ms = None
@@ -1164,8 +1192,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         if rank == 0:
             bwd_tflops = bwd_flops_local / (local_bwd_Tl_ms * 1e9) if local_bwd_Tl_ms > 0 else 0.0
             print0(
-                f" Local Bwd (T_local={T_local})    "
-                f"Average time: {local_bwd_Tl_ms:.3f} ms, TFLOPS: {bwd_tflops:.1f}"
+                f" {f'Per-rank Bwd (T_local={T_local})':<42} Average time: {local_bwd_Tl_ms:<8.2f} ms, TFLOPS: {bwd_tflops:<5.0f}"
             )
 
     # ====================================================================
@@ -1176,7 +1203,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     local_bwd_T_ms = None
     if not args.skip_local_T:
         if rank == 0:
-            print0(f"\n[bold]── Local baselines (T={T}, single-GPU full-scale) ──[/bold]")
+            print0(f"\n[bold]── Per-rank baselines (T={T}, single-GPU full-scale) ──[/bold]")
 
         x_full_nograd = x_global.clone().detach()
         x_full_grad = x_global.clone().detach().requires_grad_(True)
@@ -1184,25 +1211,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         time.sleep(0.5)
         torch.cuda.synchronize()
         dist.barrier()
-
-        local_fwd_inf_T_ms = _bench_local_fwd(
-            x_full_nograd,
-            router_w,
-            w1_local_fmt,
-            b1_full,
-            w2_local_fmt,
-            b2_full,
-            is_inference=True,
-            warmup=warmup,
-            repeats=repeats,
-            **local_kwargs,
-        )
-        if rank == 0:
-            tflops = fwd_flops_global / (local_fwd_inf_T_ms * 1e9)
-            print0(
-                f" Local Fwd (T={T}, inference)     "
-                f"Average time: {local_fwd_inf_T_ms:.3f} ms, TFLOPS: {tflops:.1f}"
-            )
 
         local_fwd_train_T_ms = _bench_local_fwd(
             x_full_nograd,
@@ -1219,8 +1227,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         if rank == 0:
             tflops = fwd_flops_global / (local_fwd_train_T_ms * 1e9)
             print0(
-                f" Local Fwd (T={T}, training)      "
-                f"Average time: {local_fwd_train_T_ms:.3f} ms, TFLOPS: {tflops:.1f}"
+                f" {f'Per-rank Fwd (T={T}, training)':<42} Average time: {local_fwd_train_T_ms:<8.2f} ms, TFLOPS: {tflops:<5.0f}"
             )
 
         if not args.skip_bench_bwd:
@@ -1245,32 +1252,34 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             if rank == 0:
                 bwd_tflops = bwd_flops_global / (local_bwd_T_ms * 1e9) if local_bwd_T_ms > 0 else 0.0
                 print0(
-                    f" Local Bwd (T={T})        " f"Average time: {local_bwd_T_ms:.3f} ms, TFLOPS: {bwd_tflops:.1f}"
+                    f" {f'Per-rank Bwd (T={T})':<42} Average time: {local_bwd_T_ms:<8.2f} ms, TFLOPS: {bwd_tflops:<5.0f}"
                 )
 
     # ====================================================================
     # 6) Exposed network latency summary
     # ====================================================================
+    #
+    # "Exposed network" = EP_time − per-rank-baseline_time. It's the
+    # extra wall time EP costs vs. running just the local T_local-row
+    # forward/backward — i.e., the part of comm + symm-mem orchestration
+    # that wasn't hidden behind compute. Per-rank NVLink bytes for each
+    # phase scale by dispatch / combine mode; see ``benchmarks/
+    # distributed/bench-ep-comm.py`` for the per-primitive breakdown.
     if rank == 0:
         print0("\n[bold]══ Exposed network latency (EP vs. local T_local) ══[/bold]")
 
-        exposed_inf_ms = ep_fwd_inf_ms - local_fwd_inf_Tl_ms
-        exposed_inf_pct = exposed_inf_ms / ep_fwd_inf_ms * 100 if ep_fwd_inf_ms > 0 else 0.0
-        print0(
-            f"  Inference fwd:\n"
-            f"    EP Fwd:                {ep_fwd_inf_ms:8.3f} ms\n"
-            f"    Local Fwd (T_local):   {local_fwd_inf_Tl_ms:8.3f} ms\n"
-            f"    Exposed network:       {exposed_inf_ms:8.3f} ms  "
-            f"({exposed_inf_pct:.1f}% of EP time)"
-        )
+        # Left-pad labels to a 24-char column so the value column starts
+        # at the same position. ms numbers use 2 decimals and left-align
+        # so the digit before the decimal lines up across rows.
+        LBL = 24
 
         exposed_train_ms = ep_fwd_train_ms - local_fwd_train_Tl_ms
         exposed_train_pct = exposed_train_ms / ep_fwd_train_ms * 100 if ep_fwd_train_ms > 0 else 0.0
         print0(
             f"  Training fwd:\n"
-            f"    EP Fwd:                {ep_fwd_train_ms:8.3f} ms\n"
-            f"    Local Fwd (T_local):   {local_fwd_train_Tl_ms:8.3f} ms\n"
-            f"    Exposed network:       {exposed_train_ms:8.3f} ms  "
+            f"    {'EP Fwd:':<{LBL}} {ep_fwd_train_ms:<8.2f} ms\n"
+            f"    {'Per-rank Fwd (T_local):':<{LBL}} {local_fwd_train_Tl_ms:<8.2f} ms\n"
+            f"    {'Exposed network:':<{LBL}} {exposed_train_ms:<8.2f} ms  "
             f"({exposed_train_pct:.1f}% of EP time)"
         )
 
@@ -1279,32 +1288,21 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             exposed_bwd_pct = exposed_bwd_ms / ep_bwd_ms * 100 if ep_bwd_ms > 0 else 0.0
             print0(
                 f"  Backward:\n"
-                f"    EP Bwd:                {ep_bwd_ms:8.3f} ms\n"
-                f"    Local Bwd (T_local):   {local_bwd_Tl_ms:8.3f} ms\n"
-                f"    Exposed network:       {exposed_bwd_ms:8.3f} ms  "
+                f"    {'EP Bwd:':<{LBL}} {ep_bwd_ms:<8.2f} ms\n"
+                f"    {'Per-rank Bwd (T_local):':<{LBL}} {local_bwd_Tl_ms:<8.2f} ms\n"
+                f"    {'Exposed network:':<{LBL}} {exposed_bwd_ms:<8.2f} ms  "
                 f"({exposed_bwd_pct:.1f}% of EP time)"
             )
 
-            local_fwdbwd_Tl_ms_total = local_fwd_train_Tl_ms + local_bwd_Tl_ms
-            exposed_step_ms = ep_fwdbwd_ms - local_fwdbwd_Tl_ms_total
-            exposed_step_pct = exposed_step_ms / ep_fwdbwd_ms * 100 if ep_fwdbwd_ms > 0 else 0.0
-            print0(
-                f"  Full training step:\n"
-                f"    EP Fwd+Bwd:            {ep_fwdbwd_ms:8.3f} ms\n"
-                f"    Local Fwd+Bwd:         {local_fwdbwd_Tl_ms_total:8.3f} ms\n"
-                f"    Exposed network:       {exposed_step_ms:8.3f} ms  "
-                f"({exposed_step_pct:.1f}% of EP time)"
-            )
-
-        if not args.skip_local_T and local_fwd_inf_T_ms is not None:
-            speedup = local_fwd_inf_T_ms / ep_fwd_inf_ms if ep_fwd_inf_ms > 0 else 0.0
+        if not args.skip_local_T and local_fwd_train_T_ms is not None:
+            speedup = local_fwd_train_T_ms / ep_fwd_train_ms if ep_fwd_train_ms > 0 else 0.0
             ideal_speedup = world_size
             scaling_eff = speedup / ideal_speedup * 100 if ideal_speedup > 0 else 0.0
             print0(
-                f"\n  EP scaling efficiency (inference fwd):\n"
-                f"    Single-GPU (T={T}):    {local_fwd_inf_T_ms:8.3f} ms\n"
-                f"    EP W={world_size} (T={T}):        {ep_fwd_inf_ms:8.3f} ms\n"
-                f"    Speedup:               {speedup:.2f}× "
+                f"\n  EP scaling efficiency (training fwd):\n"
+                f"    {f'Single-GPU (T={T}):':<{LBL}} {local_fwd_train_T_ms:<8.2f} ms\n"
+                f"    {f'EP W={world_size} (T={T}):':<{LBL}} {ep_fwd_train_ms:<8.2f} ms\n"
+                f"    {'Observed speedup:':<{LBL}} {speedup:<8.2f}× "
                 f"(ideal {ideal_speedup}×, efficiency {scaling_eff:.1f}%)"
             )
 
@@ -1313,9 +1311,9 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
                 bwd_scaling_eff = bwd_speedup / ideal_speedup * 100 if ideal_speedup > 0 else 0.0
                 print0(
                     f"\n  EP scaling efficiency (backward):\n"
-                    f"    Single-GPU (T={T}):    {local_bwd_T_ms:8.3f} ms\n"
-                    f"    EP W={world_size} (T={T}):        {ep_bwd_ms:8.3f} ms\n"
-                    f"    Speedup:               {bwd_speedup:.2f}× "
+                    f"    {f'Single-GPU (T={T}):':<{LBL}} {local_bwd_T_ms:<8.2f} ms\n"
+                    f"    {f'EP W={world_size} (T={T}):':<{LBL}} {ep_bwd_ms:<8.2f} ms\n"
+                    f"    {'Observed speedup:':<{LBL}} {bwd_speedup:<8.2f}× "
                     f"(ideal {ideal_speedup}×, efficiency {bwd_scaling_eff:.1f}%)"
                 )
 

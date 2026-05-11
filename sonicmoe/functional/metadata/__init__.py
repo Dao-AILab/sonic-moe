@@ -67,7 +67,7 @@ def _compute_col_partial_sum_kernel(
 
 
 @torch.library.custom_op(
-    f"triton_kernels::TC_topk_router_metadata",
+    f"sonicmoe_metadata::TC_topk_router_metadata",
     mutates_args={
         "expert_frequency",
         "expert_frequency_offset",
@@ -269,7 +269,7 @@ def _token_offset_searchsorted_kernel(
 
 
 @torch.library.custom_op(
-    "triton_kernels::general_routing_router_metadata",
+    "sonicmoe_metadata::general_routing_router_metadata",
     mutates_args={
         "expert_frequency",
         "expert_frequency_offset",

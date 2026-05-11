@@ -362,7 +362,15 @@ def _down_projection_backward_act(
 
         BLOCK_H = min(triton.next_power_of_2(H), 2048)
         NUM_H_BLOCKS = triton.cdiv(H, BLOCK_H)
-        new_ds_partial = torch.empty(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
+        # Must be zero-initialized: db2_and_ds_kernel only writes at the
+        # global slot indices reached by local-expert grouped positions
+        # (cu_seqlens_m bound on E_local). Sentinel slots routed to peer
+        # ranks are never written, and the subsequent
+        # `ds.copy_(new_ds_partial)` propagates whatever lives at those
+        # offsets into ds — corrupting the post-reduce_scatter ds_local
+        # by summing peer ranks' garbage in. The no-bias path stays
+        # correct because _scatter_ds writes only at masked slots.
+        new_ds_partial = torch.zeros(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
 
         db2_and_ds_kernel[(E, NUM_H_BLOCKS)](
             dout,

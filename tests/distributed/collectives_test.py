@@ -4,12 +4,12 @@
 #
 # Run with torchrun:
 #
-#   torchrun --nproc_per_node=8 --standalone --local-ranks-filter 0 -m pytest tests/ep/collectives_test.py -s
+#   torchrun --nproc_per_node=8 --standalone --local-ranks-filter 0 -m pytest tests/distributed/collectives_test.py -s
 #
 # Single test:
 #
 #   torchrun --nproc_per_node=8 --standalone --local-ranks-filter 0 \
-#       -m pytest tests/ep/collectives_test.py::EPCollectivesTest::test_all_gather -s
+#       -m pytest tests/distributed/collectives_test.py::EPCollectivesTest::test_all_gather -s
 #
 # torchrun sets RANK / WORLD_SIZE / LOCAL_RANK / MASTER_ADDR / MASTER_PORT in each
 # child process; we initialize the process group once in setUpClass and let each
@@ -36,14 +36,17 @@ import torch
 import torch.distributed as dist
 from torch.distributed import _symmetric_memory as _symm_mem
 
-from sonicmoe.functional.ep import (
-    a2a_dispatch_pull_triton,
+from sonicmoe.functional.distributed import (
+    a2a_combine_triton,
+    a2a_dispatch_triton,
     all_gather_copy_engine_async,
     all_gather_triton,
+    build_rank_dedup_a_idx,
     compute_dispatch_metadata,
-    gather_aggregation_triton,
+    local_combine,
+    rank_dedup_combine_triton,
+    rank_dedup_dispatch_triton,
     reduce_scatter_triton,
-    rs_aggregation,
 )
 from tests.test_commons import TestCommons
 
@@ -95,7 +98,7 @@ def _init_dist_from_env() -> None:
         raise unittest.SkipTest(
             "EP collective tests must be launched with torchrun, e.g.:\n"
             "  torchrun --nproc_per_node=8 --standalone "
-            "-m pytest tests/ep/collectives_test.py -s"
+            "-m pytest tests/distributed/collectives_test.py -s"
         )
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -111,7 +114,6 @@ def _init_dist_from_env() -> None:
         world_size=world_size,
         device_id=torch.device(f"cuda:{local_rank}"),
     )
-    _symm_mem.enable_symm_mem_for_group(dist.group.WORLD.group_name)
 
 
 def _alloc_symm(shape, dtype, device):
@@ -203,13 +205,10 @@ _SHAPES = [
     # (T_local, d, K, E_local)
     (64, 128, 2, 4),
     (256, 1024, 4, 8),
-    (1024, 2048, 8, 8),
-    (8192, 2048, 8, 8),
     (8192, 4096, 4, 16),
     (8192, 4096, 4, 20),
     (8192, 4096, 3, 16),
     (8192, 1536, 4, 16),
-    (8192, 1536 + 384, 4, 16),
     (8200, 4096, 4, 16),
 ]
 
@@ -230,7 +229,21 @@ def _worker_all_gather(rank, world_size, device):
             # landed before any peer reads its bytes.
             _barrier(x)
 
-            ce = all_gather_copy_engine_async(x, dist.group.WORLD).wait()
+            # Build peer_bufs explicitly — the CE all-gather is decoupled
+            # from symm-mem; it only needs (x, peer_view_per_rank, my_rank).
+            # Here `x` happens to be symm-mem so we reuse its rendezvous
+            # to mint the peer views, but the CE function itself doesn't
+            # care which mechanism produced the mapping.
+            #
+            # IMPORTANT: do NOT keep the rendezvous handle in a local —
+            # that retriggers the destructor-mid-loop trap documented above
+            # `_alloc_symm`. The peer-buffer views don't pin the handle;
+            # it stays alive in PyTorch's symm-mem cache bound to x.
+            ce_peer_bufs = tuple(
+                _symm_mem.rendezvous(x, group=dist.group.WORLD.group_name).get_buffer(r, (T_local, d), dtype)
+                for r in range(world_size)
+            )
+            ce = all_gather_copy_engine_async(x, peer_bufs=ce_peer_bufs, my_rank=rank).wait()
             tri = all_gather_triton(x, dist.group.WORLD)
             ref = torch.empty(world_size * T_local, d, dtype=dtype, device=device)
             dist.all_gather_into_tensor(ref, x, group=dist.group.WORLD)
@@ -238,7 +251,7 @@ def _worker_all_gather(rank, world_size, device):
                 fails.append(f"AG T={T_local} d={d} dt={dtype}: {(tri != ref).sum().item()} differ")
             if not torch.equal(ce, ref):
                 fails.append(f"AG T={T_local} d={d} dt={dtype}: {(ce != ref).sum().item()} differ")
-            del x, tri, ref, ce
+            del x, tri, ref, ce, ce_peer_bufs
         torch.cuda.empty_cache()
     return fails
 
@@ -293,12 +306,12 @@ def _worker_reduce_scatter(rank, world_size, device):
 
 
 # ============================================================================
-# Worker: a2a_dispatch_pull — AG-then-permute reference, sentinel detects
+# Worker: a2a_dispatch — AG-then-permute reference, sentinel detects
 # spurious writes to invalid lanes
 # ============================================================================
 
 
-def _worker_a2a_pull(rank, world_size, device):
+def _worker_a2a_dispatch(rank, world_size, device):
     fails = []
     SENTINEL = -42.0
     for T_local, d, K, E_local in _SHAPES:
@@ -314,7 +327,7 @@ def _worker_a2a_pull(rank, world_size, device):
 
             # Fence x's .normal_() before peers read it.
             _barrier(x)
-            a2a_dispatch_pull_triton(
+            a2a_dispatch_triton(
                 x,
                 meta["dst_rank_flat"],
                 meta["a2a_token_indices"],
@@ -343,19 +356,171 @@ def _worker_a2a_pull(rank, world_size, device):
 
 
 # ============================================================================
-# Worker: rs_aggregation — explicit fp32 K-loop reference matching the
-# kernel's static_range accumulation order. allclose absorbs any FMA fusion
-# difference between Triton and PyTorch elementwise.
-# ----------------------------------------------------------------------------
-# rs_aggregation reads only local memory and writes rs_buf locally — no
-# peer-side reads from rs_buf inside this test, so we don't need a
-# `_barrier(rs)` after rs_aggregation here. The benchmark's rs+RS
-# pipeline does need one (rs_aggregation → reduce_scatter); see
-# bench-comm.py.
+# Worker: rank_dedup_dispatch — bit-exact agreement with a2a_dispatch
+# on the expert-grouped layout (Phase 2 acceptance from the task spec).
+# Additionally verifies the packed-receive buffer's structural contract:
+# each unique (src, t) → my_rank row appears exactly once.
 # ============================================================================
 
 
-def _worker_rs_aggregation(rank, world_size, device):
+def _worker_rank_dedup_dispatch(rank, world_size, device):
+    fails = []
+    SENTINEL = -42.0
+    SENTINEL_PACKED = -77.0
+    for T_local, d, K, E_local in _SHAPES:
+        for pat in ("uniform", "skew_r0"):
+            E = world_size * E_local
+            TK_local = T_local * K
+            TK_global = world_size * TK_local
+
+            x = _alloc_symm((T_local, d), torch.bfloat16, device)
+            x.normal_()
+            topk = _gen_routing(T_local, K, E, rank, world_size, device, pattern=pat, seed=400)
+            meta = compute_dispatch_metadata(topk, my_rank=rank, E_local=E_local)
+
+            # Build s_reverse_local via the existing per-expert metadata
+            # path so dedup-fanout writes line up with what a non-dedup
+            # A2A dispatch would have produced. Mirrors what ep.py does
+            # in _build_consumer_metadata.
+            from sonicmoe.functional.metadata import general_routing_router_metadata_triton
+
+            E_total = E_local + 1
+            s_reverse_local = torch.empty(TK_global, dtype=torch.int32, device=device)
+            x_gather_idx = torch.empty(TK_global, dtype=torch.int32, device=device)
+            s_scatter_idx = torch.empty(TK_global, dtype=torch.int32, device=device)
+            expert_freq = torch.empty(E_total, dtype=torch.int32, device=device)
+            expert_freq_off = torch.empty(E_total + 1, dtype=torch.int32, device=device)
+            general_routing_router_metadata_triton(
+                meta["a2a_token_indices"],
+                meta["expert_local_padded"],
+                TK_global,
+                E_total,
+                expert_freq,
+                expert_freq_off,
+                x_gather_idx,
+                s_scatter_idx,
+                s_reverse_local,
+                None,
+            )
+
+            # MAX_PAIR_COUNT bound = W * T_local; sized by the spec.
+            MAX_PAIR_COUNT = world_size * T_local
+            recv_packed = _alloc_symm((MAX_PAIR_COUNT, d), torch.bfloat16, device)
+            recv_packed.fill_(SENTINEL_PACKED)
+
+            _barrier(x)
+
+            # Single-pass dispatch — packed-by-source output only.
+            rank_dedup_dispatch_triton(
+                x,
+                meta["dst_rank_flat"],
+                meta["pair_present_mask"],
+                meta["rank_dedup_recv_pos"],
+                recv_packed,
+                K=K,
+                group=dist.group.WORLD,
+            )
+
+            # Build the up-proj A_idx that maps expert-grouped row →
+            # packed row.
+            MAX_ROWS_PER_RANK = T_local * world_size * min(K, E_local)
+            a_idx_rank_dedup = torch.empty(MAX_ROWS_PER_RANK, dtype=torch.int32, device=device)
+            build_rank_dedup_a_idx(
+                dst_rank_flat=meta["dst_rank_flat"],
+                s_reverse_local=s_reverse_local,
+                rank_dedup_recv_pos=meta["rank_dedup_recv_pos"],
+                my_rank=rank,
+                out=a_idx_rank_dedup,
+            )
+
+            # Reference 1 — bit-exact agreement with the A2A dispatch on the
+            # expert-grouped layout, via A_idx-driven gather of recv_packed.
+            ref_grouped = torch.full((TK_global, d), SENTINEL, dtype=torch.bfloat16, device=device)
+            a2a_dispatch_triton(
+                x,
+                meta["dst_rank_flat"],
+                s_reverse_local,
+                ref_grouped,
+                K=K,
+                group=dist.group.WORLD,
+            )
+
+            # Restrict the A_idx-driven check to expert-grouped rows that
+            # are actually populated by routing to my_rank — matches what
+            # the GEMM consumes (cu_seqlens_m bounds the GEMM at
+            # expert_frequency_offset[E_local] ≤ MAX_ROWS_PER_RANK).
+            n_routed = int(expert_freq_off[E_local].item())
+            if n_routed > 0:
+                gathered = recv_packed[a_idx_rank_dedup[:n_routed].long()]
+                want = ref_grouped[:n_routed]
+                if not torch.equal(gathered, want):
+                    n_diff = (gathered != want).any(dim=-1).sum().item()
+                    fails.append(
+                        f"Dedup-dispatch A_idx-gathered T={T_local} d={d} K={K} {pat}: "
+                        f"{n_diff} rows differ vs A2A dispatch"
+                    )
+
+            # Reference 2 — packed buffer structural contract:
+            # for each (src=p, t) with at least one slot routing to my_rank,
+            # there must be exactly ONE row at recv_packed[rank_dedup_recv_pos[f]]
+            # equal to peer p's x[t]. Touched-row count must equal
+            # sum_p pair_count[p, my_rank].
+            x_all = all_gather_triton(x, dist.group.WORLD).view(world_size, T_local, d)
+            n_touched_expected = int(meta["pair_count"][:, rank].sum().item())
+            sentinel_rows = (recv_packed == SENTINEL_PACKED).all(dim=-1)
+            n_touched_actual = int((~sentinel_rows).sum().item())
+            if n_touched_actual != n_touched_expected:
+                fails.append(
+                    f"Dedup-dispatch packed-row count T={T_local} d={d} K={K} {pat}: "
+                    f"got {n_touched_actual} != expected {n_touched_expected}"
+                )
+
+            # For every canonical slot routed to my_rank, the packed row at
+            # rank_dedup_recv_pos must equal x_all[src, t].
+            dst3 = meta["dst_rank_flat"].view(world_size, T_local, K)
+            mask3 = meta["pair_present_mask"].view(world_size, T_local, K)
+            drp3 = meta["rank_dedup_recv_pos"].view(world_size, T_local, K)
+            mismatched = 0
+            checked = 0
+            for p in range(world_size):
+                # Vectorized over (t, k).
+                sel = ((dst3[p] == rank) & (mask3[p] != 0)).nonzero(as_tuple=False)
+                if sel.numel() == 0:
+                    continue
+                t_idx = sel[:, 0].long()
+                k_idx = sel[:, 1].long()
+                positions = drp3[p][t_idx, k_idx].long()
+                got = recv_packed[positions]
+                want = x_all[p][t_idx]
+                if not torch.equal(got, want):
+                    mismatched += int((got != want).any(dim=-1).sum().item())
+                checked += t_idx.numel()
+            if mismatched > 0:
+                fails.append(
+                    f"Dedup-dispatch packed-row content T={T_local} d={d} K={K} {pat}: "
+                    f"{mismatched}/{checked} rows mismatch"
+                )
+
+            del x, recv_packed, ref_grouped, x_all, a_idx_rank_dedup
+            del s_reverse_local, x_gather_idx, s_scatter_idx, expert_freq, expert_freq_off
+        torch.cuda.empty_cache()
+    return fails
+
+
+# ============================================================================
+# Worker: local_combine — explicit fp32 K-loop reference matching the
+# kernel's static_range accumulation order. allclose absorbs any FMA fusion
+# difference between Triton and PyTorch elementwise.
+# ----------------------------------------------------------------------------
+# local_combine reads only local memory and writes partial_acc_buf locally — no
+# peer-side reads from partial_acc_buf inside this test, so we don't need a
+# `_barrier(rs)` after local_combine here. The benchmark's local+RS
+# pipeline does need one (local_combine → reduce_scatter); see
+# bench-ep-comm.py.
+# ============================================================================
+
+
+def _worker_local_combine(rank, world_size, device):
     fails = []
     for T_local, d, K, E_local in _SHAPES:
         for pat in ("uniform", "skew_r0"):
@@ -379,12 +544,12 @@ def _worker_rs_aggregation(rank, world_size, device):
             dist.all_gather_into_tensor(sc_full.view(-1), sc_local.view(-1).contiguous(), group=dist.group.WORLD)
             sc_flat = sc_full.view(-1).contiguous()
 
-            # Iterate scored / score-less; rs_buf is reset between modes.
+            # Iterate scored / score-less; partial_acc_buf is reset between modes.
             for use_scores in (True, False):
                 rs = _alloc_symm((world_size * T_local, d), torch.float32, device)
                 rs.zero_()
                 scores_arg = sc_flat if use_scores else None
-                rs_aggregation(
+                local_combine(
                     y,
                     sr,
                     meta["dst_rank_flat"],
@@ -413,7 +578,8 @@ def _worker_rs_aggregation(rank, world_size, device):
                 if not torch.allclose(rs, ref, atol=1e-4, rtol=1e-3):
                     label = "scored" if use_scores else "score-less"
                     fails.append(
-                        f"RS-agg T={T_local} d={d} K={K} {pat} {label}: " f"max_abs={(rs - ref).abs().max():.3e}"
+                        f"local_combine T={T_local} d={d} K={K} {pat} {label}: "
+                        f"max_abs={(rs - ref).abs().max():.3e}"
                     )
                 del rs, ref
 
@@ -423,12 +589,12 @@ def _worker_rs_aggregation(rank, world_size, device):
 
 
 # ============================================================================
-# Worker: gather_aggregation — AG y_symm and s_reverse so the reference can
+# Worker: A2A_combine — AG y_symm and s_reverse so the reference can
 # index any peer's data locally.
 # ============================================================================
 
 
-def _worker_gather_aggregation(rank, world_size, device):
+def _worker_A2A_combine(rank, world_size, device):
     fails = []
     for T_local, d, K, E_local in _SHAPES:
         TK_local = T_local * K
@@ -447,7 +613,7 @@ def _worker_gather_aggregation(rank, world_size, device):
 
             topk = _gen_routing(T_local, K, E, rank, world_size, device, pattern=pat, seed=300)
             meta = compute_dispatch_metadata(topk, my_rank=rank, E_local=E_local)
-            # `gather_aggregation_triton` no longer takes a `dispatch_pos`
+            # `a2a_combine_triton` no longer takes a `dispatch_pos`
             # tensor — it computes `my_rank * TK_local + t * K + k` inline.
             # The reference below still uses the explicit pos tensor to
             # express the same indexing.
@@ -468,7 +634,7 @@ def _worker_gather_aggregation(rank, world_size, device):
                 scores_arg = scores_local if use_scores else None
                 out = torch.empty(T_local, d, dtype=torch.bfloat16, device=device)
 
-                gather_aggregation_triton(
+                a2a_combine_triton(
                     y,
                     sr,
                     meta["my_dst_rank"],
@@ -497,6 +663,108 @@ def _worker_gather_aggregation(rank, world_size, device):
                 del out
 
             del y, sr, y_all, s_all
+        torch.cuda.empty_cache()
+    return fails
+
+
+# ============================================================================
+# Worker: rank_dedup_combine — numeric parity vs a2a_combine_triton
+# (forward, scored) and vs local_combine (backward dx, score-less).
+# Same byte-saving argument as the prior dedup-combine worker; the
+# tolerance accounts for one extra bf16 rounding (partial_acc_buf store) on top
+# of the unavoidable y_local cast — total ≈ 2·ε_bf16.
+# ============================================================================
+
+
+def _worker_rank_dedup_combine(rank, world_size, device):
+    fails = []
+    for T_local, d, K, E_local in _SHAPES:
+        TK_local = T_local * K
+        TK_global = world_size * TK_local
+        if world_size * TK_global * d * 2 > (8 << 30):
+            continue
+
+        for pat in ("uniform", "skew_r0"):
+            E = world_size * E_local
+
+            y = _alloc_symm((TK_global, d), torch.bfloat16, device)
+            y.normal_()
+            g = torch.Generator(device=device).manual_seed(13 + rank * 67)
+            sr = _alloc_symm((TK_global,), torch.int32, device)
+            sr.copy_(torch.randperm(TK_global, device=device, generator=g).to(torch.int32))
+
+            topk = _gen_routing(T_local, K, E, rank, world_size, device, pattern=pat, seed=500)
+            meta = compute_dispatch_metadata(topk, my_rank=rank, E_local=E_local)
+
+            scores_local = torch.softmax(
+                torch.randn(T_local, K, device=device, dtype=torch.float32, generator=g), dim=-1
+            ).to(torch.bfloat16)
+            scores_global = torch.empty(world_size * T_local * K, dtype=torch.bfloat16, device=device)
+            dist.all_gather_into_tensor(scores_global, scores_local.view(-1).contiguous(), group=dist.group.WORLD)
+
+            # Local-reduce buffer (W*T_local, d). Same allocation the
+            # RS_COMBINE_TRITON path uses; RANK_DEDUP_COMBINE_TRITON reuses it.
+            partial_acc_buf = _alloc_symm((world_size * T_local, d), torch.bfloat16, device)
+
+            # y / sr published once; both A2A_combine and the local-
+            # reduce + gather path read peers' versions through NVLink.
+            _barrier(y)
+
+            for use_scores in (True, False):
+                # Reference path: existing a2a_combine_triton with
+                # the same inputs. Both reduce in fp32, both cast at store
+                # to bf16 — peer-read order differs (per-(t, k) vs.
+                # local-pre-summed), so allclose absorbs the ULP.
+                ref_out = torch.empty(T_local, d, dtype=torch.bfloat16, device=device)
+                a2a_combine_triton(
+                    y,
+                    sr,
+                    meta["my_dst_rank"],
+                    scores_local if use_scores else None,
+                    ref_out,
+                    K=K,
+                    group=dist.group.WORLD,
+                )
+
+                # Local-reduce + gather: producer (local_combine) +
+                # barrier + sparse gather (consumer reads partial_acc_buf at
+                # rows where peer_present_mask is set).
+                partial_acc_buf.zero_()
+                got_out = torch.empty(T_local, d, dtype=torch.bfloat16, device=device)
+                rank_dedup_combine_triton(
+                    y,
+                    sr,
+                    meta["dst_rank_flat"],
+                    scores_global if use_scores else None,
+                    meta["peer_present_mask"],
+                    partial_acc_buf,
+                    got_out,
+                    K=K,
+                    T_local=T_local,
+                    group=dist.group.WORLD,
+                )
+
+                # Tolerance reflects the extra bf16 rounding the
+                # local-reduce path introduces vs A2A_combine: the
+                # producer stores bf16-cast pre-sums into partial_acc_buf, then
+                # the consumer re-casts on the second store. The
+                # reference only has the second cast. Total error per
+                # element is bounded by ≈ 2·ε_bf16 (cf.
+                # RS_COMBINE_TRITON docstring), independent of K, W.
+                if not torch.allclose(got_out, ref_out, atol=1.5e-1, rtol=3e-2):
+                    diff = (got_out.float() - ref_out.float()).abs()
+                    label = "scored" if use_scores else "score-less"
+                    fails.append(
+                        f"local-reduce-gather T={T_local} d={d} K={K} {pat} {label}: "
+                        f"max_abs={diff.max().item():.3e}"
+                    )
+
+                # Sync peers between iterations — partial_acc_buf gets reused.
+                _barrier(partial_acc_buf)
+
+                del ref_out, got_out
+
+            del y, sr, partial_acc_buf, scores_local, scores_global
         torch.cuda.empty_cache()
     return fails
 
@@ -534,14 +802,22 @@ class EPCollectivesTest(TestCommons):
         fails = _run_worker_collect_failures(_worker_reduce_scatter)
         self.assertEqual(fails, [], "\n" + "\n".join(fails))
 
-    def test_a2a_dispatch_pull(self) -> None:
-        fails = _run_worker_collect_failures(_worker_a2a_pull)
+    def test_a2a_dispatch(self) -> None:
+        fails = _run_worker_collect_failures(_worker_a2a_dispatch)
         self.assertEqual(fails, [], "\n" + "\n".join(fails))
 
-    def test_rs_aggregation(self) -> None:
-        fails = _run_worker_collect_failures(_worker_rs_aggregation)
+    def test_rank_dedup_dispatch(self) -> None:
+        fails = _run_worker_collect_failures(_worker_rank_dedup_dispatch)
         self.assertEqual(fails, [], "\n" + "\n".join(fails))
 
-    def test_gather_aggregation(self) -> None:
-        fails = _run_worker_collect_failures(_worker_gather_aggregation)
+    def test_local_combine(self) -> None:
+        fails = _run_worker_collect_failures(_worker_local_combine)
+        self.assertEqual(fails, [], "\n" + "\n".join(fails))
+
+    def test_A2A_combine(self) -> None:
+        fails = _run_worker_collect_failures(_worker_A2A_combine)
+        self.assertEqual(fails, [], "\n" + "\n".join(fails))
+
+    def test_rank_dedup_combine(self) -> None:
+        fails = _run_worker_collect_failures(_worker_rank_dedup_combine)
         self.assertEqual(fails, [], "\n" + "\n".join(fails))

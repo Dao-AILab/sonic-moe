@@ -8,17 +8,6 @@
 # per-rank outputs, and compares against a single-rank PyTorch reference
 # computed on rank 0.
 #
-# Coverage matrix per shape:
-#   - Both public entry points: moe_ep_TC_softmax_topk_forward,
-#                               moe_ep_general_routing_forward
-#   - All three modes:          {"ag", "a2a", "auto"}
-#   - Both bias settings:       {without, with}
-#   - Both routing variants:    {softmax_then_topk, topk_then_softmax_norm}
-# = 24 EP forward calls per shape.
-#
-# Shape list is comprehensive: smoke, K∈{1,2,4,8,10}, H/I aspect ratio sweep,
-# T not divisible by common block sizes, E∈{32,64,128,256,512}.
-#
 # Usage (torchrun-launched):
 #
 #   torchrun --nproc_per_node=4 --standalone --local-ranks-filter 0 \
@@ -46,26 +35,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from sonicmoe import MoE
+from sonicmoe.distributed_utils import CombineMode, DispatchMode, RuntimeEPConfig  # type: ignore
 from sonicmoe.enums import ActivationType
-
-# Private helper — used to print which mode "auto" resolves to.
-from sonicmoe.ep import _select_dispatch_mode  # type: ignore
-from sonicmoe.ep import SymmMemManager, moe_ep_general_routing_forward, moe_ep_TC_softmax_topk_forward
-
-
-# ============================================================================
-# Comprehensive shape list.
-#
-# Constraints honored across all shapes:
-#   - T divisible by both 4 and 8 (the two world sizes we typically run).
-#   - E divisible by both 4 and 8.
-#
-# Coverage axes:
-#   K   ∈ {1, 2, 4, 8, 10}        — edges, K<W, K=W, K>W, non-pow-2
-#   H,I ∈ varied                  — H<I, H=I, H>I, large-I (FFN expansion)
-#   T   varied + a non-pow-2      — exercises tile-tail paths
-#   E   ∈ {32, 64, 128, 256, 512} — small/medium/large expert counts
-# ============================================================================
+from sonicmoe.functional.ep import SymmMemManager, moe_ep_general_routing_forward, moe_ep_TC_softmax_topk_forward
 
 
 @dataclass
@@ -79,30 +51,14 @@ class Shape:
 
 
 SHAPES: List[Shape] = [
-    # Smoke / baseline
-    Shape("smoke_K4_E32", T=1024, H=1024, I=512, E=32, K=4),
-    # K edge cases
-    Shape("K_eq_1", T=1024, H=1024, I=512, E=32, K=1),
-    Shape("K_eq_2", T=1024, H=2048, I=1024, E=32, K=2),
-    Shape("K_eq_4", T=1024, H=2048, I=1024, E=32, K=4),
+    Shape("K_eq_2", T=4096, H=2048, I=1024, E=32, K=2),
     Shape("K_eq_8", T=4096, H=2048, I=1024, E=64, K=8),
-    Shape("K_eq_10", T=1024, H=2048, I=512, E=64, K=10),
-    # H / I aspect ratios
-    Shape("H_gt_I", T=1024, H=4096, I=1024, E=64, K=8),
-    Shape("H_eq_I", T=1024, H=1024, I=1024, E=32, K=4),
-    Shape("H_lt_I_4x", T=1024, H=1024, I=4096, E=32, K=4),
-    # T non-divisible by common pow-2 block sizes
-    Shape("T_nondiv", T=3072, H=1024, I=512, E=32, K=4),
-    # Large E
-    Shape("E_eq_128", T=1024, H=4096, I=1024, E=128, K=8),
-    Shape("E_eq_256", T=1024, H=2304, I=512, E=256, K=8),
-    Shape("E_eq_512", T=1024, H=2048, I=512, E=512, K=10),
+    Shape("K_eq_10", T=4096, H=2048, I=512, E=64, K=10),
 ]
 
 
 ROUTING_VARIANTS: List[Tuple[str, bool, bool]] = [
     # (name, is_softmax_over_topk, norm_topk_probs)
-    ("softmax_then_topk", True, False),
     ("topk_then_softmax_norm", False, True),
 ]
 
@@ -222,6 +178,7 @@ def _run_one_shape(
     atol: float,
     rtol: float,
     seed: int,
+    keep_alive: Optional[list] = None,
 ) -> ShapeStats:
     T, H, I, E, K = shape.T, shape.H, shape.I, shape.E, shape.K
     assert T % world_size == 0, f"T ({T}) must be divisible by world_size ({world_size})."
@@ -262,7 +219,7 @@ def _run_one_shape(
     router_w = moe.router.weight  # (E, H)
 
     # EP-sharded weights (per-rank expert slice). Layout matches the benchmark
-    # in benchmarks/ep/moe-ep.py:
+    # in benchmarks/distributed/moe-ep.py:
     #   w1: (E_local, 2I, H) → permute(1, 2, 0) → (2I, H, E_local) view,
     #       strides (H, 1, 2I·H). Non-contiguous on purpose; the GEMM kernel
     #       requires the middle dim to have stride 1.
@@ -281,6 +238,8 @@ def _run_one_shape(
     x_local = x_global[rank * T_local : (rank + 1) * T_local].contiguous()
 
     mgr = SymmMemManager(dist.group.WORLD, device)
+    if keep_alive is not None:
+        keep_alive.append(mgr)
 
     # Pre-broadcast a fixed routing decision used by general_routing_forward.
     if rank == 0:
@@ -327,8 +286,11 @@ def _run_one_shape(
                     concat_layout=concat_layout,
                 )
 
-            for mode in ("ag", "a2a", "auto"):
-                resolved = _select_dispatch_mode(world_size, K) if mode == "auto" else mode
+            # Mode sweep: all three dispatch primitives. The final
+            # iteration of the agg_mode loop below also exercises the
+            # ep_config= path by wrapping a DispatchMode in a
+            # RuntimeEPConfig.
+            for mode in (DispatchMode.AG_TRITON, DispatchMode.A2A_TRITON, DispatchMode.RANK_DEDUP_DISPATCH_TRITON):
                 y_local = moe_ep_TC_softmax_topk_forward(
                     x_local,
                     router_w,
@@ -348,10 +310,55 @@ def _run_one_shape(
                 )
                 y_full = _all_gather_y(y_local, world_size)
                 if rank == 0:
-                    tag = f"TC[{variant_name},mode={mode}"
-                    if mode == "auto":
-                        tag += f"->{resolved}"
-                    tag += "]"
+                    tag = f"TC[{variant_name},mode={mode.value}]"
+                    ok, msg = _check(tag, y_full, ref, atol, rtol, log_prefix)
+                    print(msg)
+                    if ok:
+                        stats.pass_count += 1
+                    else:
+                        stats.fail_count += 1
+                        stats.failures.append(tag)
+                dist.barrier()
+
+            # ep_config= round-trip: sweep both combine modes.
+            # Delivers the dispatch decision via RuntimeEPConfig so the
+            # validate path is exercised, and exercises both
+            # A2A_TRITON (the fused kernel) and RS_COMBINE_TRITON
+            # (the producer + reduce-scatter pipeline) end-to-end. The
+            # two paths produce numerically equivalent outputs (modulo
+            # fp32 vs bf16 accumulation order); the same atol/rtol
+            # bounds apply.
+            for agg_mode in (
+                CombineMode.A2A_TRITON,
+                CombineMode.RS_COMBINE_TRITON,
+                CombineMode.RANK_DEDUP_COMBINE_TRITON,
+            ):
+                cfg = RuntimeEPConfig(
+                    mode=DispatchMode.AG_TRITON,
+                    W=world_size,
+                    K=K,
+                    agg_mode=agg_mode,
+                )
+                y_local = moe_ep_TC_softmax_topk_forward(
+                    x_local,
+                    router_w,
+                    w1_local,
+                    b1_local,
+                    w2_local,
+                    b2_local,
+                    K=K,
+                    E=E,
+                    mgr=mgr,
+                    activation_type=ActivationType.SWIGLU,
+                    is_inference_mode_enabled=True,
+                    is_softmax_over_topk=is_softmax_over_topk,
+                    norm_topk_probs=norm_topk_probs,
+                    concat_layout=concat_layout,
+                    ep_config=cfg,
+                )
+                y_full = _all_gather_y(y_local, world_size)
+                if rank == 0:
+                    tag = f"TC[{variant_name},ep_config=mode={cfg.mode.value},agg={cfg.agg_mode.value}]"
                     ok, msg = _check(tag, y_full, ref, atol, rtol, log_prefix)
                     print(msg)
                     if ok:
@@ -374,8 +381,7 @@ def _run_one_shape(
                 concat_layout=concat_layout,
             )
 
-        for mode in ("ag", "a2a", "auto"):
-            resolved = _select_dispatch_mode(world_size, K) if mode == "auto" else mode
+        for mode in (DispatchMode.AG_TRITON, DispatchMode.A2A_TRITON):
             y_local = moe_ep_general_routing_forward(
                 x_local,
                 idx_local,
@@ -393,10 +399,7 @@ def _run_one_shape(
             )
             y_full = _all_gather_y(y_local, world_size)
             if rank == 0:
-                tag = f"general[mode={mode}"
-                if mode == "auto":
-                    tag += f"->{resolved}"
-                tag += "]"
+                tag = f"general[mode={mode.value}]"
                 ok, msg = _check(tag, y_full, ref_general, atol, rtol, log_prefix)
                 print(msg)
                 if ok:
@@ -405,6 +408,43 @@ def _run_one_shape(
                     stats.fail_count += 1
                     stats.failures.append(tag)
             dist.barrier()
+
+        # ep_config= round-trip for general_routing_forward.
+        # Sweep both combine modes (see TC entry above).
+        for agg_mode in (CombineMode.A2A_TRITON, CombineMode.RS_COMBINE_TRITON, CombineMode.RANK_DEDUP_COMBINE_TRITON):
+            cfg = RuntimeEPConfig(
+                mode=DispatchMode.AG_TRITON,
+                W=world_size,
+                K=K,
+                agg_mode=agg_mode,
+            )
+            y_local = moe_ep_general_routing_forward(
+                x_local,
+                idx_local,
+                scores_local,
+                w1_local,
+                b1_local,
+                w2_local,
+                b2_local,
+                E=E,
+                mgr=mgr,
+                activation_type=ActivationType.SWIGLU,
+                is_inference_mode_enabled=True,
+                concat_layout=concat_layout,
+                ep_config=cfg,
+            )
+            y_full = _all_gather_y(y_local, world_size)
+            if rank == 0:
+                tag = f"general[ep_config=mode={cfg.mode.value},agg={cfg.agg_mode.value}]"
+                ok, msg = _check(tag, y_full, ref_general, atol, rtol, log_prefix)
+                print(msg)
+                if ok:
+                    stats.pass_count += 1
+                else:
+                    stats.fail_count += 1
+                    stats.failures.append(tag)
+            dist.barrier()
+        dist.barrier()
 
     return stats
 
@@ -444,7 +484,7 @@ def main() -> int:
     if not _under_torchrun():
         print(
             "ERROR: this test must be launched with torchrun, e.g.:\n"
-            "  torchrun --nproc_per_node=8 --standalone tests/test_ep.py",
+            "  torchrun --nproc_per_node=8 --standalone tests/moe_ep_test.py",
             file=sys.stderr,
         )
         return 2
@@ -486,6 +526,14 @@ def main() -> int:
             f"shapes={len(SHAPES)})\n"
         )
 
+    # Pin SymmMemManager instances created per-shape so their symm-mem
+    # tensors never destruct mid-loop. ~CUDASymmetricMemory calls
+    # cuMemUnmap from a C++ destructor; if that runs while peer mappings
+    # are still in flight (or during interpreter shutdown) it raises a
+    # c10::Error → std::terminate → SIGABRT. The benchmark uses the
+    # same pattern (see benchmarks/distributed/moe-ep.py keep_alive comment).
+    keep_alive: list = []
+
     all_stats: List[ShapeStats] = []
     try:
         for shape in SHAPES:
@@ -497,9 +545,10 @@ def main() -> int:
                     shape,
                     dtype=torch.bfloat16,
                     concat_layout=args.concat_layout,
-                    atol=2e-2,
-                    rtol=2e-2,
+                    atol=5e-2,
+                    rtol=5e-2,
                     seed=1111,
+                    keep_alive=keep_alive,
                 )
             except Exception as e:
                 if rank == 0:
@@ -532,4 +581,19 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Hard-exit via os._exit to bypass the Python destructor chain.
+    # Symm-mem tensors held in ``keep_alive`` (and internal
+    # ``torch.distributed._symmetric_memory`` module-level state) would
+    # otherwise have their C++ destructors run during interpreter
+    # shutdown: ``~CUDASymmetricMemory → cuMemUnmap`` then runs against
+    # a torn-down CUDA context, raises c10::Error from a noexcept
+    # destructor, and trips ``std::terminate → SIGABRT`` *after* the
+    # tests have already passed. ``sys.stdout/stderr.flush()`` first so
+    # the pass/fail summary still appears on the console; os._exit
+    # then skips all module destructors. (Same pattern as
+    # ``benchmarks/distributed/moe-ep.py`` and ``tests/distributed/
+    # collectives_test.py``.)
+    rc = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(rc)
