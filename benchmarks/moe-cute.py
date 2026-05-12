@@ -169,6 +169,12 @@ def parse_arguments() -> argparse.Namespace:
         default=False,
         help="Use concat [gate; up] weight layout instead of interleaved",
     )
+    parser.add_argument(
+        "--fp8",
+        action="store_true",
+        default=False,
+        help="Use mixed fp8 forward (MXFP8 expert GEMMs) with bf16 backward (SM100/Blackwell only)",
+    )
     args = parser.parse_args()
 
     if len(args.thiek) != 5:
@@ -193,6 +199,7 @@ def run(
     is_softmax_over_topk: bool = True,
     norm_topk_probs: bool = False,
     concat_layout: bool = False,
+    fp8: bool = False,
     **kwargs,
 ):
     torch_dtype = {cutlass.BFloat16: torch.bfloat16, cutlass.Float16: torch.float16}[dtype]
@@ -481,6 +488,51 @@ def run(
     tflops = flops / (bwd_time / 1e3) / 1e12
     print0(f"[bold green][/bold green] Cute-DSL Bwd Average time: {bwd_time:.3f} ms, TFLOPS: {tflops:.1f}")
 
+    if fp8 and is_glu(activation):
+        fp8_fwd_flops = 6 * T * I * H * K
+        fp8_e2e_flops = 18 * T * I * H * K
+
+        time.sleep(0.5)
+        torch.cuda.synchronize()
+
+        def forward_only_fp8():
+            return moe_TC_softmax_topk_layer(
+                x, router_w,
+                w1.permute(1, 2, 0), None,
+                w2.permute(1, 2, 0), None,
+                moe.top_k, None, activation, True,
+                is_softmax_over_topk=is_softmax_over_topk,
+                norm_topk_probs=norm_topk_probs,
+                concat_layout=concat_layout,
+                use_fp8=True,
+            )
+
+        fwd_fp8_timing = do_bench(forward_only_fp8, warmup=warmup, rep=repeats)
+        tflops = fp8_fwd_flops / (fwd_fp8_timing * 1e9)
+        print0(f"[bold cyan] Mixed fp8 Fwd (inference): {fwd_fp8_timing:.3f} ms, TFLOPS: {tflops:.1f}[/bold cyan]")
+
+        time.sleep(0.5)
+        torch.cuda.synchronize()
+        dout_fp8 = torch.randn_like(x, requires_grad=True)
+
+        def forward_backward_fp8():
+            o, _, _ = moe_TC_softmax_topk_layer(
+                x, router_w,
+                w1.permute(1, 2, 0), None,
+                w2.permute(1, 2, 0), None,
+                moe.top_k, None, activation, False,
+                is_softmax_over_topk=is_softmax_over_topk,
+                norm_topk_probs=norm_topk_probs,
+                concat_layout=concat_layout,
+                use_fp8=True,
+            )
+            o.backward(dout_fp8, retain_graph=True)
+            x.grad = w1.grad = w2.grad = router_w.grad = None
+
+        fp8_e2e_timing = do_bench(forward_backward_fp8, warmup=warmup, rep=repeats)
+        tflops = fp8_e2e_flops / (fp8_e2e_timing * 1e9)
+        print0(f"[bold cyan] Mixed fp8 Fwd+Bwd: {fp8_e2e_timing:.3f} ms, TFLOPS: {tflops:.1f}[/bold cyan]")
+
 
 if __name__ == "__main__":
     args = parse_arguments()
@@ -493,5 +545,6 @@ if __name__ == "__main__":
         is_softmax_over_topk=(not args.topk_over_softmax),
         norm_topk_probs=args.norm_topk_probs,
         concat_layout=args.concat_layout,
+        fp8=args.fp8,
     )
     print("PASS")
