@@ -32,6 +32,7 @@
 # ********************************************************************************
 
 import argparse
+import datetime
 import itertools
 import os
 import sys
@@ -280,13 +281,54 @@ def _gather_to_rank0(t_local: torch.Tensor, world_size: int, rank: int):
     return None
 
 
-def do_bench_distributed(fn, warmup=5, rep=100, calls_per_iter=3):
+def do_bench_distributed(fn, warmup=30, rep=100, calls_per_iter=1):
+    """Time ``fn`` and return mean per-call ms (pipelined within a rep block).
+
+    One CUDA-event pair brackets ``rep`` back-to-back ``fn()`` calls,
+    divided by ``rep``. The GPU stream stays busy the whole window —
+    no per-call ``cuda.synchronize()`` / ``dist.barrier()`` — so the
+    reported time reflects the steady-state per-call cost that real
+    training pays (fwd → bwd → optimizer → fwd flows without CPU drain
+    gaps).
+
+    Why not per-call sync?  On H100 with NVLink and aggressive idle
+    power management, draining the stream between every call lets the
+    GPUs drop to idle clocks and accumulates large cross-rank skew at
+    the first symm-mem / NCCL sync point of the next call — the
+    barrier kernel itself is ~0.1 ms when ranks are tight, but tens
+    of ms after a drain + CPU-bookkeeping gap. That cost is a bench
+    artifact, not a real per-call cost. Pipelined timing matches what
+    the individual EP primitive profiler reports under
+    ``NetworkProfiler.bench_fn``.
+
+    Host-blocking calls like ``.item()`` (the ``CPU_sync_on_runtime``
+    path) are still captured: they drain the stream from the host
+    side, which appears as GPU idle time inside the rep window and
+    counts toward elapsed_time. What pipelined timing does NOT count
+    is per-call Python interpreter overhead between fn() calls —
+    typically sub-millisecond and not the cost we're after.
+
+    Cross-rank alignment: one ``dist.barrier()`` + ``synchronize()``
+    before ``start.record()`` ensures all ranks enter the timed
+    window together. Within the rep loop, the cross-rank symm-mem
+    barriers inside ``fn()`` keep ranks tight without re-introducing
+    CPU stalls.
+
+    ``calls_per_iter`` runs the timing block multiple times and
+    averages. Between blocks the GPU may briefly idle — that gap is
+    untimed.
+    """
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+        torch.cuda.synchronize()
+
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    local_ms = 0
+
+    local_ms = 0.0
     for _ in range(calls_per_iter):
         start.record()
         for _ in range(rep):
@@ -294,6 +336,9 @@ def do_bench_distributed(fn, warmup=5, rep=100, calls_per_iter=3):
         end.record()
         torch.cuda.synchronize()
         local_ms += start.elapsed_time(end) / rep
+        if dist.is_initialized():
+            dist.barrier()
+            torch.cuda.synchronize()
     return local_ms / calls_per_iter
 
 
@@ -471,7 +516,16 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
 
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
-    dist.init_process_group("nccl", device_id=device)
+    # NCCL collective timeout bumped from the 10-minute default to
+    # 60 minutes: quack's GEMM autotune + Triton's EP combine/dispatch
+    # config sweeps can together exceed 10 min on a cold cache (esp.
+    # on H100 first runs), and a single straggler rank trips the
+    # watchdog while peers are still compiling.
+    dist.init_process_group(
+        "nccl",
+        device_id=device,
+        timeout=datetime.timedelta(minutes=60),
+    )
 
     torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
     activation = ActivationType(args.activation)
@@ -500,14 +554,11 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         routing_mode = "softmax_over_topk" if is_softmax_over_topk else f"topk_over_softmax (norm={norm_topk_probs})"
         layout_mode = "concat [gate; up]" if concat_layout else "interleaved [g0, u0, g1, u1, ...]"
         mode_status = f"override={mode_override.value}" if mode_override is not None else "auto (via NetworkProfiler)"
-        agg_status = (
-            f"override={agg_mode_override.value}" if agg_mode_override is not None else "auto (via NetworkProfiler)"
-        )
         print0(
-            f"[bold]EP forward+backward + local baselines[/bold]  W {W}, "
-            f"T {T} (T_local {T_local}), H {H}, I {I}, "
+            f"[bold]EP forward+backward + local baselines[/bold]  EP world size W {W}, "
+            f"Minibatch size T {T} (Per-rank microbatch size T_local {T_local}), H {H}, I {I}, "
             f"E {E} (E_local {E_local}), K {K}, "
-            f"dtype {args.dtype}, mode {mode_status}, agg_mode {agg_status}, "
+            f"dtype {args.dtype}, mode {mode_status} "
             f"routing: {routing_mode}, w1 layout: {layout_mode}, "
             f"bias: {add_bias}, "
             f"redispatch_x_in_backward: {redispatch_x_in_backward}, "
@@ -891,7 +942,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     fwdbwd_flops_local = 3 * fwd_flops_local
 
     repeats = 100
-    warmup = 5
+    warmup = 30
 
     time.sleep(0.5)
 
@@ -1026,6 +1077,12 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     dist.barrier()
 
     def ep_fwd_inference():
+        # Pass both flags through even though the EP forward forces
+        # them off internally under is_inference_mode_enabled=True —
+        # keeps the closures symmetric with ep_fwd_training and
+        # _bench_ep_fwd_bwd, and prevents future changes to the
+        # inference-time flag-handling from silently regressing the
+        # measurement.
         return moe_ep_TC_softmax_topk_forward(
             x,
             router_w,
@@ -1034,6 +1091,8 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             w2,
             b2,
             is_inference_mode_enabled=True,
+            redispatch_x_in_backward=redispatch_x_in_backward,
+            CPU_sync_on_runtime=CPU_sync_on_runtime,
             **fwd_kwargs,
         )
 
@@ -1055,6 +1114,12 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     dist.barrier()
 
     def ep_fwd_training():
+        # Pass both flags so the training-fwd timing reflects the same
+        # configuration the fwd+bwd run uses; without this, the
+        # forward measured here is vanilla and the derived
+        # ``ep_bwd_ms = ep_fwdbwd_ms - ep_fwd_train_ms`` mis-attributes
+        # the forward's CPU-sync / redispatch overhead to the
+        # backward.
         return moe_ep_TC_softmax_topk_forward(
             x,
             router_w,
@@ -1063,6 +1128,8 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             w2,
             b2,
             is_inference_mode_enabled=False,
+            redispatch_x_in_backward=redispatch_x_in_backward,
+            CPU_sync_on_runtime=CPU_sync_on_runtime,
             **fwd_kwargs,
         )
 
@@ -1140,11 +1207,38 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
 
     # ====================================================================
     # 4) Local baselines T_local
+    # --------------------------------------------------------------------
+    # Must use E_local experts (not full E) to mirror what one rank
+    # actually computes in EP: T_local·K token-expert pairs routed
+    # across E_local experts. Running T_local tokens through all E
+    # experts produces per-expert GEMMs whose M dimension is W× smaller
+    # than EP's, so each GEMM runs at lower compute efficiency — the
+    # baseline ends up slower than EP itself and the
+    # ``exposed_network = ep - baseline`` calculation produces
+    # nonsensical negative values. With E_local-sized weights, the
+    # baseline's per-expert M = T_local·K/E_local matches EP's exactly,
+    # making it a true per-rank irreducible compute lower bound.
     # ====================================================================
     if rank == 0:
-        print0(f"\n[bold]── Per-rank baselines (T_local={T_local}, no communication) ──[/bold]")
+        print0(
+            f"\n[bold]── Per-rank baselines (T={T_local}, E={E_local}, K={K}, single-GPU with E_local scale) ──[/bold]"
+        )
 
-    x_local_nograd = x.clone().detach()
+    assert K <= E_local, f"local-baseline K={K} must be ≤ E_local={E_local}"
+
+    # E_local-sized slices of the full-precision weights/router. These
+    # are intentionally separate from ``w1`` / ``w2`` (the QuACK-strided
+    # per-rank tensors fed to the EP path) — the baseline calls the
+    # non-EP layer which expects torch-native layout.
+    w1_full_baseline = w1_full[:E_local].clone()
+    w2_full_baseline = w2_full[:E_local].clone()
+    b1_full_baseline = b1_full[:E_local].clone() if add_bias else None
+    b2_full_baseline = b2_full[:E_local].clone() if add_bias else None
+    router_w_baseline = router_w[:E_local].clone()
+    w1_local_fmt_baseline = w1_full_baseline.permute(1, 2, 0)
+    w2_local_fmt_baseline = w2_full_baseline.permute(1, 2, 0)
+
+    x_local_nograd = x.detach().clone()
     x_local_grad = x.clone().detach().requires_grad_(True)
 
     time.sleep(0.5)
@@ -1153,11 +1247,11 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
 
     local_fwd_train_Tl_ms = _bench_local_fwd(
         x_local_nograd,
-        router_w,
-        w1_local_fmt,
-        b1_full,
-        w2_local_fmt,
-        b2_full,
+        router_w_baseline,
+        w1_local_fmt_baseline,
+        b1_full_baseline,
+        w2_local_fmt_baseline,
+        b2_full_baseline,
         is_inference=False,
         warmup=warmup,
         repeats=repeats,
@@ -1166,7 +1260,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     if rank == 0:
         tflops = fwd_flops_local / (local_fwd_train_Tl_ms * 1e9)
         print0(
-            f" {f'Per-rank Fwd (T_local={T_local}, training)':<42} Average time: {local_fwd_train_Tl_ms:<8.2f} ms, TFLOPS: {tflops:<5.0f}"
+            f" {f'Per-rank Fwd (T={T_local}, E={E_local}, K={K}, training)':<48} Average time: {local_fwd_train_Tl_ms:<8.2f} ms, TFLOPS: {tflops:<5.0f}"
         )
 
     local_bwd_Tl_ms = None
@@ -1177,13 +1271,13 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
 
         local_fwdbwd_Tl_ms = _bench_local_fwd_bwd(
             x_local_grad,
-            router_w,
-            w1_full,
-            b1_full,
-            w2_full,
-            b2_full,
-            w1_local_fmt,
-            w2_local_fmt,
+            router_w_baseline,
+            w1_full_baseline,
+            b1_full_baseline,
+            w2_full_baseline,
+            b2_full_baseline,
+            w1_local_fmt_baseline,
+            w2_local_fmt_baseline,
             warmup=warmup,
             repeats=repeats,
             **local_kwargs,
@@ -1192,7 +1286,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         if rank == 0:
             bwd_tflops = bwd_flops_local / (local_bwd_Tl_ms * 1e9) if local_bwd_Tl_ms > 0 else 0.0
             print0(
-                f" {f'Per-rank Bwd (T_local={T_local})':<42} Average time: {local_bwd_Tl_ms:<8.2f} ms, TFLOPS: {bwd_tflops:<5.0f}"
+                f" {f'Per-rank Bwd (T={T_local}, E={E_local}, K={K})':<48} Average time: {local_bwd_Tl_ms:<8.2f} ms, TFLOPS: {bwd_tflops:<5.0f}"
             )
 
     # ====================================================================
@@ -1203,7 +1297,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     local_bwd_T_ms = None
     if not args.skip_local_T:
         if rank == 0:
-            print0(f"\n[bold]── Per-rank baselines (T={T}, single-GPU full-scale) ──[/bold]")
+            print0(f"\n[bold]── Per-rank baselines (T={T}, E={E}, K={K}, single-GPU full EP scale) ──[/bold]")
 
         x_full_nograd = x_global.clone().detach()
         x_full_grad = x_global.clone().detach().requires_grad_(True)
@@ -1227,7 +1321,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         if rank == 0:
             tflops = fwd_flops_global / (local_fwd_train_T_ms * 1e9)
             print0(
-                f" {f'Per-rank Fwd (T={T}, training)':<42} Average time: {local_fwd_train_T_ms:<8.2f} ms, TFLOPS: {tflops:<5.0f}"
+                f" {f'Per-rank Fwd (T={T}, E={E}, K={K}, training)':<42} Average time: {local_fwd_train_T_ms:<8.2f} ms, TFLOPS: {tflops:<5.0f}"
             )
 
         if not args.skip_bench_bwd:
@@ -1252,7 +1346,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             if rank == 0:
                 bwd_tflops = bwd_flops_global / (local_bwd_T_ms * 1e9) if local_bwd_T_ms > 0 else 0.0
                 print0(
-                    f" {f'Per-rank Bwd (T={T})':<42} Average time: {local_bwd_T_ms:<8.2f} ms, TFLOPS: {bwd_tflops:<5.0f}"
+                    f" {f'Per-rank Bwd (T={T}, E={E}, K={K})':<42} Average time: {local_bwd_T_ms:<8.2f} ms, TFLOPS: {bwd_tflops:<5.0f}"
                 )
 
     # ====================================================================
@@ -1271,7 +1365,10 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         # Left-pad labels to a 24-char column so the value column starts
         # at the same position. ms numbers use 2 decimals and left-align
         # so the digit before the decimal lines up across rows.
-        LBL = 24
+        # Width sized to fit the longest label across all subsections —
+        # currently ``Single-GPU full EP-scale (T={T}):`` (~37 chars at
+        # T=131072; up to ~39 for 7-digit T values).
+        LBL = 40
 
         exposed_train_ms = ep_fwd_train_ms - local_fwd_train_Tl_ms
         exposed_train_pct = exposed_train_ms / ep_fwd_train_ms * 100 if ep_fwd_train_ms > 0 else 0.0
@@ -1300,7 +1397,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             scaling_eff = speedup / ideal_speedup * 100 if ideal_speedup > 0 else 0.0
             print0(
                 f"\n  EP scaling efficiency (training fwd):\n"
-                f"    {f'Single-GPU (T={T}):':<{LBL}} {local_fwd_train_T_ms:<8.2f} ms\n"
+                f"    {f'Single-GPU full EP-scale (T={T}):':<{LBL}} {local_fwd_train_T_ms:<8.2f} ms\n"
                 f"    {f'EP W={world_size} (T={T}):':<{LBL}} {ep_fwd_train_ms:<8.2f} ms\n"
                 f"    {'Observed speedup:':<{LBL}} {speedup:<8.2f}× "
                 f"(ideal {ideal_speedup}×, efficiency {scaling_eff:.1f}%)"
@@ -1311,7 +1408,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
                 bwd_scaling_eff = bwd_speedup / ideal_speedup * 100 if ideal_speedup > 0 else 0.0
                 print0(
                     f"\n  EP scaling efficiency (backward):\n"
-                    f"    {f'Single-GPU (T={T}):':<{LBL}} {local_bwd_T_ms:<8.2f} ms\n"
+                    f"    {f'Single-GPU full EP-scale (T={T}):':<{LBL}} {local_bwd_T_ms:<8.2f} ms\n"
                     f"    {f'EP W={world_size} (T={T}):':<{LBL}} {ep_bwd_ms:<8.2f} ms\n"
                     f"    {'Observed speedup:':<{LBL}} {bwd_speedup:<8.2f}× "
                     f"(ideal {ideal_speedup}×, efficiency {bwd_scaling_eff:.1f}%)"

@@ -105,6 +105,15 @@ class _EPWorkspace:
     s_rev_symm: Optional[torch.Tensor]
     s_rev_hdl: Any
     s_rev_peer_bufs: Tuple[torch.Tensor, ...]
+    # topk_idx_symm — (T_local, K) int32 symm-mem staging for the
+    # forward's per-rank topk decision. ``_ag_routing_decision`` copies
+    # the local routing into this buffer, barriers, and then pulls
+    # peers' topk via ``all_gather_triton``. Replaces a vanilla NCCL
+    # ``all_gather_into_tensor`` whose small-message latency (~17 ms
+    # for 4 MB on H100/NVLink in our setup) dominated the EP forward.
+    topk_idx_symm: Optional[torch.Tensor]
+    topk_idx_hdl: Any
+    topk_idx_peer_bufs: Tuple[torch.Tensor, ...]
 
     ep_group: dist.ProcessGroup
     world_size: int
@@ -239,6 +248,7 @@ class _EPWorkspace:
         self.do_peer_bufs = ()
         self.y_peer_bufs = ()
         self.s_rev_peer_bufs = ()
+        self.topk_idx_peer_bufs = ()
         self.rs_peer_bufs = ()
         # Each *_hdl is the SymmetricMemory wrapper for its buffer
         # If it survives past the symm tensor below it would keep an internal AllocationRef
@@ -247,12 +257,14 @@ class _EPWorkspace:
         self.do_hdl = None
         self.o_hdl = None
         self.s_rev_hdl = None
+        self.topk_idx_hdl = None
         self.rs_hdl = None
         # ↓ now the symm-mem buffers themselves.
         self.x_symm = None
         self.do_symm = None
         self.y_symm = None
         self.s_rev_symm = None
+        self.topk_idx_symm = None
         self.rs_buf = None
         # Plain HBM (not symm-mem) — order doesn't matter.
         self.a2a_recv = None
@@ -330,6 +342,7 @@ class SymmMemManager:
         # x_symm can stay live for the X redispatch in step 2).
         y_symm, o_hdl, y_peer_bufs = self._alloc_symm((MAX_ROWS_PER_RANK, d), dtype)
         s_rev_symm, s_rev_hdl, s_rev_peer_bufs = self._alloc_symm((TK_global,), torch.int32)
+        topk_idx_symm, topk_idx_hdl, topk_idx_peer_bufs = self._alloc_symm((T_local, K), torch.int32)
 
         a2a_recv = None
         ag_compute = None
@@ -359,6 +372,9 @@ class SymmMemManager:
             s_rev_symm=s_rev_symm,
             s_rev_hdl=s_rev_hdl,
             s_rev_peer_bufs=s_rev_peer_bufs,
+            topk_idx_symm=topk_idx_symm,
+            topk_idx_hdl=topk_idx_hdl,
+            topk_idx_peer_bufs=topk_idx_peer_bufs,
             ep_group=self.ep_group,
             world_size=W,
             my_rank=self.rank,

@@ -5,12 +5,14 @@ Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # SonicMoE: Accelerating MoE with IO and Tile-aware Optimizations
 [![arXiv](https://img.shields.io/badge/arXiv-2512.14080-b31b1b.svg)](https://arxiv.org/abs/2512.14080) [![PyPI](https://img.shields.io/pypi/v/sonic-moe?cache=no)](https://pypi.org/project/sonic-moe/)
 
-**SonicMoE** is a simple but blazing-fast Mixture-of-Experts (MoE) implementation optimized for NVIDIA Hopper (SM90), Blackwell datacenter (SM100, e.g. B200/B300), and Blackwell consumer (SM120, e.g. RTX 5090) GPUs. It mainly leverages [CuTeDSL](https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) and [Triton](https://triton-lang.org/main/getting-started/tutorials/index.html) to deliver state-of-the-art performance through IO-aware optimizations. These 2 figures provide an overview of activation memory usage and training throughput on Hopper GPUs (H100) and Blackwell GPUs (B300). The current version of SonicMoE builds on the Grouped GEMM kernels from the [QuACK](https://github.com/Dao-AILab/quack/tree/main) library which is itself built on [CUTLASS](https://github.com/NVIDIA/cutlass).
+**SonicMoE** is a simple but blazing-fast Mixture-of-Experts (MoE) implementation optimized for NVIDIA Hopper (SM90), Blackwell datacenter (SM100, e.g. B200/B300), and Blackwell consumer (SM120, e.g. RTX 5090) GPUs. It mainly leverages [CuTeDSL](https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) and [Triton](https://triton-lang.org/main/getting-started/tutorials/index.html) to deliver state-of-the-art performance through IO-aware optimizations. These 2 figures provide an overview of activation memory usage and training throughput on Hopper GPUs (H100) and Blackwell GPUs (B300). The current version of SonicMoE builds on the Grouped GEMM kernels from the [QuACK](https://github.com/Dao-AILab/quack/tree/main) library which is itself built on [CUTLASS](https://github.com/NVIDIA/cutlass). SonicMoE also ships intra-node Expert Parallelism (EP) built from [PyTorch Symmetric Memory](https://docs.pytorch.org/docs/2.11/symmetric_memory.html) with a runtime profiler that picks the fastest primitive for the local cluster configurations.
 
 ![Activation Memory](https://raw.githubusercontent.com/Dao-AILab/sonic-moe/main/assets/mem.png)
 ![Training Throughput](https://raw.githubusercontent.com/Dao-AILab/sonic-moe/main/assets/tput.png)
 
 ## News
+
+- 05/13/2026: We add a basic intra-node Expert Parallelism (EP) support.
 
 - 04/22/2026: We release a [blogpost](./assets/2026-04-22-sonicmoe-blackwell.md) on SonicMoE's activation memory-efficient and IO-aware design, and how we extend it to Blackwell GPUs through [QuACK](https://github.com/Dao-AILab/quack)'s software abstraction.
 
@@ -72,15 +74,44 @@ x = torch.randn(32768, 4096, device="cuda", dtype=torch.bfloat16)
 output, aux_loss = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe)
 ```
 
-## 🧪 Testing
+## 🧪 Tests
 
-Run the test suite to verify correctness:
+- Run the single-GPU test suite to verify correctness:
 
 ```bash
 make test
 ```
 
+- Multi-GPU EP correctness (1 dispatch + grouped GEMM + 1 combine end-to-end, plus per-primitive parity vs NCCL):
+
+```bash
+torchrun --nproc_per_node=8 --standalone tests/moe_ep_test.py
+```
+
+## 📊 Benchmarks
+
+Single-GPU MoE throughput:
+
+```bash
+python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --activation swiglu
+python benchmarks/moe-token-rounding.py --routing nr --thiekq 16384,4096,1024,256,8,128
+```
+
+Intra-node EP:
+
+```bash
+torchrun --nproc_per_node=8 --standalone benchmarks/distributed/moe-ep.py --thiek 131072,4096,1536,128,8
+```
+
+Intra-node EP communication primitives (Triton vs NCCL baselines on the same byte volume):
+
+```bash
+torchrun --nproc_per_node=8 --standalone benchmarks/distributed/bench-ep-comm.py
+```
+
 ### Example usage
+
+#### Single GPU
 
 - SonicMoE with TC top-K routing (softmax-over-topk, or `softmax(topk(logits))`) and interleaved weight layout format for up-proj weights
     ```bash
@@ -105,6 +136,38 @@ make test
     # Concatenated weight layout format with TC top-K routing
     python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --concat_layout
     ```
+
+#### Intra-node Expert Parallelism
+
+SonicMoE supports intra-node EP via `moe_ep_TC_softmax_topk_forward`. The forward dispatches each rank's `T_local` tokens to the experts that hold them via NVLink symmetric memory, runs the grouped GEMMs locally, and combines back across NVLink. A runtime `NetworkProfiler` benchmarks the three dispatch and three combine primitives on the local hardware and picks the fastest pair per workload.
+
+EP world size 8:
+```bash
+torchrun --nproc_per_node=8 --standalone benchmarks/distributed/moe-ep.py --thiek 131072,4096,1536,128,8
+```
+
+Override `--mode` / `--agg_mode` to lock a specific dispatch / combine primitive (useful for reproducing prior runs):
+```bash
+torchrun --nproc_per_node=8 --standalone benchmarks/distributed/moe-ep.py \
+    --thiek 131072,4096,1536,128,8 \
+    --mode RANK_DEDUP_DISPATCH_TRITON --agg_mode A2A_TRITON
+```
+
+The EP forward exposes two optional flags that trade off activation memory, NVLink bandwidth in backward, and a host-stall on the forward.
+
+**`--redispatch_x_in_backward`** (default to False): instead of saving the post-dispatch `x_compute` for the backward, save only the pre-dispatch `x_local` and re-dispatch in the backward via a Copy-Engine all-gather on a side stream. Activation memory drops by a factor of `W` for the X cache. The cost is one extra asynchronous all-gather of X in the backward.
+
+```bash
+torchrun --nproc_per_node=8 --standalone benchmarks/distributed/moe-ep.py --thiek 131072,4096,1536,128,8 --redispatch_x_in_backward
+```
+
+**`--CPU_sync_on_runtime`** (default to False): initiate D2H sync to run *before* the dispatch step to shrink the saved activation cache. The trade-off is a single host stall per forward. Inference mode skips this since no cache is saved.
+
+```bash
+torchrun --nproc_per_node=8 --standalone benchmarks/distributed/moe-ep.py --thiek 131072,4096,1536,128,8 --CPU_sync_on_runtime
+```
+
+Both flags can be combined. The bench's activation-cache audit prints the actual bytes saved under each setting, so you can verify the memory savings on your own workload before turning them on in training.
 
 
 ## 🤝 Contributing
