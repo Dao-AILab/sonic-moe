@@ -1,6 +1,6 @@
 # ********************************************************************************
 # Copyright (c) 2026, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
-#
+# ********************************************************************************
 # Expert Parallelism (EP) for SonicMoE.
 #
 # Dispatch modes (``DispatchMode``):
@@ -89,8 +89,7 @@ class EP_Router_Replicated_Across_Ranks(torch.autograd.Function):
     """``F.linear(x, router_w)`` with EP-aware drouter_w all-reduce.
 
     In EP, each rank holds ``T_local = T / W`` tokens of the global
-    batch and every rank has a replica of ``router_w``. Forward
-    computes the local logits via ``F.linear`` (= ``x @ router_w.T``).
+    batch and every rank has a replica of ``router_w``. 
     """
 
     @staticmethod
@@ -322,12 +321,6 @@ class _MoeEPFunction(torch.autograd.Function):
 
         H_act = 2 * I if is_glu_act else I
 
-        # Both ``redispatch_x_in_backward`` and ``CPU_sync_on_runtime``
-        # are activation-cache-shrinkage axes — they only affect what
-        # gets saved-for-backward and how it's sized. Under inference
-        # there is no save, so neither flag has anything to do; force
-        # them off here so every downstream branch can ignore the
-        # inference case explicitly.
         if is_inference_mode_enabled:
             redispatch_x_in_backward = False
             CPU_sync_on_runtime = False
@@ -337,12 +330,7 @@ class _MoeEPFunction(torch.autograd.Function):
         # down-proj y_symm slice). Under ``CPU_sync_on_runtime`` it's
         # the synced populated count from
         # ``expert_frequency_offset[E_local]`` (one D2H ``.item()``);
-        # otherwise the structural ceiling. The sync runs BEFORE
-        # dispatch — by this point the only kernel between host and
-        # value is ``general_routing_router_metadata_triton`` (already
-        # enqueued by ``_build_consumer_metadata``), so the wait is
-        # nearly a no-op. Allocating at the runtime row count avoids a
-        # post-GEMM compaction step.
+        # otherwise the structural ceiling. 
         max_rows_per_rank_runtime = MAX_ROWS_PER_RANK_STATIC
         if CPU_sync_on_runtime:
             max_rows_per_rank_runtime = expert_frequency_offset[E_local].item()
@@ -353,11 +341,7 @@ class _MoeEPFunction(torch.autograd.Function):
         if is_inference_mode_enabled or redispatch_x_in_backward:
             # x_compute isn't saved-for-backward on these paths
             # (inference saves nothing; redispatch saves x_local), so
-            # reuse the workspace recv buffer where available. AG and
-            # A2A keep mode-specific workspace allocations
-            # (``ag_compute`` / ``a2a_recv``); RANK_DEDUP allocates per
-            # call here too — its recv buffer is local-write only, so
-            # there's no benefit to a shared symm-mem workspace.
+            # reuse the workspace recv buffer where available. 
             if _is_ag_dispatch_mode(mode):
                 ws_buf = ep_ws.ag_compute
             elif _is_a2a_dispatch_mode(mode):
@@ -425,12 +409,6 @@ class _MoeEPFunction(torch.autograd.Function):
         # ====================================================================
         # 2. Up-proj GEMM with fused gated activation: x_compute @ w1 → (h, a)
         # ====================================================================
-        # gemm_gated picks ``total_m`` from ``A_idx.shape[0]`` (AG /
-        # RANK_DEDUP) or ``A.shape[0]`` (A2A) and strict-checks h, a
-        # against it. Allocating at ``max_rows_per_rank_runtime`` (the
-        # synced ``valid_rows`` under ``CPU_sync_on_runtime``, the
-        # structural ceiling otherwise) makes save_for_backward keep
-        # exactly that many rows — no post-GEMM compaction needed.
         a = torch.empty(max_rows_per_rank_runtime, I, dtype=x_dtype, device=device)
         h = torch.empty(max_rows_per_rank_runtime, H_act, dtype=x_dtype, device=device)
 
@@ -469,12 +447,7 @@ class _MoeEPFunction(torch.autograd.Function):
         # ====================================================================
         # ep_ws.y_symm is (MAX_ROWS_PER_RANK_STATIC, H) symm-mem; the
         # kernel writes [0, offset[E_local]) ≤ MAX_ROWS_PER_RANK_STATIC
-        # and peers gather from those positions via s_rev_symm. ``gemm``
-        # picks ``total_m = a.shape[0] = max_rows_per_rank_runtime`` and
-        # strict-checks ``out.shape == (total_m, H)``, so pass a slice
-        # of y_symm at the runtime row count. The slice shares storage
-        # with y_symm — peer NVLink reads in the combine step still see
-        # the full buffer.
+        # and peers gather from those positions via s_rev_symm. 
         gemm(
             a,
             w2,
@@ -488,13 +461,7 @@ class _MoeEPFunction(torch.autograd.Function):
         # ====================================================================
         # 4. NVLink combine → o_local
         # ====================================================================
-        # Mode-dispatched by ``_do_combine``; barrier placement is
-        # internal to each branch there. Scores are routed differently
-        # per agg_mode: A2A_TRITON consumes per-rank ``topk_scores_local``
-        # directly, while RS_COMBINE_TRITON and RANK_DEDUP_COMBINE_TRITON
-        # need globally-known scores — AG once here and cache on ``ctx``
-        # so the backward can reuse the result (saves one NCCL
-        # collective per training step).
+        # Mode-dispatched by ``_do_combine``; barrier placement is internal to each branch there. 
         scores_global: Optional[torch.Tensor] = None
         if cfg.agg_mode in (CombineMode.RS_COMBINE_TRITON, CombineMode.RANK_DEDUP_COMBINE_TRITON):
             scores_global = _all_gather_topk_scores(topk_scores_local, ep_ws.ep_group, ep_ws.world_size, T_local, K)
@@ -518,8 +485,7 @@ class _MoeEPFunction(torch.autograd.Function):
         if not is_inference_mode_enabled:
             # h, a are alloc'd fresh at the runtime row count (step 2);
             # cache-path x_compute is alloc'd fresh in step 1; redispatch
-            # path saves x_local instead. All decoupled from workspaces,
-            # so backward step 1's dout dispatch can't clobber them.
+            # path saves x_local instead. 
             ctx.save_for_backward(
                 x_local if redispatch_x_in_backward else x_compute,
                 w1,
@@ -538,19 +504,10 @@ class _MoeEPFunction(torch.autograd.Function):
             ctx.max_rows_per_rank_runtime = max_rows_per_rank_runtime
             ctx.ep_ws = ep_ws
             # Cached AG of topk_scores from RS-combine forward;
-            # backward step 3 reuses this when present (avoids a
-            # duplicate AG). ``None`` for A2A_TRITON combine — backward
-            # falls back to its own AG.
+            # backward step 3 reuses this when present (avoids a duplicate AG). 
             ctx.scores_global = scores_global
             ctx.set_materialize_grads(False)
 
-        # Group barrier on the workspace's ep_group: fences all peers'
-        # outstanding reads of this rank's symm-mem buffers (most
-        # recently y_symm via a2a_combine_triton's peer reads)
-        # before returning. Without this, the next forward call (or
-        # any other op on the same workspace) can overwrite y_symm /
-        # x_symm while a peer is still reading from it, corrupting its
-        # output. Stream-level barrier — cheap, no D2H sync.
         ep_ws.o_hdl.barrier()
 
         return o_local
@@ -590,12 +547,7 @@ class _MoeEPFunction(torch.autograd.Function):
         rank_dedup_recv_pos = meta.get("rank_dedup_recv_pos")
         peer_present_mask = meta.get("peer_present_mask")
         a_idx_rank_dedup = meta.get("a_idx_rank_dedup")
-        # Logical local-routed slot count for every cu_seqlens_k-bound
-        # kernel in this backward. Equals MAX_ROWS_PER_RANK_STATIC
-        # without ``CPU_sync_on_runtime``, or the synced
-        # ``valid_rows`` (≤ MAX_ROWS_PER_RANK_STATIC) with it. Picks
-        # the saved h / dh / a_prime row count and slices A_idx + dout
-        # accordingly.
+
         max_rows_per_rank_runtime = ctx.max_rows_per_rank_runtime
         ep_ws = ctx.ep_ws
         mode = ep_ws.mode
@@ -607,14 +559,6 @@ class _MoeEPFunction(torch.autograd.Function):
         # ====================================================================
         # 1. Dispatch do_local → dout_dispatched
         # ====================================================================
-        # With redispatch on, x_symm must stay live (still holding
-        # x_local from forward) for step 2's CE all-gather, so the
-        # do publish goes through a dedicated ``do_symm`` symm
-        # buffer. do_symm is rendezvous'd here at backward runtime,
-        # not in forward — the rendezvous is collective but
-        # symmetric (every rank reaches step 1 simultaneously).
-        # Without redispatch, x_symm has no later reader and we
-        # reuse it in place — no extra symm allocation needed.
         if redispatch:
             ep_ws._ensure_do_symm()
             do_buf, do_hdl, do_peer_bufs = ep_ws.do_symm, ep_ws.do_hdl, ep_ws.do_peer_bufs
@@ -622,14 +566,7 @@ class _MoeEPFunction(torch.autograd.Function):
             do_buf, do_hdl, do_peer_bufs = ep_ws.x_symm, ep_ws.x_hdl, ep_ws.x_peer_bufs
         do_buf.copy_(dout_local)
         do_hdl.barrier()
-        # AG and A2A reuse the workspace recv buffer (only one dispatch
-        # in flight at a time during backward step 1, and the buffer is
-        # consumed + freed before step 5's dW2 GEMM completes — see the
-        # ``del dout_dispatched`` after step 5). RANK_DEDUP allocates a
-        # fresh per-call buffer at the packed bound (W·T_local rows,
-        # same as AG) to avoid colliding with the saved forward
-        # x_compute — if both used a shared workspace dout would clobber
-        # x at the same packed positions.
+
         if _is_rank_dedup_dispatch_mode(mode):
             do_recv_buf = torch.empty(ep_ws.world_size * T_local, H, dtype=dtype, device=device)
         elif _is_ag_dispatch_mode(mode):
@@ -655,35 +592,11 @@ class _MoeEPFunction(torch.autograd.Function):
         # 2. Recover x_compute at the shape dW1 will consume
         # ====================================================================
         # Two mutually-exclusive paths, joined right before dW1:
-        #   (a) redispatch=True: AG-CE all-gather of saved x_local on
-        #       a Copy-Engine stream — async, overlaps the rest of
-        #       the backward. Produces an AG-shaped (W·T_local, H)
-        #       x_compute, consumed by dW1 via x_gather_idx_ag_for_dw1.
+        #   (a) redispatch=True: AG-CE all-gather of saved x_local on a Copy-Engine stream 
         #   (b) cache otherwise: saved x_compute is already dW1-ready
-        #       — at (total_m, H) for A2A (where ``total_m`` is
-        #       ``max_rows_per_rank_runtime`` — the synced ``valid_rows``
-        #       under ``CPU_sync_on_runtime``, the structural ceiling
-        #       otherwise) or (W·T_local, H) for AG / RANK_DEDUP. h
-        #       was sized identically in forward so the saved tensors
-        #       line up with dh; no expansion and no side stream
-        #       needed.
-        # Started here (right after do dispatch) so (a) overlaps with
-        # the rest of the backward.
+        # Started here (right after do dispatch) so (a) overlaps with the rest of the backward.
         ce_handle = None
         if redispatch:
-            # X redispatch always uses AG-CE (independent of forward
-            # mode) and writes into ``_ag_redispatch_buf``, a dedicated
-            # buffer distinct from the dout dispatch destination
-            # (ag_compute / a2a_recv). Decoupling the two destinations
-            # is what makes dout dispatch + X redispatch overlap
-            # safely in AG mode — otherwise the CE would race the
-            # main-stream reads in down-proj-act.
-            #
-            # No extra copy / barrier here: x_symm still holds
-            # x_local from forward's entry-point publication (the
-            # do dispatch above ran through ``do_symm``, leaving
-            # x_symm untouched) and forward already peer-barriered
-            # x_hdl. The CE can read peer x_symm directly.
             x_local = x_local_or_compute  # (T_local, H)
             ce_handle = all_gather_copy_engine_async(
                 x_local,
@@ -719,14 +632,6 @@ class _MoeEPFunction(torch.autograd.Function):
         # ====================================================================
         # 4. Down-proj backward act (gemm_dgated): dh, ds, a_prime
         # ====================================================================
-        # gemm_dgated mirrors gemm_gated's row-shape contract: it
-        # picks ``total_m`` from A_idx.shape[0] (AG / RANK_DEDUP) or
-        # dout.shape[0] (A2A) and strict-checks h / dh / a_prime
-        # against it. h was sized at ``max_rows_per_rank_runtime`` in
-        # forward — either the synced ``valid_rows`` under
-        # ``CPU_sync_on_runtime`` or the structural ceiling — and that
-        # number drives every other shape here. ds stays at TK_global
-        # because the reduce_scatter expects that shape.
         dh = torch.empty_like(h)
         ds = torch.zeros(TK_global, dtype=topk_scores_global.dtype, device=device)
         a_prime = torch.empty(max_rows_per_rank_runtime, I, dtype=h.dtype, device=device)
@@ -809,15 +714,6 @@ class _MoeEPFunction(torch.autograd.Function):
         # ====================================================================
         # 7. Up-proj backward act: dh → dx_expanded (in y_symm), db1
         # ====================================================================
-        # x_compute recovery (step 2 above) has been overlapping with
-        # this on a Copy-Engine stream (redispatch path) or runs as
-        # the saved tensor itself (cache path). Joined right before
-        # dW1.
-        # y_symm is (MAX_ROWS_PER_RANK_STATIC, H); the gemm inside
-        # takes ``dh`` (total_m rows) and writes a (total_m, H) result.
-        # When ``max_rows_per_rank_runtime`` < MAX_ROWS_PER_RANK_STATIC
-        # the two differ — slice to total_m. Same memory; the cross-
-        # rank gather below sees the full y_symm again.
         dw1 = torch.empty_like(w1)
         db1 = None if b1 is None else torch.empty_like(b1)
         _up_projection_backward_act(
@@ -833,10 +729,6 @@ class _MoeEPFunction(torch.autograd.Function):
         # ====================================================================
         # 8. Cross-rank combine of dx_expanded → dx_local
         # ====================================================================
-        # Score-less combine — all paths drop the score multiply. See
-        # ``_do_combine`` for the per-mode barrier rationale; for
-        # A2A_TRITON only y_symm needs a fresh peer barrier (step 7
-        # just wrote it; s_rev was forward-fenced and unmodified here).
         dx_local = _do_combine(
             ep_ws,
             my_dst_rank=my_dst_rank,
@@ -854,9 +746,6 @@ class _MoeEPFunction(torch.autograd.Function):
         # ====================================================================
         # 9. Join the x_compute recovery (step 2) before dW1
         # ====================================================================
-        # Only the redispatch path runs work outside the main stream;
-        # the cache path is already on the main stream and needs no
-        # join.
         if ce_handle is not None:
             ce_handle.wait()
 
@@ -890,14 +779,6 @@ class _MoeEPFunction(torch.autograd.Function):
             concat_layout=(("out",) if concat_layout else None),
         )
 
-        # Group barrier on the workspace's ep_group: fences all peers'
-        # outstanding reads of this rank's symm-mem buffers (the do
-        # dispatch + dx gather both pull from peers' x_symm / y_symm /
-        # do_symm) before returning. Without this, the next backward
-        # — or anything that writes those buffers — could race a
-        # peer's still-in-flight read. Stream-level barrier — cheap,
-        # no D2H sync. Done before clearing ctx.ep_ws so the handle
-        # is still reachable.
         ep_ws.o_hdl.barrier()
 
         ctx.ep_ws = None
@@ -1114,13 +995,6 @@ def _validate_and_resolve(
 
 
 def _validate_runtime_ep_config(cfg: RuntimeEPConfig, W: int, K: int) -> None:
-    """Reject a profile-time config that doesn't match the runtime workload.
-
-    NetworkProfiler ties its decision to a specific (W, K) shape; if
-    the actual call has a different K or runs on a different-size EP
-    group, the profiler's choice may not be valid (different number of
-    NVLink hops, different per-rank chunk sizes, …).
-    """
     if cfg.W != W:
         raise ValueError(
             f"ep_config.W={cfg.W} does not match mgr.world_size={W}; "

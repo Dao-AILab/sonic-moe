@@ -1,7 +1,6 @@
 # ********************************************************************************
 # Copyright (c) 2026, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
-#
 # Run with torchrun:
 #
 #   torchrun --nproc_per_node=8 --standalone --local-ranks-filter 0 -m pytest tests/distributed/collectives_test.py -s
@@ -10,22 +9,7 @@
 #
 #   torchrun --nproc_per_node=8 --standalone --local-ranks-filter 0 \
 #       -m pytest tests/distributed/collectives_test.py::EPCollectivesTest::test_all_gather -s
-#
-# torchrun sets RANK / WORLD_SIZE / LOCAL_RANK / MASTER_ADDR / MASTER_PORT in each
-# child process; we initialize the process group once in setUpClass and let each
-# test method execute on its own rank, gathering failure strings across ranks via
-# dist.all_gather_object.
-#
-# Symm-mem rendezvous handles are NOT held as Python locals across loop
-# iterations — doing so reorders ~CUDASymmetricMemory to fire when the
-# handle local is rebound on the next iteration, mid-execution, racing
-# with in-flight CUDA work on the buffer's peer mappings and triggering
-# `cuMemUnmap → CUDA_ERROR_INVALID_VALUE` from inside ~AllocationRef.
-# Producer-→peer-read fences use the transient `_barrier(buf)` helper,
-# which fetches the cached handle from PyTorch's symm-mem cache, calls
-# `.barrier()`, and drops the local ref immediately — the cache keeps
-# the actual handle alive bound to the buffer's lifetime. Coarse cross-
-# rank syncs (between tests) keep `dist.barrier()`.
+# ********************************************************************************
 
 import atexit
 import os
@@ -117,37 +101,13 @@ def _init_dist_from_env() -> None:
 
 
 def _alloc_symm(shape, dtype, device):
-    """Allocate + rendezvous a symm-mem tensor; return ONLY the buffer.
-
-    The rendezvous handle is intentionally discarded here. PyTorch's
-    symm-mem cache keeps the actual handle alive bound to the buffer's
-    lifetime, so `.barrier()` and wrapper-internal `rendezvous(buf, ...)`
-    calls all hit the cache (no extra round-trip).
-
-    Why we don't return the handle: holding it in a Python local across
-    loop iterations causes the handle's refcount to drop when the local
-    is rebound on the next iteration. That fires ~CUDASymmetricMemory
-    → ~AllocationRef → cuMemUnmap MID-EXECUTION, racing with in-flight
-    CUDA work on the buffer's peer mappings and crashing with
-    CUDA_ERROR_INVALID_VALUE. With the handle held only by the cache,
-    destruction is tied to buffer destruction (`del buf`), which lines
-    up across ranks via the implicit syncs from `torch.equal()` etc.,
-    and the at-process-exit failure mode is handled separately by the
-    atexit hook above.
-    """
     buf = _symm_mem.empty(*shape, dtype=dtype, device=device)
     _symm_mem.rendezvous(buf, group=dist.group.WORLD.group_name)
     return buf
 
 
 def _barrier(buf):
-    """GPU-side barrier on `buf`'s symm-mem group via the cached handle.
-
-    Fences this rank's pending writes to `buf` before peers read it via
-    NVLink. The local handle ref drops as soon as `.barrier()` returns;
-    the cache keeps the underlying SymmetricMemory alive — so this is
-    cheap (cache hit) and avoids the destruction-order trap described
-    in `_alloc_symm`."""
+    """GPU-side barrier on `buf`'s symm-mem group via the cached handle."""
     _symm_mem.rendezvous(buf, group=dist.group.WORLD.group_name).barrier()
 
 
@@ -229,16 +189,6 @@ def _worker_all_gather(rank, world_size, device):
             # landed before any peer reads its bytes.
             _barrier(x)
 
-            # Build peer_bufs explicitly — the CE all-gather is decoupled
-            # from symm-mem; it only needs (x, peer_view_per_rank, my_rank).
-            # Here `x` happens to be symm-mem so we reuse its rendezvous
-            # to mint the peer views, but the CE function itself doesn't
-            # care which mechanism produced the mapping.
-            #
-            # IMPORTANT: do NOT keep the rendezvous handle in a local —
-            # that retriggers the destructor-mid-loop trap documented above
-            # `_alloc_symm`. The peer-buffer views don't pin the handle;
-            # it stays alive in PyTorch's symm-mem cache bound to x.
             ce_peer_bufs = tuple(
                 _symm_mem.rendezvous(x, group=dist.group.WORLD.group_name).get_buffer(r, (T_local, d), dtype)
                 for r in range(world_size)
@@ -258,11 +208,6 @@ def _worker_all_gather(rank, world_size, device):
 
 # ============================================================================
 # Worker: reduce_scatter — Triton fp32-accum vs NCCL ring RS.
-# ----------------------------------------------------------------------------
-# Both reduce in fp32 internally for bf16 i/o, but they differ in summation
-# order (Triton: rank 0..W-1 left-to-right; NCCL: ring), so we use allclose
-# rather than equal. fp32 i/o has the same order issue, plus rounding from
-# non-associative fp32 add — same allclose path.
 # ============================================================================
 
 
@@ -276,17 +221,6 @@ def _worker_reduce_scatter(rank, world_size, device):
 
             tri = reduce_scatter_triton(x, dist.group.WORLD)
 
-            # Algorithmic reference matching the kernel exactly: AG every
-            # rank's x_symm, then sum the my_rank-th T_local slice over peers
-            # in fp32 (rank order, left-to-right), cast to dtype at the end.
-            #
-            # NCCL's bf16 reduce_scatter is NOT a valid bit-exact reference:
-            # its accumulation precision and topology are implementation-
-            # defined, so its bf16 output may differ from ours by ~1 ULP at
-            # high-magnitude elements (we observed exactly 2^-4 = 0.0625,
-            # one bf16 ULP at magnitude 16). The AG-based reference shares
-            # the kernel's precision and accumulation order, so torch.equal
-            # is the right check.
             x_all = all_gather_triton(x, dist.group.WORLD).view(world_size, world_size * T_local, d)
             ref_fp32 = torch.zeros(T_local, d, dtype=torch.float32, device=device)
             for p in range(world_size):
@@ -358,8 +292,6 @@ def _worker_a2a_dispatch(rank, world_size, device):
 # ============================================================================
 # Worker: rank_dedup_dispatch — bit-exact agreement with a2a_dispatch
 # on the expert-grouped layout (Phase 2 acceptance from the task spec).
-# Additionally verifies the packed-receive buffer's structural contract:
-# each unique (src, t) → my_rank row appears exactly once.
 # ============================================================================
 
 
@@ -509,14 +441,7 @@ def _worker_rank_dedup_dispatch(rank, world_size, device):
 
 # ============================================================================
 # Worker: local_combine — explicit fp32 K-loop reference matching the
-# kernel's static_range accumulation order. allclose absorbs any FMA fusion
-# difference between Triton and PyTorch elementwise.
-# ----------------------------------------------------------------------------
-# local_combine reads only local memory and writes partial_acc_buf locally — no
-# peer-side reads from partial_acc_buf inside this test, so we don't need a
-# `_barrier(rs)` after local_combine here. The benchmark's local+RS
-# pipeline does need one (local_combine → reduce_scatter); see
-# bench-ep-comm.py.
+# kernel's static_range accumulation order. 
 # ============================================================================
 
 
@@ -613,10 +538,7 @@ def _worker_A2A_combine(rank, world_size, device):
 
             topk = _gen_routing(T_local, K, E, rank, world_size, device, pattern=pat, seed=300)
             meta = compute_dispatch_metadata(topk, my_rank=rank, E_local=E_local)
-            # `a2a_combine_triton` no longer takes a `dispatch_pos`
-            # tensor — it computes `my_rank * TK_local + t * K + k` inline.
-            # The reference below still uses the explicit pos tensor to
-            # express the same indexing.
+
             pos_2d = (torch.arange(TK_local, device=device, dtype=torch.int32) + rank * TK_local).view(T_local, K)
 
             scores_local = torch.softmax(
@@ -670,9 +592,6 @@ def _worker_A2A_combine(rank, world_size, device):
 # ============================================================================
 # Worker: rank_dedup_combine — numeric parity vs a2a_combine_triton
 # (forward, scored) and vs local_combine (backward dx, score-less).
-# Same byte-saving argument as the prior dedup-combine worker; the
-# tolerance accounts for one extra bf16 rounding (partial_acc_buf store) on top
-# of the unavoidable y_local cast — total ≈ 2·ε_bf16.
 # ============================================================================
 
 
@@ -744,13 +663,6 @@ def _worker_rank_dedup_combine(rank, world_size, device):
                     group=dist.group.WORLD,
                 )
 
-                # Tolerance reflects the extra bf16 rounding the
-                # local-reduce path introduces vs A2A_combine: the
-                # producer stores bf16-cast pre-sums into partial_acc_buf, then
-                # the consumer re-casts on the second store. The
-                # reference only has the second cast. Total error per
-                # element is bounded by ≈ 2·ε_bf16 (cf.
-                # RS_COMBINE_TRITON docstring), independent of K, W.
                 if not torch.allclose(got_out, ref_out, atol=1.5e-1, rtol=3e-2):
                     diff = (got_out.float() - ref_out.float()).abs()
                     label = "scored" if use_scores else "score-less"
@@ -768,10 +680,6 @@ def _worker_rank_dedup_combine(rank, world_size, device):
         torch.cuda.empty_cache()
     return fails
 
-
-# ============================================================================
-# Test class — one process per rank; dist is initialized once per process.
-# ============================================================================
 
 
 class EPCollectivesTest(TestCommons):

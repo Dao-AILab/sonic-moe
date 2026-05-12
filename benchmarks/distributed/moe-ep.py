@@ -1,6 +1,6 @@
 # ********************************************************************************
 # Copyright (c) 2026, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
-#
+# ********************************************************************************
 # E2E benchmark for the EP forward + backward (moe_ep_TC_softmax_topk_forward)
 # with local (non-EP) baselines for exposed network latency estimation.
 #
@@ -11,14 +11,6 @@
 # and are reported from rank 0. TFLOPS use the global token count for EP and
 # per-rank / full token count for local, so numbers are directly comparable
 # in the summary table.
-#
-# Backward correctness: a single-GPU autograd reference (token-by-expert loop
-# computed in pure bf16, mirroring the EP precision exactly) is built on rank
-# 0 from the same x, w1, w2, router_w used by the EP path. EP gradients (dx,
-# dW1, dW2, drouter_w, and biases when present) are aggregated to rank 0 —
-# dx via all-gather, drouter_w via all-reduce sum (every rank computes a
-# partial drouter_w from its slice of x), dW1/dW2/db1/db2 via gather then
-# concat — and compared against the reference per-tensor.
 #
 # Mode selection: the bench profiles with ``NetworkProfiler`` to pick both
 # the dispatch mode and the combine mode at runtime. ``--mode`` and
@@ -49,7 +41,7 @@ os.environ["QUACK_COMPILE_WORKERS"] = "1"
 
 # ─────────────── Monkey-patch: similar M shapes map to the same cached config during QuACK autotuning ───────────────
 
-M_QUANT = 4096
+M_QUANT = 1024
 
 
 def _make_quantized_key(self, args, kwargs):
@@ -156,8 +148,6 @@ from sonicmoe.distributed_utils import (
     DispatchMode,
     NetworkProfiler,
     RuntimeEPConfig,
-    _is_ag_dispatch_mode,
-    _is_rank_dedup_dispatch_mode,
 )
 from sonicmoe.enums import ActivationType, is_glu
 from sonicmoe.functional import TC_Softmax_Topk_Router_Function, moe_TC_softmax_topk_layer
@@ -282,42 +272,6 @@ def _gather_to_rank0(t_local: torch.Tensor, world_size: int, rank: int):
 
 
 def do_bench_distributed(fn, warmup=30, rep=100, calls_per_iter=1):
-    """Time ``fn`` and return mean per-call ms (pipelined within a rep block).
-
-    One CUDA-event pair brackets ``rep`` back-to-back ``fn()`` calls,
-    divided by ``rep``. The GPU stream stays busy the whole window —
-    no per-call ``cuda.synchronize()`` / ``dist.barrier()`` — so the
-    reported time reflects the steady-state per-call cost that real
-    training pays (fwd → bwd → optimizer → fwd flows without CPU drain
-    gaps).
-
-    Why not per-call sync?  On H100 with NVLink and aggressive idle
-    power management, draining the stream between every call lets the
-    GPUs drop to idle clocks and accumulates large cross-rank skew at
-    the first symm-mem / NCCL sync point of the next call — the
-    barrier kernel itself is ~0.1 ms when ranks are tight, but tens
-    of ms after a drain + CPU-bookkeeping gap. That cost is a bench
-    artifact, not a real per-call cost. Pipelined timing matches what
-    the individual EP primitive profiler reports under
-    ``NetworkProfiler.bench_fn``.
-
-    Host-blocking calls like ``.item()`` (the ``CPU_sync_on_runtime``
-    path) are still captured: they drain the stream from the host
-    side, which appears as GPU idle time inside the rep window and
-    counts toward elapsed_time. What pipelined timing does NOT count
-    is per-call Python interpreter overhead between fn() calls —
-    typically sub-millisecond and not the cost we're after.
-
-    Cross-rank alignment: one ``dist.barrier()`` + ``synchronize()``
-    before ``start.record()`` ensures all ranks enter the timed
-    window together. Within the rep loop, the cross-rank symm-mem
-    barriers inside ``fn()`` keep ranks tight without re-introducing
-    CPU stalls.
-
-    ``calls_per_iter`` runs the timing block multiple times and
-    averages. Between blocks the GPU may briefly idle — that gap is
-    untimed.
-    """
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -516,11 +470,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
 
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
-    # NCCL collective timeout bumped from the 10-minute default to
-    # 60 minutes: quack's GEMM autotune + Triton's EP combine/dispatch
-    # config sweeps can together exceed 10 min on a cold cache (esp.
-    # on H100 first runs), and a single straggler rank trips the
-    # watchdog while peers are still compiling.
+
     dist.init_process_group(
         "nccl",
         device_id=device,
@@ -545,8 +495,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     T_local = T // W
     E_local = E // W
 
-    # NetworkProfiler picks dispatch + combine by default; --mode and
-    # --agg_mode (when set) override the profiler's choice.
+    # NetworkProfiler picks dispatch + combine by default; --mode and --agg_mode (when set) override the profiler's choice.
     mode_override = DispatchMode(args.mode) if args.mode is not None else None
     agg_mode_override = CombineMode(args.agg_mode) if args.agg_mode is not None else None
 
@@ -615,13 +564,8 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     x = x_global[rank * T_local : (rank + 1) * T_local].contiguous()
 
     mgr = SymmMemManager(dist.group.WORLD, device)
-    # Pin mgr's lifetime to run()'s scope (see keep_alive comment in run()).
-    # Required to survive symm-mem destructor failure during exception unwind.
     keep_alive.append(mgr)
 
-    # Profile the three dispatch primitives once on this hardware and
-    # build a RuntimeEPConfig. ``--mode`` / ``--agg_mode``, when given,
-    # override the profiler's pick.
     profiler = NetworkProfiler(
         mgr,
         T_local=T_local,
@@ -632,17 +576,13 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         repeat=50,
     )
     profiled_cfg = profiler.profile()
-    # Settle after the profiler's many warmup + timed iterations so the
-    # actual EP throughput measurements below start from a quiesced
-    # state across all ranks (GPU clocks / NVLink fabric / NCCL channels
-    # all benefit from a brief idle window).
+
     dist.barrier()
     time.sleep(0.5)
 
     final_mode = mode_override if mode_override is not None else profiled_cfg.mode
     final_agg_mode = agg_mode_override if agg_mode_override is not None else profiled_cfg.agg_mode
     ep_cfg = RuntimeEPConfig(mode=final_mode, W=W, K=K, agg_mode=final_agg_mode)
-    resolved_mode = ep_cfg.mode
     if rank == 0:
         dispatch_src = "override" if mode_override is not None else "profiled"
         agg_src = "override" if agg_mode_override is not None else "profiled"
@@ -673,9 +613,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     w1_local_fmt = w1_full.permute(1, 2, 0)
     w2_local_fmt = w2_full.permute(1, 2, 0)
 
-    # ====================================================================
-    # Reference correctness check
-    # ====================================================================
 
     if not args.skip_test:
         x_t = x.clone().detach().requires_grad_(True)
@@ -756,18 +693,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
                 ActivationType.REGLU: reglu,
             }[activation]
 
-            # Reference parameters: keep ref_x / ref_w1 / ref_w2 / ref_b* in
-            # production dtype so the per-expert MoE forward (inside the
-            # autocast(fp32) block below) sees the same input bytes EP did.
-            # `ref_router_w` is promoted to FP32 explicitly so the autograd
-            # backward through the routing F.linear returns ref_drouter_w in
-            # fp32 regardless of autocast policy. Without this, ref_drouter_w
-            # came out bf16/fp16 (matching the leaf param), the EP-vs-ref
-            # comparison measured bf16-vs-bf16 summation-order noise, and
-            # mean-rel diff inflated to 30%+ for bf16 due to small-value
-            # elements. With fp32 ground truth, the comparison measures EP's
-            # bf16 storage error against fp32 truth — cute-comparable
-            # ~2-3% mean rel diff.
             ref_x = x_global.clone().detach().requires_grad_(True)
             ref_router_w = router_w.clone().detach().to(torch.float32).requires_grad_(True)
             ref_w1 = w1_full.clone().detach().requires_grad_(True)
@@ -779,48 +704,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             if add_bias:
                 ref_grad_inputs += [ref_b1, ref_b2]
 
-            # ========================================================
-            # CHUNKED REFERENCE LOGITS *AND* SCORES.
-            #
-            # The EP forward computes router_logits =
-            # F.linear(x_local, router_w) per rank — i.e. W cuBLAS GEMM
-            # calls of shape (T_local, H) — and softmax-over-topk is
-            # then applied per rank on the (T_local, E) logits. Gradients
-            # flow back through each rank's softmax/gather and accumulate
-            # into ref_router_w via W separate calls.
-            #
-            # The reference now mirrors this exactly. Two stages, both
-            # chunked:
-            #
-            #   1) Compute router_logits in W chunks of (T_local, H), so
-            #      cuBLAS picks the same algorithm as the EP for each
-            #      chunk and produces bit-identical logits per chunk.
-            #
-            #   2) Compute topk_scores per chunk too — gather-then-softmax
-            #      for softmax-over-topk routing, or softmax-then-gather
-            #      for topk-over-softmax routing (same logic the EP uses
-            #      internally). Each chunk's softmax is row-independent,
-            #      so the *value* of topk_scores is mathematically the
-            #      same whether computed chunked or globally; doing it
-            #      chunked makes the autograd graph mirror the EP's exact
-            #      bf16 accumulation pattern into ref_router_w (W
-            #      separate GEMM-backward contributions summed in fp32),
-            #      eliminating any test-side bias on drouter_w.
-            #
-            # ref_logits is no longer needed as a single concatenated
-            # tensor — only topk_scores feeds the forward loop below.
-            # ========================================================
-            # NOTE: the chunked routing (and the autograd backward through it
-            # that produces ref_drouter_w) used to be OUTSIDE the autocast
-            # block below, so ref_drouter_w was bf16 and the EP-vs-ref
-            # comparison measured bf16-vs-bf16 summation-order noise — which
-            # mean-rel-amplifies to ~30%+ on bf16 because of small-value
-            # elements. We now wrap the routing in the same autocast(fp32)
-            # block as the MoE forward (mirroring moe-cute.py's reference),
-            # so ref_drouter_w is fp32 and the EP-vs-ref comparison measures
-            # EP's bf16 storage error against fp32 ground truth — directly
-            # comparable to moe-cute.py's drouter_w numbers and bounded by
-            # at most ~W× the single-rank bf16 ULP.
             topk_idx = ep_topk_idx_full.view(T, K).to(torch.int64)
             with torch.autocast(f"cuda:{local_rank}", torch.float32):
                 topk_scores_chunks = []
@@ -839,37 +722,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
                     topk_scores_chunks.append(topk_scores_chunk)
                 topk_scores = torch.cat(topk_scores_chunks, dim=0)
 
-            # Reference forward + backward.
-            #
-            # Ground-truth precision: ref_o_global is FP32. This is the
-            # critical detail. The autocast(fp32) wrapper makes the
-            # per-expert F.linears produce fp32 ref_y, but if
-            # ref_o_global were bf16, the per-expert
-            # `ref_o_global[rows_t] += ref_y * scores` would silently
-            # downcast the fp32 rhs to bf16 before adding, and the
-            # accumulator would quantize at every step — defeating the
-            # entire point of using autocast. The earlier failure mode
-            # at T=32768 (forward o off by 100% magnitude) and the
-            # current failure at H=I=2048 (same signature, different
-            # shape) are both this same bug: bf16 += into a bf16 buffer
-            # accumulates K bf16 quantization steps per token, and once
-            # tokens-per-expert grows large enough, those quantizations
-            # diverge from EP's gather kernel which keeps the K-sum in
-            # an fp32 register and casts once.
-            #
-            # Allocating ref_o_global in fp32 fixes this: the entire
-            # expert path stays fp32 from F.linear through the += into
-            # ref_o_global. EP's bf16 output is then compared against
-            # genuine fp32 ground truth, and the only divergence is
-            # EP's bf16 storage precision (~1 bf16 ULP per element)
-            # regardless of shape or scale.
-            #
-            # The routing path (chunked F.linear and softmax above) is
-            # OUTSIDE this autocast on purpose: it stays bf16 so the
-            # EP-vs-ref comparison on drouter_w reflects the bf16
-            # storage of router_w (which is what production sees), not
-            # an fp32 reference that would always show ~1% bf16 error
-            # we can't reduce.
             with torch.autocast(f"cuda:{local_rank}", torch.float32):
                 ref_o_global = torch.zeros(T, H, device=device, dtype=torch.float32)
                 for i in range(E):
@@ -929,9 +781,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
 
     dist.barrier()
 
-    # ====================================================================
-    # FLOP counters
-    # ====================================================================
     fwd_flops_global = (6 if is_glu(activation) else 4) * T * I * H * K
     fwd_flops_local = fwd_flops_global / world_size
 
@@ -946,9 +795,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
 
     time.sleep(0.5)
 
-    # ====================================================================
-    # EP warmup
-    # ====================================================================
     moe_ep_TC_softmax_topk_forward(
         x,
         router_w,
@@ -972,23 +818,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     torch.cuda.synchronize()
     dist.barrier()
 
-    # ====================================================================
-    # Saved-activation cache audit (training, no redispatch)
-    # ====================================================================
-    # Targets (per rank, in elements):
-    #   X cache:   min(K, W) * T_local * d      (AG mode K>=W: W·T_local·d;
-    #                                            A2A mode K<W: K·T_local·d)
-    #   h cache:   TK_global / W  ·  h_dim2     (= TK_local · 2I for SwiGLU)
-    #
-    # The X target equals the dispatched x_compute under AG mode. Under A2A
-    # the dispatched buffer is shape (W, TK_local, d) = TK_global·d, which
-    # is a factor W over the target — only ~TK_local rows are valid.
-    #
-    # For h, the merged _MoeEPFunction holds (TK_global, h_dim2) but
-    # gemm_gated only writes the first expert_frequency_offset[E_local]
-    # (~TK_local) rows under cu_seqlens_m, so the cache is over by a
-    # factor of ~W in both modes (the tradeoff that buys uniform shape
-    # in the off-path E_local < K case and removes the reinflate dance).
+
     saved_info: list = []
 
     def _pack_hook(t):
@@ -1029,16 +859,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     if rank == 0:
         h_dim2 = (2 * I) if is_glu(activation) else I
 
-        # Classify saved tensors by SHAPE + NBYTES rank. The pack_hook
-        # captures every save_for_backward in the autograd graph (the
-        # router's x and router_w, the topk function's saves, and the
-        # EP function's saves), so save-order alone can't isolate the
-        # EP's x_compute / h. The two saves that dominate cache cost
-        # are h (largest with shape[1] == h_dim2) and x_compute (largest
-        # with shape[1] == H, excluding h's slot when H == h_dim2).
-        # Index into ``saved_info`` is the disambiguator — when H ==
-        # h_dim2 the candidate pools coincide and we exclude h's
-        # specific position so x picks the next-largest distinct entry.
         candidates = [
             (i, shape, nbytes)
             for i, (shape, dtype_str, nbytes) in enumerate(saved_info)
@@ -1077,12 +897,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     dist.barrier()
 
     def ep_fwd_inference():
-        # Pass both flags through even though the EP forward forces
-        # them off internally under is_inference_mode_enabled=True —
-        # keeps the closures symmetric with ep_fwd_training and
-        # _bench_ep_fwd_bwd, and prevents future changes to the
-        # inference-time flag-handling from silently regressing the
-        # measurement.
         return moe_ep_TC_softmax_topk_forward(
             x,
             router_w,
@@ -1106,20 +920,11 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             f"Per-rank TFLOPS: {local_tflops:<5.0f}, Net EP TFLOPS: {tflops:<5.0f}"
         )
 
-    # ====================================================================
-    # 2) EP Fwd training
-    # ====================================================================
     time.sleep(0.5)
     torch.cuda.synchronize()
     dist.barrier()
 
     def ep_fwd_training():
-        # Pass both flags so the training-fwd timing reflects the same
-        # configuration the fwd+bwd run uses; without this, the
-        # forward measured here is vanilla and the derived
-        # ``ep_bwd_ms = ep_fwdbwd_ms - ep_fwd_train_ms`` mis-attributes
-        # the forward's CPU-sync / redispatch overhead to the
-        # backward.
         return moe_ep_TC_softmax_topk_forward(
             x,
             router_w,
@@ -1142,9 +947,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             f"Per-rank TFLOPS: {local_tflops:<5.0f}, Net EP TFLOPS: {tflops:<5.0f}"
         )
 
-    # ====================================================================
-    # 3) EP Fwd + Bwd
-    # ====================================================================
     ep_fwdbwd_ms = None
     ep_bwd_ms = None
     if not args.skip_bench_bwd:
@@ -1205,36 +1007,16 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         del dout_bench_global, dout_bench_local
         torch.cuda.empty_cache()
 
-    # ====================================================================
-    # 4) Local baselines T_local
-    # --------------------------------------------------------------------
-    # Must use E_local experts (not full E) to mirror what one rank
-    # actually computes in EP: T_local·K token-expert pairs routed
-    # across E_local experts. Running T_local tokens through all E
-    # experts produces per-expert GEMMs whose M dimension is W× smaller
-    # than EP's, so each GEMM runs at lower compute efficiency — the
-    # baseline ends up slower than EP itself and the
-    # ``exposed_network = ep - baseline`` calculation produces
-    # nonsensical negative values. With E_local-sized weights, the
-    # baseline's per-expert M = T_local·K/E_local matches EP's exactly,
-    # making it a true per-rank irreducible compute lower bound.
-    # ====================================================================
     if rank == 0:
         print0(
-            f"\n[bold]── Per-rank baselines (T={T_local}, E={E_local}, K={K}, single-GPU with E_local scale) ──[/bold]"
+            f"\n[bold]── Per-rank baselines (T={T_local}, E={E}, K={K}, single-GPU with T_local tokens) ──[/bold]"
         )
 
-    assert K <= E_local, f"local-baseline K={K} must be ≤ E_local={E_local}"
-
-    # E_local-sized slices of the full-precision weights/router. These
-    # are intentionally separate from ``w1`` / ``w2`` (the QuACK-strided
-    # per-rank tensors fed to the EP path) — the baseline calls the
-    # non-EP layer which expects torch-native layout.
-    w1_full_baseline = w1_full[:E_local].clone()
-    w2_full_baseline = w2_full[:E_local].clone()
-    b1_full_baseline = b1_full[:E_local].clone() if add_bias else None
-    b2_full_baseline = b2_full[:E_local].clone() if add_bias else None
-    router_w_baseline = router_w[:E_local].clone()
+    w1_full_baseline = w1_full.clone()
+    w2_full_baseline = w2_full.clone()
+    b1_full_baseline = b1_full.clone() if add_bias else None
+    b2_full_baseline = b2_full.clone() if add_bias else None
+    router_w_baseline = router_w.clone()
     w1_local_fmt_baseline = w1_full_baseline.permute(1, 2, 0)
     w2_local_fmt_baseline = w2_full_baseline.permute(1, 2, 0)
 
@@ -1260,7 +1042,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     if rank == 0:
         tflops = fwd_flops_local / (local_fwd_train_Tl_ms * 1e9)
         print0(
-            f" {f'Per-rank Fwd (T={T_local}, E={E_local}, K={K}, training)':<48} Average time: {local_fwd_train_Tl_ms:<8.2f} ms, TFLOPS: {tflops:<5.0f}"
+            f" {f'Per-rank Fwd (T={T_local}, E={E}, K={K}, training)':<48} Average time: {local_fwd_train_Tl_ms:<8.2f} ms, TFLOPS: {tflops:<5.0f}"
         )
 
     local_bwd_Tl_ms = None
@@ -1286,13 +1068,9 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         if rank == 0:
             bwd_tflops = bwd_flops_local / (local_bwd_Tl_ms * 1e9) if local_bwd_Tl_ms > 0 else 0.0
             print0(
-                f" {f'Per-rank Bwd (T={T_local}, E={E_local}, K={K})':<48} Average time: {local_bwd_Tl_ms:<8.2f} ms, TFLOPS: {bwd_tflops:<5.0f}"
+                f" {f'Per-rank Bwd (T={T_local}, E={E}, K={K})':<48} Average time: {local_bwd_Tl_ms:<8.2f} ms, TFLOPS: {bwd_tflops:<5.0f}"
             )
 
-    # ====================================================================
-    # 5) Local baselines full T
-    # ====================================================================
-    local_fwd_inf_T_ms = None
     local_fwd_train_T_ms = None
     local_bwd_T_ms = None
     if not args.skip_local_T:
@@ -1349,25 +1127,10 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
                     f" {f'Per-rank Bwd (T={T}, E={E}, K={K})':<42} Average time: {local_bwd_T_ms:<8.2f} ms, TFLOPS: {bwd_tflops:<5.0f}"
                 )
 
-    # ====================================================================
-    # 6) Exposed network latency summary
-    # ====================================================================
-    #
-    # "Exposed network" = EP_time − per-rank-baseline_time. It's the
-    # extra wall time EP costs vs. running just the local T_local-row
-    # forward/backward — i.e., the part of comm + symm-mem orchestration
-    # that wasn't hidden behind compute. Per-rank NVLink bytes for each
-    # phase scale by dispatch / combine mode; see ``benchmarks/
-    # distributed/bench-ep-comm.py`` for the per-primitive breakdown.
+
     if rank == 0:
         print0("\n[bold]══ Exposed network latency (EP vs. local T_local) ══[/bold]")
 
-        # Left-pad labels to a 24-char column so the value column starts
-        # at the same position. ms numbers use 2 decimals and left-align
-        # so the digit before the decimal lines up across rows.
-        # Width sized to fit the longest label across all subsections —
-        # currently ``Single-GPU full EP-scale (T={T}):`` (~37 chars at
-        # T=131072; up to ~39 for 7-digit T values).
         LBL = 40
 
         exposed_train_ms = ep_fwd_train_ms - local_fwd_train_Tl_ms

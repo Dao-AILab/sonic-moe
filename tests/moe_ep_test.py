@@ -14,11 +14,6 @@
 #            tests/moe_ep_test.py
 #   torchrun --nproc_per_node=8 --standalone --local-ranks-filter 0 \
 #            tests/moe_ep_test.py --concat-layout
-#
-# torchrun sets RANK / WORLD_SIZE / LOCAL_RANK / MASTER_ADDR / MASTER_PORT in
-# each child; we just read them. --standalone picks a free master port; use
-# --local-ranks-filter 0 to dedupe console output (rank 0 already does the
-# printing, but Triton/NCCL warnings on other ranks can still be noisy).
 # ********************************************************************************
 
 from __future__ import annotations
@@ -447,11 +442,6 @@ def _run_one_shape(
         dist.barrier()
 
     return stats
-
-
-# ============================================================================
-# Driver
-# ============================================================================
 
 
 def _print_summary(all_stats: List[ShapeStats]) -> bool:

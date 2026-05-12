@@ -440,13 +440,6 @@ class DispatchMetadataTest(TestCommons):
 
 
 class DedupMetadataTest(TestCommons):
-    """Tests for the 6 RANK_DEDUP dispatch metadata keys emitted by phases D1/D2/D3.
-
-    Bit-exact agreement with the pure-PyTorch reference is the bar; the
-    additional invariant checks guard the contracts the dispatch /
-    combine kernels rely on (canonical-slot uniqueness, packed-row range
-    coverage, K-slot dedup uniformity, sentinel ↔ has-route equivalence)."""
-
     @parameterized.expand(
         TestCommons.make_args_matrix(
             [torch.device("cuda")],

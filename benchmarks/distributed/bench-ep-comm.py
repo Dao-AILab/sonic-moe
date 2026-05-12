@@ -1,6 +1,6 @@
 # ********************************************************************************
 # Copyright (c) 2026, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
-#
+# ********************************************************************************
 # Benchmark suite for SonicMoE EP collectives and end-to-end forward.
 #
 # Run (torchrun-launched):
@@ -40,23 +40,6 @@
 #                            three plus the standalone local_combine
 #                            HBM TB/s (the producer leg shared by RS
 #                            and the dedup combine)
-#
-# torchrun sets RANK / WORLD_SIZE / LOCAL_RANK / MASTER_ADDR / MASTER_PORT in
-# each child; we just read them. --standalone picks a free master port; use
-# --local-ranks-filter 0 to dedupe console output (rank 0 already does the
-# printing, but Triton/NCCL warnings on other ranks can still be noisy).
-#
-# Symm-mem rendezvous handles are NOT held as Python locals across the
-# bench loops — doing so reorders ~CUDASymmetricMemory to fire when the
-# handle local is rebound on the next iteration, mid-execution, racing
-# with in-flight CUDA work on the buffer's peer mappings and triggering
-# `cuMemUnmap → CUDA_ERROR_INVALID_VALUE` from inside ~AllocationRef.
-# Producer-→peer-read fences use the transient `_barrier(buf)` helper,
-# which fetches the cached handle from PyTorch's symm-mem cache, calls
-# `.barrier()`, and drops the local ref immediately — the cache keeps
-# the actual handle alive bound to the buffer's lifetime. Coarse cross-
-# rank syncs (in `bench_fn` between warmup and timing, in main()
-# teardown) keep `dist.barrier()`.
 # ********************************************************************************
 
 from __future__ import annotations
@@ -233,13 +216,6 @@ def _pick_t_local() -> int:
     SM90 (Hopper: H100/H200) → 16384.
     SM100+ (Blackwell: B100/B200/SM110+) → 32768.
     Other / unknown → 16384 conservatively.
-
-    Bench-comm uses one T_local for every config so the resulting
-    table is directly comparable across phases; the value is chosen
-    per-architecture so the reported numbers reflect a workload size
-    that's representative for that class of GPU (Hopper has roughly
-    half the per-chip resources of Blackwell, so a smaller T_local
-    keeps total HBM footprint comparable).
     """
     cap_major = torch.cuda.get_device_capability()[0]
     if cap_major >= 10:
@@ -478,15 +454,6 @@ def phase_ag_dispatch(rank, world_size, device, args):
 
 
 def phase_a2a_dispatch(rank, world_size, device, args):
-    """A2A dispatch — Triton vs NCCL baseline (NVLink GB/s).
-
-    Triton pulls only the slots routed to this rank's E_local experts
-    via NVLink. NCCL ``all_to_all_single`` is benched with the same
-    per-peer split sizes (so both transfer the same byte volume), and
-    the GB/s for both is computed on the same ``peer_count_per_rank``-
-    derived denominator (excluding self), giving an apples-to-apples
-    NVLink-throughput comparison. Parity is covered by the test suite.
-    """
     rows = []
     for cfg in _A2A_DISPATCH_CONFIGS:
         if cfg.E % world_size != 0:
@@ -1273,11 +1240,6 @@ def run_phases(rank: int, world_size: int, device: torch.device, args) -> None:
             dist.barrier()
         torch.cuda.empty_cache()
 
-
-# ============================================================================
-# Driver — torchrun-driven. dist is initialized once in main(); everything
-# else is plain rank-aware code.
-# ============================================================================
 
 
 def _under_torchrun() -> bool:
