@@ -43,8 +43,7 @@
 
 from __future__ import annotations
 
-import math
-from typing import Iterable, Optional
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -245,11 +244,7 @@ def reduce_scatter_triton(x_symm, group, out=None, hdl=None, peer_bufs=None, my_
     numel_per_rank = out.numel()
     grid = lambda META: (triton.cdiv(numel_per_rank, META["BLOCK_SIZE"]),)
     _reduce_scatter_kernel[grid](
-        peer_bufs,
-        out,
-        numel_per_rank=numel_per_rank,
-        my_rank=my_rank,
-        world_size=W,
+        peer_bufs, out, numel_per_rank=numel_per_rank, my_rank=my_rank, world_size=W,
     )
     return out
 
@@ -261,17 +256,6 @@ def reduce_scatter_triton(x_symm, group, out=None, hdl=None, peer_bufs=None, my_
 
 def rendezvous(tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
     return symm_mem.rendezvous(tensor, group=group)
-
-
-def barrier(tensor: torch.Tensor, group: dist.ProcessGroup):
-    rendezvous(tensor, group).barrier()
-
-
-def safe_block_size(chunk_numel: int, requested: int = 4096) -> int:
-    block = requested
-    while triton.cdiv(chunk_numel, block) > _CUDA_MAX_GRID_Y:
-        block *= 2
-    return block
 
 
 # ============================================================================
@@ -296,10 +280,7 @@ def all_gather_triton(x_symm, group, out=None, hdl=None, peer_bufs=None):
         )
     grid = lambda META: (W, triton.cdiv(numel, META["BLOCK_SIZE"]))
     _all_gather_kernel[grid](
-        peer_bufs,
-        out,
-        numel_per_rank=numel,
-        world_size=W,
+        peer_bufs, out, numel_per_rank=numel, world_size=W,
     )
     return out
 

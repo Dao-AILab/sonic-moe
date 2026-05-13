@@ -65,12 +65,6 @@ def _set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-# ============================================================================
-# Distributed setup (torchrun-driven). dist is initialized exactly once per
-# process; we key off RANK/WORLD_SIZE in os.environ to detect torchrun.
-# ============================================================================
-
-
 def _under_torchrun() -> bool:
     return "RANK" in os.environ and "WORLD_SIZE" in os.environ
 
@@ -469,7 +463,7 @@ def _worker_local_combine(rank, world_size, device):
             dist.all_gather_into_tensor(sc_full.view(-1), sc_local.view(-1).contiguous(), group=dist.group.WORLD)
             sc_flat = sc_full.view(-1).contiguous()
 
-            # Iterate scored / score-less; partial_acc_buf is reset between modes.
+            # Iterate scored / score-less; partial_combine_buf is reset between modes.
             for use_scores in (True, False):
                 rs = _alloc_symm((world_size * T_local, d), torch.float32, device)
                 rs.zero_()
@@ -623,7 +617,7 @@ def _worker_rank_dedup_combine(rank, world_size, device):
 
             # Local-reduce buffer (W*T_local, d). Same allocation the
             # RS_COMBINE_TRITON path uses; RANK_DEDUP_COMBINE_TRITON reuses it.
-            partial_acc_buf = _alloc_symm((world_size * T_local, d), torch.bfloat16, device)
+            partial_combine_buf = _alloc_symm((world_size * T_local, d), torch.bfloat16, device)
 
             # y / sr published once; both A2A_combine and the local-
             # reduce + gather path read peers' versions through NVLink.
@@ -646,9 +640,9 @@ def _worker_rank_dedup_combine(rank, world_size, device):
                 )
 
                 # Local-reduce + gather: producer (local_combine) +
-                # barrier + sparse gather (consumer reads partial_acc_buf at
+                # barrier + sparse gather (consumer reads partial_combine_buf at
                 # rows where peer_present_mask is set).
-                partial_acc_buf.zero_()
+                partial_combine_buf.zero_()
                 got_out = torch.empty(T_local, d, dtype=torch.bfloat16, device=device)
                 rank_dedup_combine_triton(
                     y,
@@ -656,7 +650,7 @@ def _worker_rank_dedup_combine(rank, world_size, device):
                     meta["dst_rank_flat"],
                     scores_global if use_scores else None,
                     meta["peer_present_mask"],
-                    partial_acc_buf,
+                    partial_combine_buf,
                     got_out,
                     K=K,
                     T_local=T_local,
@@ -671,12 +665,12 @@ def _worker_rank_dedup_combine(rank, world_size, device):
                         f"max_abs={diff.max().item():.3e}"
                     )
 
-                # Sync peers between iterations — partial_acc_buf gets reused.
-                _barrier(partial_acc_buf)
+                # Sync peers between iterations — partial_combine_buf gets reused.
+                _barrier(partial_combine_buf)
 
                 del ref_out, got_out
 
-            del y, sr, partial_acc_buf, scores_local, scores_global
+            del y, sr, partial_combine_buf, scores_local, scores_global
         torch.cuda.empty_cache()
     return fails
 

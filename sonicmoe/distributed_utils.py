@@ -105,15 +105,6 @@ class _EPWorkspace:
     s_rev_symm: Optional[torch.Tensor]
     s_rev_hdl: Any
     s_rev_peer_bufs: Tuple[torch.Tensor, ...]
-    # topk_idx_symm — (T_local, K) int32 symm-mem staging for the
-    # forward's per-rank topk decision. ``_ag_routing_decision`` copies
-    # the local routing into this buffer, barriers, and then pulls
-    # peers' topk via ``all_gather_triton``. Replaces a vanilla NCCL
-    # ``all_gather_into_tensor`` whose small-message latency (~17 ms
-    # for 4 MB on H100/NVLink in our setup) dominated the EP forward.
-    topk_idx_symm: Optional[torch.Tensor]
-    topk_idx_hdl: Any
-    topk_idx_peer_bufs: Tuple[torch.Tensor, ...]
 
     ep_group: dist.ProcessGroup
     world_size: int
@@ -147,20 +138,25 @@ class _EPWorkspace:
     # step 2 must not clobber it before down-proj-act reads it).
     _ag_redispatch_buf: Optional[torch.Tensor] = None
 
-    # rs_buf — (W*T_local, d) bf16 symm-mem staging for the
-    # ``RS_COMBINE_TRITON`` combine path: ``local_combine``
-    # writes per-(home_rank, home_t) accumulations here locally, then
-    # ``reduce_scatter_triton`` reads peer rs_buf to combine across
-    # ranks. Lazy-allocated only when the agg path is actually used.
-    # Storage is the model dtype (bf16) — both producer and reducer
+    # partial_combine_buf — (W*T_local, d) bf16 symm-mem staging for the
+    # per-(home_rank, home_t) partial-combine accumulator. Shared by both
+    # combine paths that use a local pre-sum:
+    #   * ``RS_COMBINE_TRITON``: ``local_combine`` writes here locally,
+    #     then ``reduce_scatter_triton`` reads peer partial_combine_buf to
+    #     combine across ranks.
+    #   * ``RANK_DEDUP_COMBINE_TRITON``: ``local_combine`` writes
+    #     non-self stripes here, then the per-token sparse gather kernel
+    #     peer-reads them via NVLink.
+    # Lazy-allocated only when one of these agg paths is actually used.
+    # Storage is the model dtype (bf16) — both producer and consumer
     # kernels accumulate in fp32 registers and cast at store time, so
-    # NVLink moves half the bytes a fp32 rs_buf would. End-to-end this
-    # adds one extra bf16 rounding (rs_buf store) on top of the
+    # NVLink moves half the bytes a fp32 partial_combine_buf would. End-to-end this
+    # adds one extra bf16 rounding (partial_combine_buf store) on top of the
     # unavoidable y_local cast — total error per element ≈ 2·ε_bf16,
     # independent of K and W.
-    rs_buf: Optional[torch.Tensor] = None
-    rs_hdl: Any = None
-    rs_peer_bufs: Tuple[torch.Tensor, ...] = ()
+    partial_combine_buf: Optional[torch.Tensor] = None
+    partial_combine_hdl: Any = None
+    partial_combine_peer_bufs: Tuple[torch.Tensor, ...] = ()
 
     # a_idx_rank_dedup_buf — (MAX_ROWS_PER_RANK_STATIC,) int32 plain HBM,
     # the up-proj GEMM's A_idx for the dedup mode. Built every forward
@@ -203,20 +199,21 @@ class _EPWorkspace:
         self.do_hdl = hdl
         self.do_peer_bufs = peer_bufs
 
-    def _ensure_rs_buf(self) -> None:
-        """Lazy-allocate rs_buf for the RS_COMBINE_TRITON path.
+    def _ensure_partial_combine_buf(self) -> None:
+        """Lazy-allocate partial_combine_buf for the RS_COMBINE_TRITON
+        and RANK_DEDUP_COMBINE_TRITON combine paths.
 
         Called from forward/backward step 4 when ``cfg.agg_mode`` is
-        ``RS_COMBINE_TRITON``. ``(W·T_local, d)`` symm-mem buffer
-        in the model dtype (bf16) — register accumulation stays fp32
-        in both producer and reducer kernels; only the storage is
-        bf16, which halves NVLink bytes for the reduce-scatter step.
-        The allocation is collective (``_symm_mem.rendezvous``) but
-        symmetric — all ranks enter this combine at the same
-        logical point. First call pays the rendezvous cost; later
-        calls reuse.
+        ``RS_COMBINE_TRITON`` or ``RANK_DEDUP_COMBINE_TRITON``.
+        ``(W·T_local, d)`` symm-mem buffer in the model dtype (bf16) —
+        register accumulation stays fp32 in both producer and consumer
+        kernels; only the storage is bf16, which halves NVLink bytes
+        for the cross-rank read. The allocation is collective
+        (``_symm_mem.rendezvous``) but symmetric — all ranks enter
+        this combine at the same logical point. First call pays the
+        rendezvous cost; later calls reuse.
         """
-        if self.rs_buf is not None:
+        if self.partial_combine_buf is not None:
             return
         W = self.world_size
         shape = (W * self._T_local, self._d)
@@ -225,9 +222,9 @@ class _EPWorkspace:
         buf = _symm_mem.empty(*shape, dtype=dtype, device=device)
         hdl = _symm_mem.rendezvous(buf, group=self.ep_group)
         peer_bufs = tuple(hdl.get_buffer(r, shape, dtype) for r in range(W))
-        self.rs_buf = buf
-        self.rs_hdl = hdl
-        self.rs_peer_bufs = peer_bufs
+        self.partial_combine_buf = buf
+        self.partial_combine_hdl = hdl
+        self.partial_combine_peer_bufs = peer_bufs
 
     def release(self) -> None:
         """Drop ALL tensor refs (use when evicting / disposing).
@@ -248,8 +245,7 @@ class _EPWorkspace:
         self.do_peer_bufs = ()
         self.y_peer_bufs = ()
         self.s_rev_peer_bufs = ()
-        self.topk_idx_peer_bufs = ()
-        self.rs_peer_bufs = ()
+        self.partial_combine_peer_bufs = ()
         # Each *_hdl is the SymmetricMemory wrapper for its buffer
         # If it survives past the symm tensor below it would keep an internal AllocationRef
         # alive and we'd hit the same cuMemUnmap("invalid argument") crash one rendezvous later.
@@ -257,15 +253,13 @@ class _EPWorkspace:
         self.do_hdl = None
         self.o_hdl = None
         self.s_rev_hdl = None
-        self.topk_idx_hdl = None
-        self.rs_hdl = None
+        self.partial_combine_hdl = None
         # ↓ now the symm-mem buffers themselves.
         self.x_symm = None
         self.do_symm = None
         self.y_symm = None
         self.s_rev_symm = None
-        self.topk_idx_symm = None
-        self.rs_buf = None
+        self.partial_combine_buf = None
         # Plain HBM (not symm-mem) — order doesn't matter.
         self.a2a_recv = None
         self.ag_compute = None
@@ -342,7 +336,6 @@ class SymmMemManager:
         # x_symm can stay live for the X redispatch in step 2).
         y_symm, o_hdl, y_peer_bufs = self._alloc_symm((MAX_ROWS_PER_RANK, d), dtype)
         s_rev_symm, s_rev_hdl, s_rev_peer_bufs = self._alloc_symm((TK_global,), torch.int32)
-        topk_idx_symm, topk_idx_hdl, topk_idx_peer_bufs = self._alloc_symm((T_local, K), torch.int32)
 
         a2a_recv = None
         ag_compute = None
@@ -363,29 +356,11 @@ class SymmMemManager:
             t_global_pattern = torch.arange(TK_global, device=dev, dtype=torch.int32) // K
 
         return _EPWorkspace(
-            x_symm=x_symm,
-            x_hdl=x_hdl,
-            x_peer_bufs=x_peer_bufs,
-            y_symm=y_symm,
-            o_hdl=o_hdl,
-            y_peer_bufs=y_peer_bufs,
-            s_rev_symm=s_rev_symm,
-            s_rev_hdl=s_rev_hdl,
-            s_rev_peer_bufs=s_rev_peer_bufs,
-            topk_idx_symm=topk_idx_symm,
-            topk_idx_hdl=topk_idx_hdl,
-            topk_idx_peer_bufs=topk_idx_peer_bufs,
-            ep_group=self.ep_group,
-            world_size=W,
-            my_rank=self.rank,
-            E_local=E_local,
-            _T_local=T_local,
-            _K=K,
-            _d=d,
-            mode=mode,
-            a2a_recv=a2a_recv,
-            ag_compute=ag_compute,
-            t_global_pattern=t_global_pattern,
+            x_symm=x_symm, x_hdl=x_hdl, x_peer_bufs=x_peer_bufs, y_symm=y_symm, o_hdl=o_hdl,
+            y_peer_bufs=y_peer_bufs, s_rev_symm=s_rev_symm, s_rev_hdl=s_rev_hdl,
+            s_rev_peer_bufs=s_rev_peer_bufs, ep_group=self.ep_group, world_size=W, my_rank=self.rank,
+            E_local=E_local, _T_local=T_local, _K=K, _d=d, mode=mode, a2a_recv=a2a_recv,
+            ag_compute=ag_compute, t_global_pattern=t_global_pattern,
             a_idx_rank_dedup_buf=a_idx_rank_dedup_buf,
         )
 
@@ -424,8 +399,9 @@ class RuntimeEPConfig:
       used for the forward x dispatch and the backward dO dispatch.
     * ``W`` — EP world size (validated against ``mgr.world_size``).
     * ``K`` — top-K experts per token (validated against the call's K).
-    * ``agg_mode`` — combine mode (A2A_TRITON / RS_COMBINE_TRITON),
-      used for the forward combine and the backward dx combine.
+    * ``agg_mode`` — combine mode (A2A_TRITON / RS_COMBINE_TRITON /
+      RANK_DEDUP_COMBINE_TRITON), used for the forward combine and the
+      backward dx combine.
     * ``MAX_ROWS_PER_RANK_STATIC`` — worst-case (token, expert) slots
       routed to this rank, given by ``T_local · W · min(K, E_local)``.
       Top-K's distinct-pick guarantee plus this rank holding ``E_local``
@@ -569,30 +545,16 @@ class NetworkProfiler:
         _expert_freq = torch.empty(E_total, dtype=torch.int32, device=device)
         _expert_freq_off = torch.empty(E_total + 1, dtype=torch.int32, device=device)
         general_routing_router_metadata_triton(
-            a2a_token_indices,
-            expert_local_padded,
-            TK_global,
-            E_total,
-            _expert_freq,
-            _expert_freq_off,
-            _x_gather_idx,
-            _s_scatter_idx,
-            a2a_s_rev,
-            None,
+            a2a_token_indices, expert_local_padded, TK_global, E_total, _expert_freq, _expert_freq_off,
+            _x_gather_idx, _s_scatter_idx, a2a_s_rev, None,
         )
 
         a2a_recv = torch.empty(W, TK_local, H, dtype=dtype, device=device)
 
         def a2a_call() -> None:
             a2a_dispatch_triton(
-                x_symm=x_symm,
-                dst_rank_flat=dst_rank_flat,
-                recv_pos=a2a_s_rev,
-                recv=a2a_recv,
-                K=K,
-                group=mgr.ep_group,
-                peer_bufs=x_peer_bufs,
-                my_rank=rank,
+                x_symm=x_symm, dst_rank_flat=dst_rank_flat, recv_pos=a2a_s_rev, recv=a2a_recv, K=K,
+                group=mgr.ep_group, peer_bufs=x_peer_bufs, my_rank=rank,
             )
 
         # RANK_DEDUP dispatch: same metadata, plus pair_present_mask /
@@ -631,8 +593,10 @@ class NetworkProfiler:
         # ── Setup symm-mem buffers for the combine primitives ────
         # a2a_combine_triton reads peers' y_symm + s_rev_symm in
         # a single fused kernel. local_combine writes a bf16
-        # rs_buf locally then reduce_scatter_triton across ranks.
-        # Both reuse the routing meta we already computed above.
+        # partial_combine_buf locally; reduce_scatter_triton and the
+        # rank_dedup sparse gather both consume that buffer across
+        # ranks. All three reuse the routing meta we already computed
+        # above.
         y_symm = _symm_mem.empty((TK_global, H), dtype=dtype, device=device)
         y_symm.normal_()
         o_hdl = _symm_mem.rendezvous(y_symm, group=mgr.ep_group)
@@ -656,41 +620,24 @@ class NetworkProfiler:
 
         def gather_call() -> None:
             a2a_combine_triton(
-                y_symm,
-                s_rev_symm,
-                my_dst_rank,
-                topk_scores_local,
-                gather_out,
-                K=K,
-                group=mgr.ep_group,
-                y_peer_bufs=y_peer_bufs,
-                s_peer_bufs=s_rev_peer_bufs,
-                my_rank=rank,
+                y_symm, s_rev_symm, my_dst_rank, topk_scores_local, gather_out, K=K, group=mgr.ep_group,
+                y_peer_bufs=y_peer_bufs, s_peer_bufs=s_rev_peer_bufs, my_rank=rank,
             )
 
         scores_global = torch.empty(W * T_local, K, device=device, dtype=torch.float32)
         dist.all_gather_into_tensor(scores_global, topk_scores_local.contiguous(), group=mgr.ep_group)
         scores_flat = scores_global.view(-1)
 
-        rs_buf = _symm_mem.empty((W * T_local, H), dtype=dtype, device=device)
-        rs_hdl = _symm_mem.rendezvous(rs_buf, group=mgr.ep_group)
-        rs_peer_bufs = tuple(rs_hdl.get_buffer(r, (W * T_local, H), dtype) for r in range(W))
+        partial_combine_buf = _symm_mem.empty((W * T_local, H), dtype=dtype, device=device)
+        partial_combine_hdl = _symm_mem.rendezvous(partial_combine_buf, group=mgr.ep_group)
+        partial_combine_peer_bufs = tuple(partial_combine_hdl.get_buffer(r, (W * T_local, H), dtype) for r in range(W))
         rs_out = torch.empty(T_local, H, dtype=dtype, device=device)
 
         def rs_call() -> None:
             rs_combine_triton(
-                y_symm,
-                s_rev_symm,
-                dst_rank_flat,
-                scores_flat,
-                rs_buf,
-                rs_out,
-                K,
-                T_local,
-                group=mgr.ep_group,
-                partial_acc_hdl=rs_hdl,
-                partial_acc_peer_bufs=rs_peer_bufs,
-                my_rank=rank,
+                y_symm, s_rev_symm, dst_rank_flat, scores_flat, partial_combine_buf, rs_out, K, T_local,
+                group=mgr.ep_group, partial_combine_hdl=partial_combine_hdl,
+                partial_combine_peer_bufs=partial_combine_peer_bufs, my_rank=rank,
             )
 
         out_dedup = torch.empty(T_local, H, dtype=dtype, device=device)
@@ -702,13 +649,13 @@ class NetworkProfiler:
                 dst_rank_flat,
                 scores_flat,
                 meta["peer_present_mask"],
-                rs_buf,
+                partial_combine_buf,
                 out_dedup,
                 K=K,
                 T_local=T_local,
                 group=mgr.ep_group,
-                partial_acc_hdl=rs_hdl,
-                partial_acc_peer_bufs=rs_peer_bufs,
+                partial_combine_hdl=partial_combine_hdl,
+                partial_combine_peer_bufs=partial_combine_peer_bufs,
                 my_rank=rank,
             )
 
@@ -723,12 +670,18 @@ class NetworkProfiler:
         }
         agg_winner = min(agg_timings, key=agg_timings.get)
 
+        # Expose per-rank-mean timings (ms) so callers can report the
+        # measured cost of the chosen dispatch/combine pair without
+        # re-running the bench.
+        self.dispatch_timings_ms = {mode: t / W * 1e3 for mode, t in timings.items()}
+        self.combine_timings_ms = {mode: t / W * 1e3 for mode, t in agg_timings.items()}
+
         # ── Cleanup symm-mem in safe destruction order ───────────────
         # peer aliases first → handle next → buffer last (mirrors
         # _EPWorkspace.release()'s rationale).
-        del x_peer_bufs, y_peer_bufs, s_rev_peer_bufs, rs_peer_bufs
-        del x_hdl, o_hdl, s_rev_hdl, rs_hdl
-        del x_symm, y_symm, s_rev_symm, rs_buf, rank_dedup_packed_local
+        del x_peer_bufs, y_peer_bufs, s_rev_peer_bufs, partial_combine_peer_bufs
+        del x_hdl, o_hdl, s_rev_hdl, partial_combine_hdl
+        del x_symm, y_symm, s_rev_symm, partial_combine_buf, rank_dedup_packed_local
         del a2a_recv, a2a_s_rev, out_dedup
         del gather_out, rs_out
         del topk_scores_local, scores_global, scores_flat
@@ -750,7 +703,7 @@ class NetworkProfiler:
             #   A2A_TRITON: same as A2A (peer y_symm reads).
             #   RS pipeline: dominated by reduce_scatter, which moves
             #     (W-1) · T_local · H · itemsize_dtype bytes per rank
-            #     (rs_buf is now stored in the model dtype; reducer
+            #     (partial_combine_buf is now stored in the model dtype; reducer
             #     register acc stays fp32, store casts at the boundary).
             itemsize = torch.tensor([], dtype=dtype).element_size()
             ag_bytes = (W - 1) * T_local * H * itemsize

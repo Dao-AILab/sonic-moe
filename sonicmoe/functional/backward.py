@@ -348,7 +348,8 @@ def _down_projection_backward_act(
             TK = x_gather_idx.size(0)
             x_gather_idx_eff = x_gather_idx
 
-        old_ds_partial = torch.zeros(TK, 1, device=ds_scattered.device, dtype=ds_scattered.dtype)
+        DS_LEN = ds.size(0)
+        old_ds_partial = torch.zeros(DS_LEN, 1, device=ds_scattered.device, dtype=ds_scattered.dtype)
         # Same fused scatter+mask trick for the db2 path's old_ds_partial.
         # Sentinel positions remain 0 so they don't pollute db2_and_ds_kernel's
         # accumulation and the resulting ds.
@@ -370,7 +371,7 @@ def _down_projection_backward_act(
         # offsets into ds — corrupting the post-reduce_scatter ds_local
         # by summing peer ranks' garbage in. The no-bias path stays
         # correct because _scatter_ds writes only at masked slots.
-        new_ds_partial = torch.zeros(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
+        new_ds_partial = torch.zeros(DS_LEN, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
 
         db2_and_ds_kernel[(E, NUM_H_BLOCKS)](
             dout,

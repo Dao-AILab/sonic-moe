@@ -1,7 +1,5 @@
 # ********************************************************************************
 # Copyright (c) 2026, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
-#
-# SonicMoE EP — combine primitives
 # ********************************************************************************
 
 from __future__ import annotations
@@ -17,27 +15,23 @@ from ..collectives import _CUDA_MAX_GRID_Y, _prune_block_d_vs_d, reduce_scatter_
 
 
 # ============================================================================
-# Combine kernel — single-pass with inline s_reverse resolve, no atomics.
+# A2A Combine kernel — single-pass with inline s_reverse resolve, no atomics.
 # ============================================================================
-#
 # Design (one kernel):
 #   grid (T_local, cdiv(d, BLOCK_D)). One program per (t, BLOCK_D-tile).
 #   Inside, the K-loop is statically unrolled. For each k in 0..K:
 #     1. Load peer = src_dst_rank[t, k], score.
 #        pos = my_rank * TK_local + t * K + k is computed inline (each rank
 #        owns the contiguous [my_rank * TK_local, (my_rank+1) * TK_local)
-#        slice of every peer's TK_global-sized buffer; no per-(t, k) lookup
-#        needed).
+#        slice of every peer's TK_global-sized buffer.
 #     2. Load peer.s_reverse[pos] via NVLink to get the row in peer.y_symm
-#        (folded inline — no separate resolve kernel/barrier; the extra
-#        NVLink bytes are <0.1% of gather traffic and pipeline freely).
+#        (folded inline — no separate resolve kernel/barrier
 #     3. Load peer.y_symm[s_peer, d-tile] via NVLink, multiply by score,
 #        accumulate into an fp32 register block.
-#   After the K-loop, store the register block (cast to dtype) into
-#   out[t, d-tile]. One contiguous non-atomic store; bitwise deterministic.
+#   After the K-loop, store the register block (cast to dtype) into out[t, d-tile]. 
 # ============================================================================
 
-_GATHER_COMBINE_CONFIGS = [
+_A2A_COMBINE_CONFIGS = [
     triton.Config({"BLOCK_D": BLOCK_D}, num_warps=nw, num_stages=4)
     for BLOCK_D in [128, 256, 512, 1024, 2048, 4096]
     for nw in [2, 4, 8]
@@ -46,7 +40,7 @@ _GATHER_COMBINE_CONFIGS = [
 
 
 @triton.autotune(
-    configs=_GATHER_COMBINE_CONFIGS,
+    configs=_A2A_COMBINE_CONFIGS,
     key=["K", "d", "world_size"],
     prune_configs_by={"early_config_prune": _prune_block_d_vs_d},
 )
@@ -170,37 +164,28 @@ def a2a_combine_triton(
 
     grid = lambda META: (T_local, triton.cdiv(d, META["BLOCK_D"]))
     _a2a_combine_kernel[grid](
-        y_peer_bufs,
-        s_peer_bufs,
-        src_flat,
-        scores_flat,
-        out,
-        my_rank_offset,
-        K=K,
-        d=d,
-        world_size=W,
+        y_peer_bufs, s_peer_bufs, src_flat, scores_flat, out, my_rank_offset, K=K, d=d, world_size=W,
         WITH_SCORES=with_scores,
     )
 
 
 # ============================================================================
-# Local combine — local pre-sum + reduce-scatter producer step.
-# Single-store-per-row.
+# Local combine — local pre-sum producer step. Single-store-per-row.
 # ----------------------------------------------------------------------------
 #
 # Design (one kernel):
-#   grid (W * T_local, cdiv(d, BLOCK_D)). One program per (home_rank,
-#   home_t, BLOCK_D-tile). Inside, a tl.static_range(K) loop walks the K
-#   expert slots for this (home_rank, home_t) token.
-#
-#   For each k: if dst_rank_flat[f] == my_rank, loads score and
-#   y_symm[s_reverse[f], :], accumulates score * row in fp32 registers.
+#   grid (cdiv(W * T_local, BLOCK_SLOT), cdiv(d, BLOCK_D)). Each program
+#   walks ``BLOCK_SLOT`` adjacent (home_rank, home_t) output rows. For
+#   each row a ``tl.static_range(K)`` loop walks the K expert slots:
+#   if ``dst_rank_flat[f] == my_rank``, loads score and
+#   y_symm[s_reverse[f], :] and accumulates score * row in fp32 registers.
 #   If dst != my_rank, a masked load returns 0 (other=0.0), so score * 0 = 0
 #   and the accumulator is unaffected — no conditional branch, no Triton SSA
 #   miscompile risk from `if` inside tl.static_range.
 #
 #   After the K-loop, stores the register block ONCE into
-#   partial_acc_buf[home_rank * T_local + home_t, :]. No atomic_add. No zero_() required.
+#   partial_combine_buf[home_rank * T_local + home_t, :]. No atomic_add.
+#   No zero_() required.
 # ============================================================================
 
 # ``BLOCK_SLOT`` is the row-coarsening factor for ``_local_combine_kernel``.
@@ -235,10 +220,9 @@ def _local_combine_kernel(
     s_reverse_ptr,  # (TK_global,) int32, dispatch slot -> row index
     dst_rank_flat_ptr,  # (TK_global,) int32, destination rank per slot
     scores_ag_ptr,  # only read when WITH_SCORES is True
-    rs_buf_ptr,  # (W * T_local, d) output, flat — register acc is fp32, store casts to ptr dtype
+    partial_combine_buf_ptr,  # (W * T_local, d) output, flat — register acc is fp32, store casts to ptr dtype
     out_for_self_ptr,  # (T_local, d) — only used when WITH_OUT_FOR_SELF
     T_local,
-    WT_local,  # = world_size * T_local; tail-guard bound
     my_rank: tl.constexpr,
     world_size: tl.constexpr,
     K: tl.constexpr,
@@ -292,8 +276,10 @@ def _local_combine_kernel(
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     d_mask = offs_d < d  # const-True for EVEN_D
 
+    WT_local = world_size * T_local  # tail-guard bound
+
     # Walk BLOCK_SLOT adjacent (home_rank, home_t) rows. Tail-guard for
-    # the last block when WT_local doesn't divide BLOCK_SLOT evenly.
+    # the last block when BLOCK_SLOT doesn't divide WT_local evenly.
     for j in tl.static_range(BLOCK_SLOT):
         pid_ht = pid_block * BLOCK_SLOT + j
         if pid_ht < WT_local:
@@ -355,9 +341,9 @@ def _local_combine_kernel(
                 if (not SKIP_EMPTY) | any_mine:
                     out_offs = pid_ht * d + offs_d
                     if EVEN_D:
-                        tl.store(rs_buf_ptr + out_offs, acc)
+                        tl.store(partial_combine_buf_ptr + out_offs, acc)
                     else:
-                        tl.store(rs_buf_ptr + out_offs, acc, mask=d_mask)
+                        tl.store(partial_combine_buf_ptr + out_offs, acc, mask=d_mask)
 
 
 def local_combine(
@@ -365,7 +351,7 @@ def local_combine(
     s_reverse: torch.Tensor,
     dst_rank_flat: torch.Tensor,
     scores_ag: Optional[torch.Tensor],
-    partial_acc_buf: torch.Tensor,
+    partial_combine_buf: torch.Tensor,
     K: int,
     T_local: int,
     group: dist.ProcessGroup,
@@ -373,7 +359,7 @@ def local_combine(
     out_for_self: Optional[torch.Tensor] = None,
 ) -> None:
     """Writes
-        partial_acc_buf[home_rank * T_local + home_t, :] =
+        partial_combine_buf[home_rank * T_local + home_t, :] =
             sum_{k where dst[f] == my_rank}
                 w[f] * y_symm[s_reverse[f], :]
     for each (home_rank, home_t) pair, where
@@ -392,7 +378,7 @@ def local_combine(
             Accepted shapes when not None: (TK_global,) flat, or
             (W*T_local, K) — the natural output of all_gather(scores_symm).
             Flattened internally; no copy when already contiguous.
-        partial_acc_buf: (W*T_local, d) output buffer (any float dtype). Should be
+        partial_combine_buf: (W*T_local, d) output buffer (any float dtype). Should be
             symm-mem so it can feed reduce_scatter directly. The kernel
             accumulates in fp32 registers and casts at store time, so the
             buffer dtype controls only NVLink/HBM bytes, not accumulation
@@ -400,12 +386,12 @@ def local_combine(
         K: top-K experts per token.
         T_local: tokens per rank.
         group: the EP process group.
-        skip_empty: when True, the kernel skips the partial_acc_buf store for
+        skip_empty: when True, the kernel skips the partial_combine_buf store for
             (home_rank, home_t) rows that have no slot routed to my_rank.
-            Saves the HBM store bandwidth on those rows; partial_acc_buf retains
+            Saves the HBM store bandwidth on those rows; partial_combine_buf retains
             stale data there. Safe ONLY when downstream consumers access
-            partial_acc_buf via a presence mask that excludes these same rows
-            (e.g. ``rank_dedup_combine_triton`` reads partial_acc_buf only at
+            partial_combine_buf via a presence mask that excludes these same rows
+            (e.g. ``rank_dedup_combine_triton`` reads partial_combine_buf only at
             rows where ``peer_present_mask`` is set, which is exactly
             the complement of empty rows). MUST be False for the dense
             reduce-scatter path (the RS reducer reads ALL peer rows
@@ -413,7 +399,7 @@ def local_combine(
         out_for_self: optional (T_local, d) tensor. When given, programs
             with ``home_rank == my_rank`` store the per-(my_rank, home_t)
             accumulator directly into ``out_for_self[home_t]`` and skip
-            the ``partial_acc_buf[my_rank*T_local + home_t]`` write entirely.
+            the ``partial_combine_buf[my_rank*T_local + home_t]`` write entirely.
             Self-stripe stores are unconditional regardless of
             ``skip_empty`` because ``rank_dedup_combine_triton``'s
             consumer reads ``out[t]`` as its initial accumulator value.
@@ -421,12 +407,12 @@ def local_combine(
             consumer's ``q == my_rank`` symm-mem self-read.
     """
     assert (
-        partial_acc_buf.ndim == 2
-    ), f"partial_acc_buf must be 2D (W*T_local, d), got shape {tuple(partial_acc_buf.shape)}."
-    WT, d = partial_acc_buf.shape
+        partial_combine_buf.ndim == 2
+    ), f"partial_combine_buf must be 2D (W*T_local, d), got shape {tuple(partial_combine_buf.shape)}."
+    WT, d = partial_combine_buf.shape
     W = dist.get_world_size(group)
     my_rank = dist.get_rank(group)
-    assert WT == W * T_local, f"partial_acc_buf.shape[0]={WT} != W*T_local={W*T_local} (W from group)"
+    assert WT == W * T_local, f"partial_combine_buf.shape[0]={WT} != W*T_local={W*T_local} (W from group)"
 
     with_scores = scores_ag is not None
     if with_scores:
@@ -455,20 +441,8 @@ def local_combine(
         triton.cdiv(d, META["BLOCK_D"]),
     )
     _local_combine_kernel[grid](
-        y_symm,
-        s_reverse,
-        dst_rank_flat,
-        scores_flat,
-        partial_acc_buf,
-        out_self_arg,
-        T_local=T_local,
-        WT_local=WT_local,
-        my_rank=my_rank,
-        world_size=W,
-        K=K,
-        d=d,
-        WITH_SCORES=with_scores,
-        SKIP_EMPTY=skip_empty,
+        y_symm, s_reverse, dst_rank_flat, scores_flat, partial_combine_buf, out_self_arg, T_local=T_local,
+        my_rank=my_rank, world_size=W, K=K, d=d, WITH_SCORES=with_scores, SKIP_EMPTY=skip_empty,
         WITH_OUT_FOR_SELF=with_out_for_self,
     )
 
@@ -479,7 +453,7 @@ def local_combine(
 # Combine has *no* row-level deduplication — the K experts on a peer rank
 # produce K *different* outputs, not duplicate rows. What we exploit is
 # associativity: each rank pre-sums its own K-many contributions into
-# per-(home_p, home_t) partial sums (the local reduce — `_local_combine_kernel`
+# per-(home_rank, home_t) partial sums (the local reduce — `_local_combine_kernel`
 # above), and home ranks then sum those partial sums across peers
 # (`_rank_dedup_combine_kernel` below). The bytes saving vs. plain
 # reduce-scatter comes from skipping peer reads where the peer has no
@@ -543,7 +517,7 @@ def _prune_block_td_vs_d(configs, named_args, **kwargs):
 )
 @triton.jit
 def _rank_dedup_combine_kernel(
-    peer_partial_acc_buf_tuple,  # tuple of W (W*T_local, d) tensors — peers' local-reduce buffers
+    peer_partial_combine_buf_tuple,  # tuple of W (W*T_local, d) tensors — peers' local-reduce buffers
     peer_present_mask_ptr,  # (W, T_local) int8 — 1 if peer q has any expert for my (t)
     out_ptr,  # (T_local, d) — final aggregated output (RMW under WITH_OUT_FOR_SELF)
     T_local,
@@ -559,7 +533,7 @@ def _rank_dedup_combine_kernel(
 
     Each program owns ``(BLOCK_OUT_ROW tokens, BLOCK_D d-lanes)``. For each peer
     q in ``static_range``, loads a ``(BLOCK_OUT_ROW, BLOCK_D)`` tile from
-    ``peer_partial_acc_buf[q]`` using the 2-D mask
+    ``peer_partial_combine_buf[q]`` using the 2-D mask
     ``present[:, None] & d_mask[None, :]``. Bitwise deterministic;
     same accumulation order across runs (peer 0 → W-1).
 
@@ -598,7 +572,7 @@ def _rank_dedup_combine_kernel(
     for q in tl.static_range(world_size):
         # Skip q == my_rank under WITH_OUT_FOR_SELF — the self
         # contribution was already loaded into acc from out_ptr above
-        # (producer wrote it directly to ``out``, not to partial_acc_buf at this
+        # (producer wrote it directly to ``out``, not to partial_combine_buf at this
         # row). Both predicates are constexpr at compile time, so the
         # iteration folds away cleanly.
         if not (WITH_OUT_FOR_SELF and q == my_rank):
@@ -611,7 +585,7 @@ def _rank_dedup_combine_kernel(
                 != 0
             )
             m = present[:, None] & d_mask[None, :]
-            rows = tl.load(peer_partial_acc_buf_tuple[q] + row_base, mask=m, other=0.0).to(tl.float32)
+            rows = tl.load(peer_partial_combine_buf_tuple[q] + row_base, mask=m, other=0.0).to(tl.float32)
             acc += rows
 
     tl.store(out_ptr + out_offs, acc, mask=out_mask)
@@ -623,19 +597,19 @@ def rank_dedup_combine_triton(
     dst_rank_flat: torch.Tensor,
     scores: Optional[torch.Tensor],
     peer_present_mask: torch.Tensor,
-    partial_acc_buf: torch.Tensor,
+    partial_combine_buf: torch.Tensor,
     out: torch.Tensor,
     K: int,
     T_local: int,
     group,
-    partial_acc_hdl=None,
-    partial_acc_peer_bufs=None,
+    partial_combine_hdl=None,
+    partial_combine_peer_bufs=None,
     my_rank=None,
 ) -> None:
     """Combine via local reduce + per-token sparse gather.
 
-    Step 1 (``local_combine``): writes per-(home_p, home_t) partial sums
-    into local ``partial_acc_buf`` for non-self stripes, and into ``out`` directly
+    Step 1 (``local_combine``): writes per-(home_rank, home_t) partial sums
+    into local ``partial_combine_buf`` for non-self stripes, and into ``out`` directly
     for the self stripe (``home_rank == my_rank``). Empty contributions
     on non-self stripes are skipped via the ``skip_empty=True`` path;
     self-stripe stores are unconditional because the consumer reads
@@ -644,7 +618,7 @@ def rank_dedup_combine_triton(
     prior down-proj write to ``y_symm`` is sufficient).
 
     Step 2 (``_rank_dedup_combine_kernel``): for each local token t,
-    peer-reads ``partial_acc_buf[q][my_rank*T_local + t]`` and accumulates,
+    peer-reads ``partial_combine_buf[q][my_rank*T_local + t]`` and accumulates,
     skipping peers where ``peer_present_mask[q, t] == 0`` AND skipping
     the ``q == my_rank`` iteration entirely (self contribution comes
     from ``out`` via the in-kernel init load).
@@ -665,10 +639,10 @@ def rank_dedup_combine_triton(
         peer_present_mask: (W, T_local) int8 — 1 if peer q has any
             expert for my (t). From compute_dispatch_metadata's
             emit_dedup output.
-        partial_acc_buf: symm-mem buffer (W*T_local, d) (model dtype). Step 1
+        partial_combine_buf: symm-mem buffer (W*T_local, d) (model dtype). Step 1
             writes non-self stripes; step 2 peer-reads them. Same buffer
             the RS_COMBINE path uses — workspaces share one allocation.
-            The self stripe (``partial_acc_buf[my_rank*T_local : (my_rank+1)*T_local]``)
+            The self stripe (``partial_combine_buf[my_rank*T_local : (my_rank+1)*T_local]``)
             is left unwritten by this path (producer redirects to ``out``;
             consumer skips ``q == my_rank``), so its contents are
             irrelevant to the result.
@@ -687,59 +661,45 @@ def rank_dedup_combine_triton(
     # into ``out`` so the consumer can pick it up via its initial
     # accumulator load and elide the q == my_rank symm-mem self-read.
     local_combine(
-        y_symm,
-        s_reverse,
-        dst_rank_flat,
-        scores,
-        partial_acc_buf,
-        K,
-        T_local,
-        group=group,
-        skip_empty=True,
-        out_for_self=out,
+        y_symm, s_reverse, dst_rank_flat, scores, partial_combine_buf, K, T_local, group=group,
+        skip_empty=True, out_for_self=out,
     )
 
     # Step 2: per-token sparse gather (communication only). Internally
-    # issues the inter-rank barrier partial_acc_hdl.barrier() before the peer
+    # issues the inter-rank barrier partial_combine_hdl.barrier() before the peer
     # reads. ``init_acc_from_out=True`` matches the producer's
     # ``out_for_self=out`` redirect: the kernel loads its initial acc
     # from ``out`` (the self contribution) and skips the q == my_rank
     # symm-mem self-read.
     _rank_dedup_combine_communication_triton(
-        partial_acc_buf,
-        peer_present_mask,
-        out,
-        T_local=T_local,
-        group=group,
-        partial_acc_hdl=partial_acc_hdl,
-        partial_acc_peer_bufs=partial_acc_peer_bufs,
-        my_rank=my_rank,
-        init_acc_from_out=True,
+        partial_combine_buf, peer_present_mask, out, T_local=T_local, group=group,
+        partial_combine_hdl=partial_combine_hdl, partial_combine_peer_bufs=partial_combine_peer_bufs,
+        my_rank=my_rank, init_acc_from_out=True,
     )
 
 
 def _rank_dedup_combine_communication_triton(
-    partial_acc_buf: torch.Tensor,
+    partial_combine_buf: torch.Tensor,
     peer_present_mask: torch.Tensor,
     out: torch.Tensor,
     *,
     T_local: int,
     group,
-    partial_acc_hdl=None,
-    partial_acc_peer_bufs=None,
+    partial_combine_hdl=None,
+    partial_combine_peer_bufs=None,
     my_rank: Optional[int] = None,
     init_acc_from_out: bool = False,
 ) -> None:
     """Communication-only step of RANK_DEDUP combine: per-token sparse
-    cross-rank gather over peers' pre-populated ``partial_acc_buf``.
+    cross-rank gather over peers' pre-populated ``partial_combine_buf``.
 
-    Caller contract: ``partial_acc_buf`` has been written by ``local_combine`` (or
+    Caller contract: ``partial_combine_buf`` has been written by ``local_combine`` (or
     equivalent) on every rank BEFORE this call. The wrapper issues the
-    inter-rank ``partial_acc_hdl.barrier()`` internally so peers' writes are
+    inter-rank ``partial_combine_hdl.barrier()`` internally so peers' writes are
     visible before the gather kernel reads them.
 
     Args:
-        partial_acc_buf: symm-mem buffer (W*T_local, d). Pre-populated.
+        partial_combine_buf: symm-mem buffer (W*T_local, d). Pre-populated.
         peer_present_mask: (W, T_local) int8 — 1 if peer q has any
             partial sum for my (t).
         out: (T_local, d) local output buffer; written in place.
@@ -748,7 +708,7 @@ def _rank_dedup_combine_communication_triton(
             self-stripe contribution by ``local_combine(out_for_self=out)``).
         T_local: tokens per rank.
         group: process group.
-        partial_acc_hdl / partial_acc_peer_bufs / my_rank: optional cached rendezvous
+        partial_combine_hdl / partial_combine_peer_bufs / my_rank: optional cached rendezvous
             handle / peer-buf tuple / my-rank int. Auto-resolved when
             None.
         init_acc_from_out: when True, the kernel initializes its
@@ -756,41 +716,35 @@ def _rank_dedup_combine_communication_triton(
             ``q == my_rank`` static_range iteration entirely. Pairs
             with ``local_combine(out_for_self=out)`` on the producer
             side. Default False — kernel zero-inits acc and the
-            q == my_rank iteration reads partial_acc_buf at the self stripe
+            q == my_rank iteration reads partial_combine_buf at the self stripe
             (which the producer must have populated).
     """
-    d = partial_acc_buf.shape[-1]
-    if partial_acc_peer_bufs is None:
-        if partial_acc_hdl is None:
-            partial_acc_hdl = rendezvous(partial_acc_buf, group)
-        W = partial_acc_hdl.world_size
-        my_rank = partial_acc_hdl.rank if my_rank is None else my_rank
-        partial_acc_peer_bufs = tuple(
-            partial_acc_hdl.get_buffer(r, tuple(partial_acc_buf.shape), partial_acc_buf.dtype) for r in range(W)
+    d = partial_combine_buf.shape[-1]
+    if partial_combine_peer_bufs is None:
+        if partial_combine_hdl is None:
+            partial_combine_hdl = rendezvous(partial_combine_buf, group)
+        W = partial_combine_hdl.world_size
+        my_rank = partial_combine_hdl.rank if my_rank is None else my_rank
+        partial_combine_peer_bufs = tuple(
+            partial_combine_hdl.get_buffer(r, tuple(partial_combine_buf.shape), partial_combine_buf.dtype) for r in range(W)
         )
     else:
-        W = len(partial_acc_peer_bufs)
+        W = len(partial_combine_peer_bufs)
         if my_rank is None:
-            my_rank = partial_acc_hdl.rank if partial_acc_hdl is not None else dist.get_rank(group)
+            my_rank = partial_combine_hdl.rank if partial_combine_hdl is not None else dist.get_rank(group)
 
-    # Barrier: peers must have finished writing partial_acc_buf before we read.
-    if partial_acc_hdl is None:
-        partial_acc_hdl = rendezvous(partial_acc_buf, group)
-    partial_acc_hdl.barrier()
+    # Barrier: peers must have finished writing partial_combine_buf before we read.
+    if partial_combine_hdl is None:
+        partial_combine_hdl = rendezvous(partial_combine_buf, group)
+    partial_combine_hdl.barrier()
 
     grid = lambda META: (
         triton.cdiv(T_local, META["BLOCK_OUT_ROW"]),
         triton.cdiv(d, META["BLOCK_D"]),
     )
     _rank_dedup_combine_kernel[grid](
-        partial_acc_peer_bufs,
-        peer_present_mask,
-        out,
-        T_local=T_local,
-        my_rank=my_rank,
-        world_size=W,
-        d=d,
-        WITH_OUT_FOR_SELF=init_acc_from_out,
+        partial_combine_peer_bufs, peer_present_mask, out, T_local=T_local, my_rank=my_rank, world_size=W,
+        d=d, WITH_OUT_FOR_SELF=init_acc_from_out,
     )
 
 
@@ -799,13 +753,13 @@ def rs_combine_triton(
     s_reverse: torch.Tensor,
     dst_rank_flat: torch.Tensor,
     scores_ag: Optional[torch.Tensor],
-    partial_acc_buf: torch.Tensor,
+    partial_combine_buf: torch.Tensor,
     out: torch.Tensor,
     K: int,
     T_local: int,
     group,
-    partial_acc_hdl=None,
-    partial_acc_peer_bufs=None,
+    partial_combine_hdl=None,
+    partial_combine_peer_bufs=None,
     my_rank: Optional[int] = None,
 ) -> torch.Tensor:
     """Full RS combine: ``local_combine`` (producer) + barrier +
@@ -813,8 +767,8 @@ def rs_combine_triton(
 
     Caller contract: ``y_symm`` has been written and a same-stream
     ordering with this call is sufficient (the producer is fully local).
-    The wrapper issues an ``partial_acc_hdl.barrier()`` between the producer and
-    the reduce-scatter so peers' partial_acc_buf writes are visible before the
+    The wrapper issues an ``partial_combine_hdl.barrier()`` between the producer and
+    the reduce-scatter so peers' partial_combine_buf writes are visible before the
     cross-rank reads.
 
     Args:
@@ -824,43 +778,32 @@ def rs_combine_triton(
         scores_ag: GLOBAL all-gathered scores OR None for score-less
             mode (backward dx combine). Accepted shapes when not None:
             (TK_global,) flat or (W*T_local, K).
-        partial_acc_buf: symm-mem buffer (W*T_local, d). Producer writes here;
+        partial_combine_buf: symm-mem buffer (W*T_local, d). Producer writes here;
             the reducer peer-reads it.
         out: (T_local, d) local output buffer (model dtype). Written
             in-place — fp32 register accumulation casts at store time.
         K: top-K experts per token.
         T_local: tokens per rank.
         group: process group.
-        partial_acc_hdl / partial_acc_peer_bufs / my_rank: optional cached state, same
+        partial_combine_hdl / partial_combine_peer_bufs / my_rank: optional cached state, same
             semantics as elsewhere in this module.
 
     Returns ``out`` (for convenience).
     """
-    # Producer: writes partial_acc_buf locally — no peer reads, no barrier needed
+    # Producer: writes partial_combine_buf locally — no peer reads, no barrier needed
     # before this kernel; same-stream ordering with the prior write to
     # y_symm is sufficient.
     local_combine(
-        y_symm,
-        s_reverse,
-        dst_rank_flat,
-        scores_ag,
-        partial_acc_buf,
-        K,
-        T_local,
-        group=group,
+        y_symm, s_reverse, dst_rank_flat, scores_ag, partial_combine_buf, K, T_local, group=group,
     )
 
-    # Barrier before the reduce-scatter peer-reads partial_acc_buf.
-    if partial_acc_hdl is None:
-        partial_acc_hdl = rendezvous(partial_acc_buf, group)
-    partial_acc_hdl.barrier()
+    # Barrier before the reduce-scatter peer-reads partial_combine_buf.
+    if partial_combine_hdl is None:
+        partial_combine_hdl = rendezvous(partial_combine_buf, group)
+    partial_combine_hdl.barrier()
 
     reduce_scatter_triton(
-        partial_acc_buf,
-        group,
-        out=out,
-        hdl=partial_acc_hdl,
-        peer_bufs=partial_acc_peer_bufs,
+        partial_combine_buf, group, out=out, hdl=partial_combine_hdl, peer_bufs=partial_combine_peer_bufs,
         my_rank=my_rank,
     )
     return out

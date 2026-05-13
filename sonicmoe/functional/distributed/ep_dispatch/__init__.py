@@ -1,7 +1,5 @@
 # ********************************************************************************
 # Copyright (c) 2026, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
-#
-# SonicMoE EP — dispatch primitives
 # ********************************************************************************
 
 from __future__ import annotations
@@ -14,12 +12,6 @@ import triton.language as tl
 from ..collectives import _prune_block_d_vs_d, rendezvous
 
 
-# Used by both A2A dispatch and `_rank_dedup_dispatch_kernel` (purely
-# memory-bound: one peer load + one local store per slot/d-tile).
-# Same shrinking style as `_RANK_DEDUP_COMBINE_CONFIGS`, but the dispatch
-# kernel's observed winners include nw=2 at BLOCK_D=2048 (large tile
-# memory-saturated by 2 warps), so we don't apply the
-# "under-paralleled large tile" filter from the gather sweep.
 _A2A_DISPATCH_CONFIGS = [
     triton.Config({"BLOCK_D": BLOCK_D}, num_warps=nw, num_stages=ns)
     for BLOCK_D in [128, 256, 512, 1024, 2048, 4096]
@@ -188,14 +180,7 @@ def a2a_dispatch_triton(
 
     grid = lambda META: (TK_global, triton.cdiv(d, META["BLOCK_D"]))
     _a2a_dispatch_kernel[grid](
-        peer_bufs,
-        dst_rank_flat,
-        recv_pos,
-        recv_flat,
-        TK_local=TK_local,
-        my_rank=my_rank,
-        world_size=W,
-        K=K,
+        peer_bufs, dst_rank_flat, recv_pos, recv_flat, TK_local=TK_local, my_rank=my_rank, world_size=W, K=K,
         d=d,
     )
     return recv
@@ -207,20 +192,6 @@ def a2a_dispatch_triton(
 # longer materialized; the up-proj GEMM consumes ``recv_packed`` directly
 # via an A_idx that maps expert-grouped row → packed row (built by
 # ``build_rank_dedup_a_idx`` below).
-# ----------------------------------------------------------------------------
-# `_rank_dedup_dispatch_kernel` (grid (TK_global, cdiv(d, BLOCK_D))):
-#   Identical decomposition to _a2a_dispatch_kernel (peer-interleaved
-#   src_rank in the inner pid axis), but skips both (a) slots with
-#   dst != my_rank and (b) non-canonical slots (pair_present_mask[f] == 0).
-#   For each surviving slot: one peer NVLink read of x_symm[t_local], one
-#   write into recv_packed[rank_dedup_recv_pos[f]]. Net inbound NVLink rows per
-#   rank: sum_p pair_count[p, my_rank] = #unique (src, t) routed here —
-#   strictly ≤ both AG and per-slot A2A.
-#
-# Skipping the fanout saves a kernel launch and ~MAX_ROWS_PER_RANK · d
-# bytes of local HBM bandwidth per dispatch with zero NVLink change. The
-# K-fanout that the old fanout kernel performed in HBM is now folded into
-# the GEMM's A_idx-driven gather of ``recv_packed`` rows.
 # ============================================================================
 
 
@@ -385,17 +356,8 @@ def rank_dedup_dispatch_triton(
         triton.cdiv(d, META["BLOCK_D"]),
     )
     _rank_dedup_dispatch_kernel[grid](
-        peer_bufs,
-        pair_present_mask,
-        dst_rank_flat,
-        rank_dedup_recv_pos,
-        recv_packed_flat,
-        TK_local=TK_local,
-        TK_global=TK_global,
-        my_rank=my_rank,
-        world_size=W,
-        K=K,
-        d=d,
+        peer_bufs, pair_present_mask, dst_rank_flat, rank_dedup_recv_pos, recv_packed_flat, TK_local=TK_local,
+        TK_global=TK_global, my_rank=my_rank, world_size=W, K=K, d=d,
     )
     return recv_packed
 
@@ -431,12 +393,7 @@ def build_rank_dedup_a_idx(
     BLOCK_SLOT = 1024
     grid = (triton.cdiv(TK_global, BLOCK_SLOT),)
     _build_rank_dedup_a_idx_kernel[grid](
-        dst_rank_flat,
-        s_reverse_local,
-        rank_dedup_recv_pos,
-        out,
-        TK_global=TK_global,
-        my_rank=my_rank,
+        dst_rank_flat, s_reverse_local, rank_dedup_recv_pos, out, TK_global=TK_global, my_rank=my_rank,
         BLOCK_SLOT=BLOCK_SLOT,
     )
     return out

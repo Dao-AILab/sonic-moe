@@ -146,25 +146,25 @@ EP world size 8:
 torchrun --nproc_per_node=8 --standalone benchmarks/distributed/moe-ep.py --thiek 131072,4096,1536,128,8
 ```
 
-Override `--mode` / `--agg_mode` to lock a specific dispatch / combine primitive (useful for reproducing prior runs):
+Override `--dispatch_mode` / `--combine_mode` to lock a specific dispatch / combine primitive (useful for reproducing prior runs):
 ```bash
 torchrun --nproc_per_node=8 --standalone benchmarks/distributed/moe-ep.py \
     --thiek 131072,4096,1536,128,8 \
-    --mode RANK_DEDUP_DISPATCH_TRITON --agg_mode A2A_TRITON
+    --dispatch_mode RANK_DEDUP_DISPATCH_TRITON --combine_mode A2A_TRITON
 ```
 
 The EP forward exposes two optional flags that trade off activation memory, NVLink bandwidth in backward, and a host-stall on the forward.
-
-**`--redispatch_x_in_backward`** (default to False): instead of saving the post-dispatch `x_compute` for the backward, save only the pre-dispatch `x_local` and re-dispatch in the backward via a Copy-Engine all-gather on a side stream. Activation memory drops by a factor of `W` for the X cache. The cost is one extra asynchronous all-gather of X in the backward.
-
-```bash
-torchrun --nproc_per_node=8 --standalone benchmarks/distributed/moe-ep.py --thiek 131072,4096,1536,128,8 --redispatch_x_in_backward
-```
 
 **`--CPU_sync_on_runtime`** (default to False): initiate D2H sync to run *before* the dispatch step to shrink the saved activation cache. The trade-off is a single host stall per forward. Inference mode skips this since no cache is saved.
 
 ```bash
 torchrun --nproc_per_node=8 --standalone benchmarks/distributed/moe-ep.py --thiek 131072,4096,1536,128,8 --CPU_sync_on_runtime
+```
+
+**`--redispatch_x_in_backward`** (default to False): instead of saving the post-dispatch `x_compute` for the backward, save only the pre-dispatch `x_local` and re-dispatch in the backward via a Copy-Engine all-gather on a side stream. Activation memory drops by a factor of `W` for the X cache. The cost is one extra asynchronous all-gather of X in the backward.
+
+```bash
+torchrun --nproc_per_node=8 --standalone benchmarks/distributed/moe-ep.py --thiek 131072,4096,1536,128,8 --redispatch_x_in_backward
 ```
 
 Both flags can be combined. The bench's activation-cache audit prints the actual bytes saved under each setting, so you can verify the memory savings on your own workload before turning them on in training.
