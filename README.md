@@ -74,6 +74,72 @@ x = torch.randn(32768, 4096, device="cuda", dtype=torch.bfloat16)
 output, aux_loss = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe)
 ```
 
+#### Intra-node Expert Parallelism
+
+`moe_ep_TC_softmax_topk_forward` runs the same MoE across an NVLink-connected EP group. Each rank holds `E // W` experts and processes `T_local = T // W` tokens; the forward dispatches tokens to their owning ranks, runs the grouped GEMMs locally, and combines the per-expert outputs back. `NetworkProfiler` benchmarks the dispatch/combine primitives on the local hardware and returns the fastest pair. Launch with `torchrun --nproc_per_node=<W> --standalone your_script.py`.
+
+```python
+import os
+import torch
+import torch.distributed as dist
+from sonicmoe import MoE
+from sonicmoe.distributed_utils import NetworkProfiler
+from sonicmoe.enums import ActivationType
+from sonicmoe.functional.ep import moe_ep_TC_softmax_topk_forward
+
+rank = int(os.environ["RANK"])
+local_rank = int(os.environ["LOCAL_RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+torch.cuda.set_device(local_rank)
+
+device = torch.device(f"cuda:{local_rank}")
+dist.init_process_group("nccl", device_id=device)
+
+T, H, I, E, K = 131072, 4096, 1536, 128, 8   # T is the global token count
+T_local, E_local = T // world_size, E // world_size
+
+# Build the global MoE once, then slice each rank's E_local expert shard.
+moe = MoE(
+    num_experts=E,
+    num_experts_per_tok=K,
+    hidden_size=H,
+    intermediate_size=I,
+    activation_function=ActivationType.SWIGLU,
+    add_bias=False,
+    std=0.02,
+).to(device=device, dtype=torch.bfloat16)
+for p in moe.parameters():
+    dist.broadcast(p.data, src=0)
+
+# QuACK's grouped GEMM requires the original (E, *, *) strides, preserved via
+# empty_strided + copy_ after permuting to the EP layout.
+
+# EP: shard expert weights evenly across all ranks
+w1_sharded = moe.c_fc.weight[rank * E_local : (rank + 1) * E_local].permute(1, 2, 0)    # (2I, H, E_local) view
+w2_sharded = moe.c_proj.weight[rank * E_local : (rank + 1) * E_local].permute(0, 2, 1)  # (E_local, I, H) view
+w1_sharded_contiguous = torch.empty_strided(w1_sharded.shape, w1_sharded.stride(), dtype=w1_sharded.dtype, device=device).copy_(w1_sharded)
+w2_sharded_contiguous = torch.empty_strided(w2_sharded.shape, w2_sharded.stride(), dtype=w2_sharded.dtype, device=device).copy_(w2_sharded)
+
+# !!!!! We assume the router weights are replicated across ranks !!!!!
+router_w = moe.router.weight
+
+# Pick the fastest dispatch and combine primitives for this GPU cluster once per (T_local, H, K, dtype).
+# We have also construct a `sonicmoe.distributed_utils.RuntimeEPConfig` from scratch by overwriting the Dispatch and Combine mode.
+ep_config = NetworkProfiler(T_local=T_local, H=H, K=K, dtype=torch.bfloat16).profile()
+
+# we always assume DP -> EP -> DP !!!
+x_local = torch.randn(T_local, H, device=device, dtype=torch.bfloat16)
+output_local = moe_ep_TC_softmax_topk_forward(
+    x_local,
+    router_w,
+    w1_sharded_contiguous, None,
+    w2_sharded_contiguous, None,
+    K=K, E=E,
+    ep_config=ep_config,
+    activation_type=ActivationType.SWIGLU,
+)
+```
+
 ## 🧪 Tests
 
 - Run the single-GPU test suite to verify correctness:
