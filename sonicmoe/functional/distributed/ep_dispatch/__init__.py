@@ -180,7 +180,14 @@ def a2a_dispatch_triton(
 
     grid = lambda META: (TK_global, triton.cdiv(d, META["BLOCK_D"]))
     _a2a_dispatch_kernel[grid](
-        peer_bufs, dst_rank_flat, recv_pos, recv_flat, TK_local=TK_local, my_rank=my_rank, world_size=W, K=K,
+        peer_bufs,
+        dst_rank_flat,
+        recv_pos,
+        recv_flat,
+        TK_local=TK_local,
+        my_rank=my_rank,
+        world_size=W,
+        K=K,
         d=d,
     )
     return recv
@@ -356,8 +363,17 @@ def rank_dedup_dispatch_triton(
         triton.cdiv(d, META["BLOCK_D"]),
     )
     _rank_dedup_dispatch_kernel[grid](
-        peer_bufs, pair_present_mask, dst_rank_flat, rank_dedup_recv_pos, recv_packed_flat, TK_local=TK_local,
-        TK_global=TK_global, my_rank=my_rank, world_size=W, K=K, d=d,
+        peer_bufs,
+        pair_present_mask,
+        dst_rank_flat,
+        rank_dedup_recv_pos,
+        recv_packed_flat,
+        TK_local=TK_local,
+        TK_global=TK_global,
+        my_rank=my_rank,
+        world_size=W,
+        K=K,
+        d=d,
     )
     return recv_packed
 
@@ -393,7 +409,12 @@ def build_rank_dedup_a_idx(
     BLOCK_SLOT = 1024
     grid = (triton.cdiv(TK_global, BLOCK_SLOT),)
     _build_rank_dedup_a_idx_kernel[grid](
-        dst_rank_flat, s_reverse_local, rank_dedup_recv_pos, out, TK_global=TK_global, my_rank=my_rank,
+        dst_rank_flat,
+        s_reverse_local,
+        rank_dedup_recv_pos,
+        out,
+        TK_global=TK_global,
+        my_rank=my_rank,
         BLOCK_SLOT=BLOCK_SLOT,
     )
     return out

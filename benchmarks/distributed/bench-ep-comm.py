@@ -31,7 +31,9 @@
 #                            excludes the local_combine producer step
 #                            which is HBM-only and not a network primitive)
 #   a2a_combine            — A2A_combine triton vs NCCL all_to_all_single
-#                            (correctness only)
+#                            (NVLink GB/s on the cross-rank recv volume;
+#                            Triton fuses the per-token weighted sum-K
+#                            on top, NCCL only does the gather)
 #   rank_dedup_combine     — RANK_DEDUP_COMBINE_TRITON on TWO profiles:
 #                            local_combine producer (HBM TB/s) and
 #                            cross-rank gather (NVLink GB/s)
@@ -422,11 +424,17 @@ def phase_ag_dispatch(rank, world_size, device, args):
         elem = x.element_size()
         nv_bytes = (world_size - 1) * cfg.T_local * cfg.d * elem
 
-        rows.append([
-            cfg.name, f"{cfg.T_local}", f"{cfg.d}",
-            f"{t_tri*1e3:.1f}", f"{t_ncl*1e3:.1f}",
-            f"{_gbps(nv_bytes, t_tri):.0f}", f"{_gbps(nv_bytes, t_ncl):.0f}",
-        ])
+        rows.append(
+            [
+                cfg.name,
+                f"{cfg.T_local}",
+                f"{cfg.d}",
+                f"{t_tri*1e3:.1f}",
+                f"{t_ncl*1e3:.1f}",
+                f"{_gbps(nv_bytes, t_tri):.0f}",
+                f"{_gbps(nv_bytes, t_ncl):.0f}",
+            ]
+        )
         del x, out_ncl, tri_call, ncl_call
         _iter_cleanup()
 
@@ -480,7 +488,10 @@ def phase_a2a_dispatch(rank, world_size, device, args):
 
         def ncl_call():
             dist.all_to_all_single(
-                recv_ncl, send_ncl, output_split_sizes=out_splits, input_split_sizes=in_splits,
+                recv_ncl,
+                send_ncl,
+                output_split_sizes=out_splits,
+                input_split_sizes=in_splits,
                 group=dist.group.WORLD,
             )
 
@@ -494,11 +505,19 @@ def phase_a2a_dispatch(rank, world_size, device, args):
         a2a_rows = int(pcpr[:, rank].sum().item() - pcpr[rank, rank].item())
         nv_bytes = a2a_rows * cfg.d * elem
 
-        rows.append([
-            cfg.name, f"{cfg.T_local}", f"{cfg.d}", f"{cfg.K}", f"{cfg.E}",
-            f"{t_tri*1e3:.1f}", f"{t_ncl*1e3:.1f}",
-            f"{_gbps(nv_bytes, t_tri):.0f}", f"{_gbps(nv_bytes, t_ncl):.0f}",
-        ])
+        rows.append(
+            [
+                cfg.name,
+                f"{cfg.T_local}",
+                f"{cfg.d}",
+                f"{cfg.K}",
+                f"{cfg.E}",
+                f"{t_tri*1e3:.1f}",
+                f"{t_ncl*1e3:.1f}",
+                f"{_gbps(nv_bytes, t_tri):.0f}",
+                f"{_gbps(nv_bytes, t_ncl):.0f}",
+            ]
+        )
         del x, recv, send_ncl, recv_ncl, meta, s_reverse_local, tri_call, ncl_call
         _iter_cleanup()
 
@@ -549,10 +568,17 @@ def phase_rank_dedup_dispatch(rank, world_size, device, args):
         recv_rows = int(pc[:, rank].sum().item() - pc[rank, rank].item())
         nv_bytes = recv_rows * cfg.d * elem
 
-        rows.append([
-            cfg.name, f"{cfg.T_local}", f"{cfg.d}", f"{cfg.K}", f"{cfg.E}",
-            f"{t*1e3:.1f}", f"{_gbps(nv_bytes, t):.0f}",
-        ])
+        rows.append(
+            [
+                cfg.name,
+                f"{cfg.T_local}",
+                f"{cfg.d}",
+                f"{cfg.K}",
+                f"{cfg.E}",
+                f"{t*1e3:.1f}",
+                f"{_gbps(nv_bytes, t):.0f}",
+            ]
+        )
         del x, recv_packed, meta, call
         _iter_cleanup()
 
@@ -667,13 +693,25 @@ def phase_dispatch_compare(rank, world_size, device, args):
         dedup_rows = int(pc[:, rank].sum().item() - pc[rank, rank].item())
         dedup_bytes = dedup_rows * cfg.d * elem
 
-        rows.append([
-            cfg.name, f"{cfg.T_local}", f"{cfg.d}", f"{cfg.K}", f"{cfg.E}",
-            f"{t_ag*1e3:.1f}", f"{t_a2a*1e3:.1f}", f"{t_dedup*1e3:.1f}",
-            f"{_gbps(ag_bytes, t_ag):.0f}", f"{_gbps(a2a_bytes, t_a2a):.0f}", f"{_gbps(dedup_bytes, t_dedup):.0f}",
-            f"{t_ag/t_dedup:.2f}x", f"{t_a2a/t_dedup:.2f}x",
-            f"{dedup_bytes/ag_bytes:.2f}", f"{dedup_bytes/a2a_bytes:.2f}",
-        ])
+        rows.append(
+            [
+                cfg.name,
+                f"{cfg.T_local}",
+                f"{cfg.d}",
+                f"{cfg.K}",
+                f"{cfg.E}",
+                f"{t_ag*1e3:.1f}",
+                f"{t_a2a*1e3:.1f}",
+                f"{t_dedup*1e3:.1f}",
+                f"{_gbps(ag_bytes, t_ag):.0f}",
+                f"{_gbps(a2a_bytes, t_a2a):.0f}",
+                f"{_gbps(dedup_bytes, t_dedup):.0f}",
+                f"{t_ag/t_dedup:.2f}x",
+                f"{t_a2a/t_dedup:.2f}x",
+                f"{dedup_bytes/ag_bytes:.2f}",
+                f"{dedup_bytes/a2a_bytes:.2f}",
+            ]
+        )
         del x, ag_compute, a2a_recv, dedup_packed, a_idx_dedup, x_gather_idx_ag
         del _s_scatter, _ef, _efo, _s_rev_throwaway, t_global_pattern
         del meta, s_reverse_local, ag_call, a2a_call, dedup_call
@@ -683,11 +721,21 @@ def phase_dispatch_compare(rank, world_size, device, args):
         rank,
         f"Dispatch head-to-head: AG vs A2A vs RANK_DEDUP_DISPATCH (W={world_size})",
         [
-            "name", "T_local", "d", "K", "E",
-            "AG µs", "A2A µs", "DEDUP µs",
-            "AG NVLink GB/s", "A2A NVLink GB/s", "DEDUP NVLink GB/s",
-            "AG/DEDUP", "A2A/DEDUP",
-            "DEDUP/AG bytes", "DEDUP/A2A bytes",
+            "name",
+            "T_local",
+            "d",
+            "K",
+            "E",
+            "AG µs",
+            "A2A µs",
+            "DEDUP µs",
+            "AG NVLink GB/s",
+            "A2A NVLink GB/s",
+            "DEDUP NVLink GB/s",
+            "AG/DEDUP",
+            "A2A/DEDUP",
+            "DEDUP/AG bytes",
+            "DEDUP/A2A bytes",
         ],
         rows,
     )
@@ -727,11 +775,17 @@ def phase_reduce_scatter(rank, world_size, device, args):
         elem = x.element_size()
         nv_bytes = (world_size - 1) * cfg.T_local * cfg.d * elem
 
-        rows.append([
-            cfg.name, f"{cfg.T_local}", f"{cfg.d}",
-            f"{t_tri*1e3:.1f}", f"{t_ncl*1e3:.1f}",
-            f"{_gbps(nv_bytes, t_tri):.0f}", f"{_gbps(nv_bytes, t_ncl):.0f}",
-        ])
+        rows.append(
+            [
+                cfg.name,
+                f"{cfg.T_local}",
+                f"{cfg.d}",
+                f"{t_tri*1e3:.1f}",
+                f"{t_ncl*1e3:.1f}",
+                f"{_gbps(nv_bytes, t_tri):.0f}",
+                f"{_gbps(nv_bytes, t_ncl):.0f}",
+            ]
+        )
         del x, out_tri, out_ncl, tri_call, ncl_call
         _iter_cleanup()
 
@@ -744,13 +798,19 @@ def phase_reduce_scatter(rank, world_size, device, args):
 
 
 def phase_a2a_combine(rank, world_size, device, args):
-    """``a2a_combine_triton`` vs NCCL ``all_to_all_single`` smoke test.
+    """``a2a_combine_triton`` vs NCCL ``all_to_all_single`` head-to-head.
 
-    Runs both paths to verify they complete without error on the
-    target shapes. No bandwidth column — numerical parity to the NCCL
-    recv would require a per-source reduction the bench does
-    out-of-band, and timing the A2A combine head-to-head with the
-    other combine paths lives in ``phase_combine_compare``.
+    Mirrors :func:`phase_a2a_dispatch` on the combine side: times both
+    paths on identical (T_local, d, K, E) shapes and reports NVLink GB/s
+    on the cross-rank receive volume.
+
+    Note this is a primitives-level comparison, not an end-to-end one —
+    ``a2a_combine_triton`` fuses the cross-rank gather with the per-token
+    weighted top-K sum, while ``all_to_all_single`` only performs the
+    gather (a fair NCCL combine would need an out-of-band weighted
+    sum-K reduction on the recv buffer to land on the (T_local, d) home
+    layout). End-to-end wall-clock against the RS and dedup combine
+    paths lives in ``phase_combine_compare``.
     """
     rows = []
     for cfg in _COMBINE_CONFIGS:
@@ -805,24 +865,47 @@ def phase_a2a_combine(rank, world_size, device, args):
 
         def ncl_call():
             dist.all_to_all_single(
-                recv_ncl, send_buf, output_split_sizes=out_splits, input_split_sizes=in_splits,
+                recv_ncl,
+                send_buf,
+                output_split_sizes=out_splits,
+                input_split_sizes=in_splits,
                 group=dist.group.WORLD,
             )
 
-        # Smoke-test both paths complete without error; numerical parity
-        # at the row layout level is non-trivial (the NCCL recv would
-        # need a per-source reduction the bench does out-of-band).
-        tri_call()
-        ncl_call()
+        t_tri = bench_fn(tri_call, warmup=args.warmup, repeat=args.repeat)
+        _post_bench_sync()
+        t_ncl = bench_fn(ncl_call, warmup=args.warmup, repeat=args.repeat)
+        _post_bench_sync()
 
-        rows.append([cfg.name, f"{cfg.T_local}", f"{cfg.d}", f"{cfg.K}", f"{cfg.E}"])
+        elem = y.element_size()
+        # Per-rank received bytes across NVLink: rows received from peers
+        # (excluding self) × d × elem. Mirrors phase_a2a_dispatch — under
+        # balanced routing the combine recv volume equals the dispatch
+        # send volume from the same peer_count_per_rank.
+        pcpr = meta["peer_count_per_rank"]
+        a2a_rows = int(pcpr[:, rank].sum().item() - pcpr[rank, rank].item())
+        nv_bytes = a2a_rows * cfg.d * elem
+
+        rows.append(
+            [
+                cfg.name,
+                f"{cfg.T_local}",
+                f"{cfg.d}",
+                f"{cfg.K}",
+                f"{cfg.E}",
+                f"{t_tri*1e3:.1f}",
+                f"{t_ncl*1e3:.1f}",
+                f"{_gbps(nv_bytes, t_tri):.0f}",
+                f"{_gbps(nv_bytes, t_ncl):.0f}",
+            ]
+        )
         del y, sr, out_tri, send_buf, recv_ncl, scores_local, scores_global, meta, tri_call, ncl_call
         _iter_cleanup()
 
     _print_table(
         rank,
-        f"A2A combine triton vs NCCL all_to_all_single (smoke, W={world_size})",
-        ["name", "T_local", "d", "K", "E"],
+        f"A2A combine: Triton vs NCCL (W={world_size})",
+        ["name", "T_local", "d", "K", "E", "Triton µs", "NCCL µs", "Triton NVLink GB/s", "NCCL NVLink GB/s"],
         rows,
     )
 
@@ -915,27 +998,43 @@ def phase_rank_dedup_combine(rank, world_size, device, args):
         pc = meta["pair_count"]
         gather_rows = int(pc[rank, :].sum().item() - pc[rank, rank].item())
         nv_bytes = gather_rows * cfg.d * elem
-        # local_combine HBM bytes per rank.
-        #   y_symm reads: only the K·is_mine masked loads move HBM
-        #     (warps where is_mine==False are predicate-killed and
-        #     don't fetch from DRAM). Under balanced routing the
-        #     mine_slot count per rank is T_local·K → effective
-        #     reads ≈ T_local·K rows · d · elem.
-        #   partial_combine_buf writes: W·T_local rows · d · elem. With
-        #     SKIP_EMPTY=True only ``any_mine`` rows are stored —
-        #     under balanced routing that's
-        #     ~W·T_local·(1 - (1 - 1/W)^K). For typical (K, W) the
-        #     uncondensed-write count is within a few % of W·T_local
-        #     and we ignore the small overcount.
+        # local_combine HBM bytes per rank — measured directly from the
+        # routing pattern and averaged across ranks (matches bench_fn,
+        # whose returned time is also the cross-rank average).
+        #   y_symm reads: predication on the scalar `is_mine` kills the
+        #     warp's load when the slot doesn't route here, so the
+        #     fetched-row count is exactly the mine-slot count.
+        #   partial_combine_buf writes: SKIP_EMPTY=True stores only
+        #     rows with at least one mine slot — i.e. the count of
+        #     (home_rank, home_t) rows whose K slots include my_rank.
         #   Metadata reads (dst_rank_flat, s_reverse, scores) are
         #     <1% of total and ignored.
-        hbm_bytes = cfg.T_local * (cfg.K + world_size) * cfg.d * elem
+        dst = meta["dst_rank_flat"].view(world_size, cfg.T_local, cfg.K)
+        is_mine = dst == rank
+        counts = torch.stack(
+            [
+                is_mine.sum().to(torch.int64),
+                is_mine.any(dim=2).sum().to(torch.int64),
+            ]
+        )
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
+        n_read_rows_avg = counts[0].item() / world_size
+        n_write_rows_avg = counts[1].item() / world_size
+        hbm_bytes = int((n_read_rows_avg + n_write_rows_avg) * cfg.d * elem)
 
-        rows.append([
-            cfg.name, f"{cfg.T_local}", f"{cfg.d}", f"{cfg.K}", f"{cfg.E}",
-            f"{t_local*1e3:.1f}", f"{t_gather*1e3:.1f}",
-            f"{_tbps(hbm_bytes, t_local):.2f}", f"{_gbps(nv_bytes, t_gather):.0f}",
-        ])
+        rows.append(
+            [
+                cfg.name,
+                f"{cfg.T_local}",
+                f"{cfg.d}",
+                f"{cfg.K}",
+                f"{cfg.E}",
+                f"{t_local*1e3:.1f}",
+                f"{t_gather*1e3:.1f}",
+                f"{_tbps(hbm_bytes, t_local):.2f}",
+                f"{_gbps(nv_bytes, t_gather):.0f}",
+            ]
+        )
         del y, sr, partial_combine_buf, out, scores_global, meta, local_call, gather_call
         _iter_cleanup()
 
@@ -1021,10 +1120,11 @@ def phase_combine_compare(rank, world_size, device, args):
             )
 
         # Standalone ``local_combine`` producer step (the HBM-only leg
-        # shared by RS and RANK_DEDUP combines). Timed separately so
-        # the per-tier bandwidth (HBM for this, NVLink for the others)
-        # is reported on its native unit.
-        def local_call():
+        # shared by RS and RANK_DEDUP combines). The RS path always
+        # writes every row (skip_empty=False), while rank_dedup_combine
+        # internally runs skip_empty=True — so we time both variants and
+        # report each next to its consumer's cross-rank leg.
+        def local_call_dense():
             local_combine(
                 y,
                 sr,
@@ -1034,6 +1134,20 @@ def phase_combine_compare(rank, world_size, device, args):
                 cfg.K,
                 cfg.T_local,
                 group=dist.group.WORLD,
+                skip_empty=False,
+            )
+
+        def local_call_dedup():
+            local_combine(
+                y,
+                sr,
+                meta["dst_rank_flat"],
+                scores_global,
+                partial_combine_buf_local,
+                cfg.K,
+                cfg.T_local,
+                group=dist.group.WORLD,
+                skip_empty=True,
             )
 
         a2a_call()
@@ -1046,7 +1160,9 @@ def phase_combine_compare(rank, world_size, device, args):
         _post_bench_sync()
         t_dedup = bench_fn(dedup_call, warmup=args.warmup, repeat=args.repeat)
         _post_bench_sync()
-        t_local = bench_fn(local_call, warmup=args.warmup, repeat=args.repeat)
+        t_local_dense = bench_fn(local_call_dense, warmup=args.warmup, repeat=args.repeat)
+        _post_bench_sync()
+        t_local_dedup = bench_fn(local_call_dedup, warmup=args.warmup, repeat=args.repeat)
         _post_bench_sync()
 
         elem = y.element_size()
@@ -1057,46 +1173,91 @@ def phase_combine_compare(rank, world_size, device, args):
         rs_bytes = (world_size - 1) * cfg.T_local * cfg.d * elem
         dedup_rows = int(pc[rank, :].sum().item() - pc[rank, rank].item())
         dedup_bytes = dedup_rows * cfg.d * elem
-        # local_combine HBM bytes per rank.
-        #   y_symm reads: only the K·is_mine masked loads move HBM —
-        #     warps where is_mine==False are predicate-killed and
-        #     don't fetch from DRAM. Under balanced routing the
-        #     mine_slot count per rank is T_local·K, so effective
-        #     reads ≈ T_local·K rows of size d·elem.
-        #   partial_combine_buf writes: W·T_local rows · d · elem (SKIP_EMPTY=False
-        #     in this path — every row written).
-        #   dst_rank_flat / s_reverse / scores reads are <1% of the
-        #     total and ignored.
-        hbm_bytes = cfg.T_local * (cfg.K + world_size) * cfg.d * elem
+        # local_combine HBM bytes per rank — measured directly from the
+        # routing pattern and averaged across ranks (bench_fn returns
+        # the cross-rank mean time, so the bytes input matches).
+        #   reads (both variants): predication on `is_mine` kills the
+        #     warp's y_symm load when the slot doesn't route here, so
+        #     the fetched-row count = mine-slot count.
+        #   writes (RS / skip_empty=False): every (home_rank, home_t)
+        #     row is stored, deterministically W·T_local per rank.
+        #   writes (dedup / skip_empty=True): only rows whose K slots
+        #     include my_rank — counted directly from dst_rank_flat.
+        #   Metadata reads (dst_rank_flat, s_reverse, scores) are
+        #     <1% of total and ignored.
+        dst = meta["dst_rank_flat"].view(world_size, cfg.T_local, cfg.K)
+        is_mine = dst == rank
+        counts = torch.stack(
+            [
+                is_mine.sum().to(torch.int64),
+                is_mine.any(dim=2).sum().to(torch.int64),
+            ]
+        )
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
+        n_read_rows_avg = counts[0].item() / world_size
+        n_write_dedup_avg = counts[1].item() / world_size
+        hbm_bytes_dense = int((n_read_rows_avg + world_size * cfg.T_local) * cfg.d * elem)
+        hbm_bytes_dedup = int((n_read_rows_avg + n_write_dedup_avg) * cfg.d * elem)
 
         # Three-way pairwise allclose asserted inline; not printed.
-        # The two `_tbps(hbm_bytes, t_local)` entries both report the standalone
-        # `local_combine` HBM throughput (RS and the dedup combine share that
-        # producer kernel) — printed once per cross-rank leg so the producer
-        # cost is visible in context for both paths.
-        rows.append([
-            cfg.name, f"{cfg.T_local}", f"{cfg.d}", f"{cfg.K}", f"{cfg.E}",
-            f"{t_a2a*1e3:.1f}", f"{t_rs*1e3:.1f}", f"{t_dedup*1e3:.1f}",
-            f"{_gbps(a2a_bytes, t_a2a):.0f}",
-            f"{_gbps(rs_bytes, t_rs):.0f}", f"{_tbps(hbm_bytes, t_local):.2f}",
-            f"{_gbps(dedup_bytes, t_dedup):.0f}", f"{_tbps(hbm_bytes, t_local):.2f}",
-            f"{t_a2a/t_dedup:.2f}x", f"{t_rs/t_dedup:.2f}x",
-            f"{dedup_bytes/rs_bytes:.2f}", f"{dedup_bytes/a2a_bytes:.2f}",
-        ])
-        del y, sr, out_a2a, out_rs, out_dedup, partial_combine_buf_rs, partial_combine_buf_dedup, partial_combine_buf_local
-        del scores_local, scores_global, meta, a2a_call, rs_call, dedup_call, local_call
+        # The two HBM TB/s columns report each consumer's actual local_combine
+        # producer cost — RS runs skip_empty=False (dense), dedup runs
+        # skip_empty=True (sparse).
+        rows.append(
+            [
+                cfg.name,
+                f"{cfg.T_local}",
+                f"{cfg.d}",
+                f"{cfg.K}",
+                f"{cfg.E}",
+                f"{t_a2a*1e3:.1f}",
+                f"{t_rs*1e3:.1f}",
+                f"{t_dedup*1e3:.1f}",
+                f"{_gbps(a2a_bytes, t_a2a):.0f}",
+                f"{_gbps(rs_bytes, t_rs):.0f}",
+                f"{_tbps(hbm_bytes_dense, t_local_dense):.2f}",
+                f"{_gbps(dedup_bytes, t_dedup):.0f}",
+                f"{_tbps(hbm_bytes_dedup, t_local_dedup):.2f}",
+                f"{t_a2a/t_dedup:.2f}x",
+                f"{t_rs/t_dedup:.2f}x",
+                f"{dedup_bytes/rs_bytes:.2f}",
+                f"{dedup_bytes/a2a_bytes:.2f}",
+            ]
+        )
+        del (
+            y,
+            sr,
+            out_a2a,
+            out_rs,
+            out_dedup,
+            partial_combine_buf_rs,
+            partial_combine_buf_dedup,
+            partial_combine_buf_local,
+        )
+        del scores_local, scores_global, meta, a2a_call, rs_call, dedup_call, local_call_dense, local_call_dedup
         _iter_cleanup()
 
     _print_table(
         rank,
         f"Combine head-to-head: A2A vs RS vs RANK_DEDUP_COMBINE_TRITON (W={world_size})",
         [
-            "name", "T_local", "d", "K", "E",
-            "A2A µs", "RS µs", "DEDUP µs",
-            "A2A NVLink GB/s", "RS NVLink GB/s", "RS Local HBM TB/s",
-            "DEDUP NVLink GB/s", "Dedup local HBM TB/s",
-            "A2A/DEDUP", "RS/DEDUP",
-            "DEDUP/RS bytes", "DEDUP/A2A bytes",
+            "name",
+            "T_local",
+            "d",
+            "K",
+            "E",
+            "A2A µs",
+            "RS µs",
+            "DEDUP µs",
+            "A2A NVLink GB/s",
+            "RS NVLink GB/s",
+            "RS Local HBM TB/s",
+            "DEDUP NVLink GB/s",
+            "Dedup local HBM TB/s",
+            "A2A/DEDUP",
+            "RS/DEDUP",
+            "DEDUP/RS bytes",
+            "DEDUP/A2A bytes",
         ],
         rows,
     )
@@ -1142,7 +1303,6 @@ def run_phases(rank: int, world_size: int, device: torch.device, args) -> None:
         if dist.is_initialized():
             dist.barrier()
         torch.cuda.empty_cache()
-
 
 
 def _under_torchrun() -> bool:

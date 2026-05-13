@@ -7,7 +7,7 @@
 # T in --thiek is the GLOBAL token count; each rank processes T // W tokens.
 #
 # Mode selection: the bench profiles with ``NetworkProfiler`` to pick both
-# the dispatch mode and the combine mode at runtime. 
+# the dispatch mode and the combine mode at runtime.
 #
 # Launch with torchrun:
 #
@@ -101,13 +101,20 @@ def _fast_sm100_configs(epilogue=None):
     use_tma_gather_vals = [True, False]
     return [
         GemmConfigCls(
-            tile_m=m, tile_n=n, cluster_m=cm, cluster_n=cn, swap_ab=False, max_swizzle_size=8,
-            is_dynamic_persistent=use_clc, use_tma_gather=use_tma_gather,
+            tile_m=m,
+            tile_n=n,
+            cluster_m=cm,
+            cluster_n=cn,
+            swap_ab=False,
+            max_swizzle_size=8,
+            is_dynamic_persistent=use_clc,
+            use_tma_gather=use_tma_gather,
         )
         for (m, n, (cm, cn)), use_clc, use_tma_gather in itertools.product(
             tile_mn_cluster_vals, use_clc_vals, use_tma_gather_vals
         )
     ]
+
 
 def _fast_sm90_configs(epilogue=None, tune_coop=True):
     tile_n_vals = [128, 160, 192]
@@ -160,15 +167,10 @@ gemm_dgated_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_confi
 
 
 from sonicmoe import MoE
-from sonicmoe.distributed_utils import (
-    CombineMode,
-    DispatchMode,
-    NetworkProfiler,
-    RuntimeEPConfig,
-)
+from sonicmoe.distributed_utils import CombineMode, DispatchMode, NetworkProfiler, RuntimeEPConfig
 from sonicmoe.enums import ActivationType, is_glu
 from sonicmoe.functional import TC_Softmax_Topk_Router_Function, moe_TC_softmax_topk_layer
-from sonicmoe.functional.ep import SymmMemManager, moe_ep_TC_softmax_topk_forward
+from sonicmoe.functional.ep import moe_ep_TC_softmax_topk_forward
 
 
 def swiglu(h: torch.Tensor, concat_layout: bool = False) -> torch.Tensor:
@@ -314,13 +316,35 @@ def do_bench_distributed(fn, warmup=30, rep=100, calls_per_iter=1):
 
 
 def _bench_local_fwd(
-    x, router_w, w1, b1, w2, b2, K, activation, is_softmax_over_topk, norm_topk_probs, concat_layout,
-    is_inference, warmup, repeats,
+    x,
+    router_w,
+    w1,
+    b1,
+    w2,
+    b2,
+    K,
+    activation,
+    is_softmax_over_topk,
+    norm_topk_probs,
+    concat_layout,
+    is_inference,
+    warmup,
+    repeats,
 ):
     def fn():
         return moe_TC_softmax_topk_layer(
-            x, router_w, w1, b1, w2, b2, K, None, activation, is_inference,
-            is_softmax_over_topk=is_softmax_over_topk, norm_topk_probs=norm_topk_probs,
+            x,
+            router_w,
+            w1,
+            b1,
+            w2,
+            b2,
+            K,
+            None,
+            activation,
+            is_inference,
+            is_softmax_over_topk=is_softmax_over_topk,
+            norm_topk_probs=norm_topk_probs,
             concat_layout=concat_layout,
         )
 
@@ -330,15 +354,38 @@ def _bench_local_fwd(
 
 
 def _bench_local_fwd_bwd(
-    x, router_w, w1_param, b1_param, w2_param, b2_param, w1_perm, w2_perm, K, activation,
-    is_softmax_over_topk, norm_topk_probs, concat_layout, warmup, repeats,
+    x,
+    router_w,
+    w1_param,
+    b1_param,
+    w2_param,
+    b2_param,
+    w1_perm,
+    w2_perm,
+    K,
+    activation,
+    is_softmax_over_topk,
+    norm_topk_probs,
+    concat_layout,
+    warmup,
+    repeats,
 ):
     dout = 0.2 * torch.randn_like(x)
 
     def fn():
         o, _, _ = moe_TC_softmax_topk_layer(
-            x, router_w, w1_perm, b1_param, w2_perm, b2_param, K, None, activation, False,
-            is_softmax_over_topk=is_softmax_over_topk, norm_topk_probs=norm_topk_probs,
+            x,
+            router_w,
+            w1_perm,
+            b1_param,
+            w2_perm,
+            b2_param,
+            K,
+            None,
+            activation,
+            False,
+            is_softmax_over_topk=is_softmax_over_topk,
+            norm_topk_probs=norm_topk_probs,
             concat_layout=concat_layout,
         )
         o.backward(dout, retain_graph=True)
@@ -357,13 +404,31 @@ def _bench_local_fwd_bwd(
 
 
 def _bench_ep_fwd_bwd(
-    x_grad, router_w_grad, w1_grad, b1_grad, w2_grad, b2_grad, grad_inputs, dout_local, fwd_kwargs,
-    redispatch_x_in_backward, CPU_sync_on_runtime, warmup, repeats,
+    x_grad,
+    router_w_grad,
+    w1_grad,
+    b1_grad,
+    w2_grad,
+    b2_grad,
+    grad_inputs,
+    dout_local,
+    fwd_kwargs,
+    redispatch_x_in_backward,
+    CPU_sync_on_runtime,
+    warmup,
+    repeats,
 ):
     def fn():
         o = moe_ep_TC_softmax_topk_forward(
-            x_grad, router_w_grad, w1_grad, b1_grad, w2_grad, b2_grad, is_inference_mode_enabled=False,
-            redispatch_x_in_backward=redispatch_x_in_backward, CPU_sync_on_runtime=CPU_sync_on_runtime,
+            x_grad,
+            router_w_grad,
+            w1_grad,
+            b1_grad,
+            w2_grad,
+            b2_grad,
+            is_inference_mode_enabled=False,
+            redispatch_x_in_backward=redispatch_x_in_backward,
+            CPU_sync_on_runtime=CPU_sync_on_runtime,
             **fwd_kwargs,
         )
         torch.autograd.grad(o, grad_inputs, grad_outputs=dout_local, retain_graph=False)
@@ -378,28 +443,13 @@ def run(args: argparse.Namespace) -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
-    # `keep_alive` is a container that lives in run()'s scope. _run_impl
-    # appends `mgr` (and any other object whose destructor invokes CUDA
-    # APIs that fail at process exit) into this list. When an exception
-    # unwinds out of _run_impl, those objects remain referenced through
-    # `keep_alive` and DO NOT destruct at the boundary — they survive
-    # until run() reaches os._exit() below. os._exit terminates the
-    # process atomically without invoking any C++ destructors, which is
-    # the only reliable cleanup path for symm-mem allocations.
-    #
-    # Why this matters: the quack autotuner can hit a BrokenPipeError
-    # during local benchmarks (cache-write race to a closed subprocess
-    # pipe). The exception unwinds out of _run_impl. Without keep_alive,
-    # `mgr` was in _run_impl's scope and destructed during the unwind;
-    # ~CUDASymmetricMemory then called cuMemUnmap which threw c10::Error
-    # from a destructor → std::terminate → SIGABRT *before* run()'s
-    # except clause could fire. With keep_alive, mgr survives the unwind
-    # and is only "released" when os._exit kills the process — at which
-    # point Python's garbage collector and C++ destructors don't run.
-    keep_alive: list = []
-
+    # The symm-mem workspace is owned by the process-wide cache in
+    # ``sonicmoe.distributed_utils`` and freed via its atexit hook. We
+    # still hard-exit through os._exit below so that an unexpected
+    # exception (e.g. quack autotuner BrokenPipeError) can't race the
+    # symm-mem dealloc against CUDA-context teardown in the unwind path.
     try:
-        _run_impl(args, rank, local_rank, world_size, keep_alive)
+        _run_impl(args, rank, local_rank, world_size)
         rc = 0
     except BaseException:
         import traceback
@@ -414,7 +464,7 @@ def run(args: argparse.Namespace) -> None:
     os._exit(rc)
 
 
-def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: int, keep_alive: list) -> None:
+def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: int) -> None:
     W = world_size
 
     torch.autograd.set_multithreading_enabled(False)
@@ -470,8 +520,13 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     torch.cuda.manual_seed_all(1111)
 
     moe = MoE(
-        num_experts=E, num_experts_per_tok=K, hidden_size=H, intermediate_size=I,
-        activation_function=activation, add_bias=add_bias, std=0.02,
+        num_experts=E,
+        num_experts_per_tok=K,
+        hidden_size=H,
+        intermediate_size=I,
+        activation_function=activation,
+        add_bias=add_bias,
+        std=0.02,
     ).to(dtype=torch_dtype, device=device)
 
     if add_bias:
@@ -511,57 +566,69 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     dist.broadcast(x_global, src=0)
     x = x_global[rank * T_local : (rank + 1) * T_local].contiguous()
 
-    mgr = SymmMemManager(dist.group.WORLD, device)
-    keep_alive.append(mgr)
-
     # Skip the NetworkProfiler entirely when both modes are user-overridden —
     # its only outputs (dispatch winner + combine winner + per-mode timings)
     # are unused in that case.
     both_overridden = dispatch_mode_override is not None and combine_mode_override is not None
     if both_overridden:
         profiler = None
-        final_mode = dispatch_mode_override
-        final_agg_mode = combine_mode_override
+        final_dispatch_mode = dispatch_mode_override
+        final_combine_mode = combine_mode_override
     else:
         profiler = NetworkProfiler(
-            mgr, T_local=T_local, H=H, K=K, dtype=torch_dtype, warmup=10, repeat=50,
+            T_local=T_local,
+            H=H,
+            K=K,
+            dtype=torch_dtype,
+            device=device,
+            warmup=10,
+            repeat=50,
         )
         profiled_cfg = profiler.profile()
-        final_mode = dispatch_mode_override if dispatch_mode_override is not None else profiled_cfg.mode
-        final_agg_mode = combine_mode_override if combine_mode_override is not None else profiled_cfg.agg_mode
+        final_dispatch_mode = (
+            dispatch_mode_override if dispatch_mode_override is not None else profiled_cfg.dispatch_mode
+        )
+        final_combine_mode = combine_mode_override if combine_mode_override is not None else profiled_cfg.combine_mode
 
     dist.barrier()
     time.sleep(0.5)
 
-    ep_cfg = RuntimeEPConfig(mode=final_mode, W=W, K=K, agg_mode=final_agg_mode)
+    ep_cfg = RuntimeEPConfig(dispatch_mode=final_dispatch_mode, W=W, K=K, combine_mode=final_combine_mode)
     if rank == 0:
         dispatch_src = "override" if dispatch_mode_override is not None else "profiled"
-        agg_src = "override" if combine_mode_override is not None else "profiled"
+        combine_src = "override" if combine_mode_override is not None else "profiled"
         print0(
-            f"[bold]Final config[/bold]: dispatch={final_mode.value} ({dispatch_src}), "
-            f"agg={final_agg_mode.value} ({agg_src})"
+            f"[bold]Final config[/bold]: dispatch={final_dispatch_mode.value} ({dispatch_src}), "
+            f"combine={final_combine_mode.value} ({combine_src})"
         )
         if profiler is not None:
-            chosen_dispatch_ms = profiler.dispatch_timings_ms[final_mode]
-            chosen_combine_ms = profiler.combine_timings_ms[final_agg_mode]
+            chosen_dispatch_ms = profiler.dispatch_timings_ms[final_dispatch_mode]
+            chosen_combine_ms = profiler.combine_timings_ms[final_combine_mode]
             print0(
                 f"Dispatch + Combine time: {chosen_dispatch_ms:.2f} + "
                 f"{chosen_combine_ms:.2f} = {chosen_dispatch_ms + chosen_combine_ms:.2f} ms"
             )
 
     fwd_kwargs = dict(
-        K=K, E=E, mgr=mgr, activation_type=activation, is_softmax_over_topk=is_softmax_over_topk,
-        norm_topk_probs=norm_topk_probs, concat_layout=concat_layout, ep_config=ep_cfg,
+        K=K,
+        E=E,
+        activation_type=activation,
+        is_softmax_over_topk=is_softmax_over_topk,
+        norm_topk_probs=norm_topk_probs,
+        concat_layout=concat_layout,
+        ep_config=ep_cfg,
     )
 
     local_kwargs = dict(
-        K=K, activation=activation, is_softmax_over_topk=is_softmax_over_topk,
-        norm_topk_probs=norm_topk_probs, concat_layout=concat_layout,
+        K=K,
+        activation=activation,
+        is_softmax_over_topk=is_softmax_over_topk,
+        norm_topk_probs=norm_topk_probs,
+        concat_layout=concat_layout,
     )
 
     w1_local_fmt = w1_full.permute(1, 2, 0)
     w2_local_fmt = w2_full.permute(1, 2, 0)
-
 
     if not args.skip_test:
         x_t = x.clone().detach().requires_grad_(True)
@@ -572,8 +639,15 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         b2_t = b2.clone().detach().requires_grad_(True) if add_bias else None
 
         o_local = moe_ep_TC_softmax_topk_forward(
-            x_t, router_w_t, w1_t, b1_t, w2_t, b2_t, is_inference_mode_enabled=False,
-            redispatch_x_in_backward=redispatch_x_in_backward, CPU_sync_on_runtime=CPU_sync_on_runtime,
+            x_t,
+            router_w_t,
+            w1_t,
+            b1_t,
+            w2_t,
+            b2_t,
+            is_inference_mode_enabled=False,
+            redispatch_x_in_backward=redispatch_x_in_backward,
+            CPU_sync_on_runtime=CPU_sync_on_runtime,
             **fwd_kwargs,
         )
 
@@ -738,14 +812,27 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     time.sleep(0.5)
 
     moe_ep_TC_softmax_topk_forward(
-        x, router_w, w1, b1, w2, b2, is_inference_mode_enabled=True, **fwd_kwargs,
+        x,
+        router_w,
+        w1,
+        b1,
+        w2,
+        b2,
+        is_inference_mode_enabled=True,
+        **fwd_kwargs,
     )
     moe_ep_TC_softmax_topk_forward(
-        x, router_w, w1, b1, w2, b2, is_inference_mode_enabled=False, **fwd_kwargs,
+        x,
+        router_w,
+        w1,
+        b1,
+        w2,
+        b2,
+        is_inference_mode_enabled=False,
+        **fwd_kwargs,
     )
     torch.cuda.synchronize()
     dist.barrier()
-
 
     saved_info: list = []
 
@@ -772,8 +859,15 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
 
     with torch.autograd.graph.saved_tensors_hooks(_pack_hook, _unpack_hook):
         _o_audit = moe_ep_TC_softmax_topk_forward(
-            x_audit, router_w_audit, w1_audit, b1_audit, w2_audit, b2_audit, is_inference_mode_enabled=False,
-            redispatch_x_in_backward=redispatch_x_in_backward, CPU_sync_on_runtime=CPU_sync_on_runtime,
+            x_audit,
+            router_w_audit,
+            w1_audit,
+            b1_audit,
+            w2_audit,
+            b2_audit,
+            is_inference_mode_enabled=False,
+            redispatch_x_in_backward=redispatch_x_in_backward,
+            CPU_sync_on_runtime=CPU_sync_on_runtime,
             **fwd_kwargs,
         )
 
@@ -819,8 +913,15 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
 
     def ep_fwd_inference():
         return moe_ep_TC_softmax_topk_forward(
-            x, router_w, w1, b1, w2, b2, is_inference_mode_enabled=True,
-            redispatch_x_in_backward=redispatch_x_in_backward, CPU_sync_on_runtime=CPU_sync_on_runtime,
+            x,
+            router_w,
+            w1,
+            b1,
+            w2,
+            b2,
+            is_inference_mode_enabled=True,
+            redispatch_x_in_backward=redispatch_x_in_backward,
+            CPU_sync_on_runtime=CPU_sync_on_runtime,
             **fwd_kwargs,
         )
 
@@ -840,8 +941,15 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
 
     def ep_fwd_training():
         return moe_ep_TC_softmax_topk_forward(
-            x, router_w, w1, b1, w2, b2, is_inference_mode_enabled=False,
-            redispatch_x_in_backward=redispatch_x_in_backward, CPU_sync_on_runtime=CPU_sync_on_runtime,
+            x,
+            router_w,
+            w1,
+            b1,
+            w2,
+            b2,
+            is_inference_mode_enabled=False,
+            redispatch_x_in_backward=redispatch_x_in_backward,
+            CPU_sync_on_runtime=CPU_sync_on_runtime,
             **fwd_kwargs,
         )
 
@@ -880,20 +988,25 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         dout_bench_local = dout_bench_global[rank * T_local : (rank + 1) * T_local].contiguous()
 
         ep_fwdbwd_ms = _bench_ep_fwd_bwd(
-            x_g, router_w_g, w1_g, b1_g, w2_g, b2_g, grad_inputs_bench, dout_bench_local, fwd_kwargs,
-            redispatch_x_in_backward, CPU_sync_on_runtime, warmup=warmup, repeats=repeats,
+            x_g,
+            router_w_g,
+            w1_g,
+            b1_g,
+            w2_g,
+            b2_g,
+            grad_inputs_bench,
+            dout_bench_local,
+            fwd_kwargs,
+            redispatch_x_in_backward,
+            CPU_sync_on_runtime,
+            warmup=warmup,
+            repeats=repeats,
         )
         ep_bwd_ms = ep_fwdbwd_ms - ep_fwd_train_ms
 
         if rank == 0:
-            fwdbwd_tflops = fwdbwd_flops_global / (ep_fwdbwd_ms * 1e9)
-            fwdbwd_local_tflops = fwdbwd_flops_local / (ep_fwdbwd_ms * 1e9)
             bwd_tflops = bwd_flops_global / (ep_bwd_ms * 1e9) if ep_bwd_ms > 0 else 0.0
             bwd_local_tflops = bwd_flops_local / (ep_bwd_ms * 1e9) if ep_bwd_ms > 0 else 0.0
-            print0(
-                f" EP Fwd+Bwd              Average time: {ep_fwdbwd_ms:<8.2f} ms, "
-                f"Per-rank TFLOPS: {fwdbwd_local_tflops:<5.0f}, Net EP TFLOPS: {fwdbwd_tflops:<5.0f}"
-            )
             print0(
                 f" EP Bwd (derived)        Average time: {ep_bwd_ms:<8.2f} ms, "
                 f"Per-rank TFLOPS: {bwd_local_tflops:<5.0f}, Net EP TFLOPS: {bwd_tflops:<5.0f}"
@@ -904,9 +1017,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         torch.cuda.empty_cache()
 
     if rank == 0:
-        print0(
-            f"\n[bold]── Per-rank baselines (T={T_local}, E={E}, K={K}, single-GPU with T_local tokens) ──[/bold]"
-        )
+        print0(f"\n[bold]── Per-rank baselines (T={T_local}, E={E}, K={K}, single-GPU with T_local tokens) ──[/bold]")
 
     w1_full_baseline = w1_full.clone()
     w2_full_baseline = w2_full.clone()
@@ -924,8 +1035,16 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     dist.barrier()
 
     local_fwd_train_Tl_ms = _bench_local_fwd(
-        x_local_nograd, router_w_baseline, w1_local_fmt_baseline, b1_full_baseline, w2_local_fmt_baseline,
-        b2_full_baseline, is_inference=False, warmup=warmup, repeats=repeats, **local_kwargs,
+        x_local_nograd,
+        router_w_baseline,
+        w1_local_fmt_baseline,
+        b1_full_baseline,
+        w2_local_fmt_baseline,
+        b2_full_baseline,
+        is_inference=False,
+        warmup=warmup,
+        repeats=repeats,
+        **local_kwargs,
     )
     if rank == 0:
         tflops = fwd_flops_local / (local_fwd_train_Tl_ms * 1e9)
@@ -940,8 +1059,16 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         dist.barrier()
 
         local_fwdbwd_Tl_ms = _bench_local_fwd_bwd(
-            x_local_grad, router_w_baseline, w1_full_baseline, b1_full_baseline, w2_full_baseline,
-            b2_full_baseline, w1_local_fmt_baseline, w2_local_fmt_baseline, warmup=warmup, repeats=repeats,
+            x_local_grad,
+            router_w_baseline,
+            w1_full_baseline,
+            b1_full_baseline,
+            w2_full_baseline,
+            b2_full_baseline,
+            w1_local_fmt_baseline,
+            w2_local_fmt_baseline,
+            warmup=warmup,
+            repeats=repeats,
             **local_kwargs,
         )
         local_bwd_Tl_ms = local_fwdbwd_Tl_ms - local_fwd_train_Tl_ms
@@ -978,8 +1105,15 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         dist.barrier()
 
         local_fwd_train_Tl_Elocal_ms = _bench_local_fwd(
-            x_E_local_nograd, router_w_E_local_baseline, w1_E_local_baseline, b1_E_local_baseline,
-            w2_E_local_baseline, b2_E_local_baseline, is_inference=False, warmup=warmup, repeats=repeats,
+            x_E_local_nograd,
+            router_w_E_local_baseline,
+            w1_E_local_baseline,
+            b1_E_local_baseline,
+            w2_E_local_baseline,
+            b2_E_local_baseline,
+            is_inference=False,
+            warmup=warmup,
+            repeats=repeats,
             **local_kwargs,
         )
         if rank == 0:
@@ -994,8 +1128,16 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             dist.barrier()
 
             local_fwdbwd_Tl_E_local_ms = _bench_local_fwd_bwd(
-                x_E_local_grad, router_w_E_local_baseline, w1_E_local_src, b1_E_local_baseline, w2_E_local_src,
-                b2_E_local_baseline, w1_E_local_baseline, w2_E_local_baseline, warmup=warmup, repeats=repeats,
+                x_E_local_grad,
+                router_w_E_local_baseline,
+                w1_E_local_src,
+                b1_E_local_baseline,
+                w2_E_local_src,
+                b2_E_local_baseline,
+                w1_E_local_baseline,
+                w2_E_local_baseline,
+                warmup=warmup,
+                repeats=repeats,
                 **local_kwargs,
             )
             local_bwd_Tl_E_local_ms = local_fwdbwd_Tl_E_local_ms - local_fwd_train_Tl_Elocal_ms
@@ -1019,8 +1161,16 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         dist.barrier()
 
         local_fwd_train_T_ms = _bench_local_fwd(
-            x_full_nograd, router_w, w1_local_fmt, b1_full, w2_local_fmt, b2_full, is_inference=False,
-            warmup=warmup, repeats=repeats, **local_kwargs,
+            x_full_nograd,
+            router_w,
+            w1_local_fmt,
+            b1_full,
+            w2_local_fmt,
+            b2_full,
+            is_inference=False,
+            warmup=warmup,
+            repeats=repeats,
+            **local_kwargs,
         )
         if rank == 0:
             tflops = fwd_flops_global / (local_fwd_train_T_ms * 1e9)
@@ -1034,8 +1184,17 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             dist.barrier()
 
             local_fwdbwd_T_ms = _bench_local_fwd_bwd(
-                x_full_grad, router_w, w1_full, b1_full, w2_full, b2_full, w1_local_fmt, w2_local_fmt,
-                warmup=warmup, repeats=repeats, **local_kwargs,
+                x_full_grad,
+                router_w,
+                w1_full,
+                b1_full,
+                w2_full,
+                b2_full,
+                w1_local_fmt,
+                w2_local_fmt,
+                warmup=warmup,
+                repeats=repeats,
+                **local_kwargs,
             )
             local_bwd_T_ms = local_fwdbwd_T_ms - local_fwd_train_T_ms
             if rank == 0:
@@ -1043,7 +1202,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
                 print0(
                     f" {f'Per-rank Bwd (T={T}, E={E}, K={K})':<48} Average time: {local_bwd_T_ms:<8.2f} ms, TFLOPS: {bwd_tflops:<5.0f}"
                 )
-
 
     if rank == 0:
         print0("\n[bold]══ Exposed network latency (EP vs. local T_local) ══[/bold]")

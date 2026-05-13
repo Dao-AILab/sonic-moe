@@ -244,7 +244,11 @@ def reduce_scatter_triton(x_symm, group, out=None, hdl=None, peer_bufs=None, my_
     numel_per_rank = out.numel()
     grid = lambda META: (triton.cdiv(numel_per_rank, META["BLOCK_SIZE"]),)
     _reduce_scatter_kernel[grid](
-        peer_bufs, out, numel_per_rank=numel_per_rank, my_rank=my_rank, world_size=W,
+        peer_bufs,
+        out,
+        numel_per_rank=numel_per_rank,
+        my_rank=my_rank,
+        world_size=W,
     )
     return out
 
@@ -280,7 +284,10 @@ def all_gather_triton(x_symm, group, out=None, hdl=None, peer_bufs=None):
         )
     grid = lambda META: (W, triton.cdiv(numel, META["BLOCK_SIZE"]))
     _all_gather_kernel[grid](
-        peer_bufs, out, numel_per_rank=numel, world_size=W,
+        peer_bufs,
+        out,
+        numel_per_rank=numel,
+        world_size=W,
     )
     return out
 

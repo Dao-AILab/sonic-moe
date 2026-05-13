@@ -49,12 +49,14 @@ from ..distributed_utils import (
     RuntimeEPConfig,
     SymmMemManager,
     _EPWorkspace,
+    _get_or_create_ep_manager,
     _is_a2a_combine_mode,
     _is_a2a_dispatch_mode,
     _is_ag_dispatch_mode,
     _is_rank_dedup_combine_mode,
     _is_rank_dedup_dispatch_mode,
     _is_rs_combine_mode,
+    clear_ep_cache,
 )
 from ..enums import ActivationType, is_glu
 from . import TC_Softmax_Topk_Router_Function
@@ -80,6 +82,7 @@ __all__ = [
     "NetworkProfiler",
     "RuntimeEPConfig",
     "SymmMemManager",
+    "clear_ep_cache",
     "moe_ep_TC_softmax_topk_forward",
     "moe_ep_general_routing_forward",
 ]
@@ -89,7 +92,7 @@ class EP_Router_Replicated_Across_Ranks(torch.autograd.Function):
     """``F.linear(x, router_w)`` with EP-aware drouter_w all-reduce.
 
     In EP, each rank holds ``T_local = T / W`` tokens of the global
-    batch and every rank has a replica of ``router_w``. 
+    batch and every rank has a replica of ``router_w``.
     """
 
     @staticmethod
@@ -134,15 +137,27 @@ def _do_dispatch(
         return all_gather_triton(src_symm, group, out=out_buf, peer_bufs=src_peer_bufs)
     elif _is_rank_dedup_dispatch_mode(mode):
         rank_dedup_dispatch_triton(
-            x_symm=src_symm, dst_rank_flat=dst_rank_flat, pair_present_mask=pair_present_mask,
-            rank_dedup_recv_pos=rank_dedup_recv_pos, recv_packed=out_buf, K=K, group=group,
-            peer_bufs=src_peer_bufs, my_rank=my_rank,
+            x_symm=src_symm,
+            dst_rank_flat=dst_rank_flat,
+            pair_present_mask=pair_present_mask,
+            rank_dedup_recv_pos=rank_dedup_recv_pos,
+            recv_packed=out_buf,
+            K=K,
+            group=group,
+            peer_bufs=src_peer_bufs,
+            my_rank=my_rank,
         )
         return out_buf.view(-1, H)
     elif _is_a2a_dispatch_mode(mode):
         a2a_dispatch_triton(
-            x_symm=src_symm, dst_rank_flat=dst_rank_flat, recv_pos=recv_pos, recv=out_buf, K=K, group=group,
-            peer_bufs=src_peer_bufs, my_rank=my_rank,
+            x_symm=src_symm,
+            dst_rank_flat=dst_rank_flat,
+            recv_pos=recv_pos,
+            recv=out_buf,
+            K=K,
+            group=group,
+            peer_bufs=src_peer_bufs,
+            my_rank=my_rank,
         )
         # out_buf may be (W, TK_local, H) symm-mem or flat
         # (rows, H); collapse to (rows, H) regardless.
@@ -182,33 +197,59 @@ def _do_combine(
     T_local: int,
     H: int,
     out_dtype: torch.dtype,
-    agg_mode: CombineMode,
+    combine_mode: CombineMode,
     # RANK_DEDUP_COMBINE_TRITON-only:
     peer_present_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     out = torch.empty(T_local, H, dtype=out_dtype, device=ep_ws.y_symm.device)
-    if _is_a2a_combine_mode(agg_mode):
+    if _is_a2a_combine_mode(combine_mode):
         ep_ws.o_hdl.barrier()
         a2a_combine_triton(
-            ep_ws.y_symm, ep_ws.s_rev_symm, my_dst_rank, topk_scores_local, out, K=K, group=ep_ws.ep_group,
-            y_peer_bufs=ep_ws.y_peer_bufs, s_peer_bufs=ep_ws.s_rev_peer_bufs, my_rank=ep_ws.my_rank,
+            ep_ws.y_symm,
+            ep_ws.s_rev_symm,
+            my_dst_rank,
+            topk_scores_local,
+            out,
+            K=K,
+            group=ep_ws.ep_group,
+            y_peer_bufs=ep_ws.y_peer_bufs,
+            s_peer_bufs=ep_ws.s_rev_peer_bufs,
+            my_rank=ep_ws.my_rank,
         )
         return out
-    elif _is_rank_dedup_combine_mode(agg_mode):
+    elif _is_rank_dedup_combine_mode(combine_mode):
         ep_ws._ensure_partial_combine_buf()
         rank_dedup_combine_triton(
-            ep_ws.y_symm, ep_ws.s_rev_symm, dst_rank_flat, scores_global, peer_present_mask,
-            ep_ws.partial_combine_buf, out, K=K, T_local=T_local, group=ep_ws.ep_group,
+            ep_ws.y_symm,
+            ep_ws.s_rev_symm,
+            dst_rank_flat,
+            scores_global,
+            peer_present_mask,
+            ep_ws.partial_combine_buf,
+            out,
+            K=K,
+            T_local=T_local,
+            group=ep_ws.ep_group,
             partial_combine_hdl=ep_ws.partial_combine_hdl,
-            partial_combine_peer_bufs=ep_ws.partial_combine_peer_bufs, my_rank=ep_ws.my_rank,
+            partial_combine_peer_bufs=ep_ws.partial_combine_peer_bufs,
+            my_rank=ep_ws.my_rank,
         )
         return out
-    elif _is_rs_combine_mode(agg_mode):
+    elif _is_rs_combine_mode(combine_mode):
         ep_ws._ensure_partial_combine_buf()
         rs_combine_triton(
-            ep_ws.y_symm, ep_ws.s_rev_symm, dst_rank_flat, scores_global, ep_ws.partial_combine_buf, out, K,
-            T_local, group=ep_ws.ep_group, partial_combine_hdl=ep_ws.partial_combine_hdl,
-            partial_combine_peer_bufs=ep_ws.partial_combine_peer_bufs, my_rank=ep_ws.my_rank,
+            ep_ws.y_symm,
+            ep_ws.s_rev_symm,
+            dst_rank_flat,
+            scores_global,
+            ep_ws.partial_combine_buf,
+            out,
+            K,
+            T_local,
+            group=ep_ws.ep_group,
+            partial_combine_hdl=ep_ws.partial_combine_hdl,
+            partial_combine_peer_bufs=ep_ws.partial_combine_peer_bufs,
+            my_rank=ep_ws.my_rank,
         )
         return out
     else:
@@ -264,7 +305,7 @@ class _MoeEPFunction(torch.autograd.Function):
         is_glu_act = cfg.is_glu_act
         E_local = cfg.E_local
         MAX_ROWS_PER_RANK_STATIC = cfg.MAX_ROWS_PER_RANK_STATIC
-        mode = cfg.mode
+        mode = cfg.dispatch_mode
         K = cfg.K
         T_local = ep_ws.T_local
 
@@ -290,7 +331,7 @@ class _MoeEPFunction(torch.autograd.Function):
         # down-proj y_symm slice). Under ``CPU_sync_on_runtime`` it's
         # the synced populated count from
         # ``expert_frequency_offset[E_local]`` (one D2H ``.item()``);
-        # otherwise the structural ceiling. 
+        # otherwise the structural ceiling.
         max_rows_per_rank_runtime = MAX_ROWS_PER_RANK_STATIC
         if CPU_sync_on_runtime:
             max_rows_per_rank_runtime = expert_frequency_offset[E_local].item()
@@ -301,7 +342,7 @@ class _MoeEPFunction(torch.autograd.Function):
         if is_inference_mode_enabled or redispatch_x_in_backward:
             # x_compute isn't saved-for-backward on these paths
             # (inference saves nothing; redispatch saves x_local), so
-            # reuse the workspace recv buffer where available. 
+            # reuse the workspace recv buffer where available.
             if _is_ag_dispatch_mode(mode):
                 ws_buf = ep_ws.ag_compute
             elif _is_a2a_dispatch_mode(mode):
@@ -309,9 +350,18 @@ class _MoeEPFunction(torch.autograd.Function):
             else:
                 ws_buf = torch.empty(ep_ws.world_size * T_local, H, dtype=x_dtype, device=device)
             x_compute = _do_dispatch(
-                ep_ws.x_symm, ws_buf, mode, dst_rank_flat=dst_rank_flat, recv_pos=recv_pos, K=K,
-                group=ep_ws.ep_group, H=H, src_peer_bufs=ep_ws.x_peer_bufs, my_rank=ep_ws.my_rank,
-                pair_present_mask=pair_present_mask, rank_dedup_recv_pos=rank_dedup_recv_pos,
+                ep_ws.x_symm,
+                ws_buf,
+                mode,
+                dst_rank_flat=dst_rank_flat,
+                recv_pos=recv_pos,
+                K=K,
+                group=ep_ws.ep_group,
+                H=H,
+                src_peer_bufs=ep_ws.x_peer_bufs,
+                my_rank=ep_ws.my_rank,
+                pair_present_mask=pair_present_mask,
+                rank_dedup_recv_pos=rank_dedup_recv_pos,
             )
             # A2A's recv is consumed by gemm_gated WITHOUT an A_idx,
             # so the kernel reads ``total_m = A.shape[0]`` directly —
@@ -343,9 +393,18 @@ class _MoeEPFunction(torch.autograd.Function):
             else:
                 fresh = torch.empty(max_rows_per_rank_runtime, H, dtype=x_dtype, device=device)
             x_compute = _do_dispatch(
-                ep_ws.x_symm, fresh, mode, dst_rank_flat=dst_rank_flat, recv_pos=recv_pos, K=K,
-                group=ep_ws.ep_group, H=H, src_peer_bufs=ep_ws.x_peer_bufs, my_rank=ep_ws.my_rank,
-                pair_present_mask=pair_present_mask, rank_dedup_recv_pos=rank_dedup_recv_pos,
+                ep_ws.x_symm,
+                fresh,
+                mode,
+                dst_rank_flat=dst_rank_flat,
+                recv_pos=recv_pos,
+                K=K,
+                group=ep_ws.ep_group,
+                H=H,
+                src_peer_bufs=ep_ws.x_peer_bufs,
+                my_rank=ep_ws.my_rank,
+                pair_present_mask=pair_present_mask,
+                rank_dedup_recv_pos=rank_dedup_recv_pos,
             )
 
         # ====================================================================
@@ -389,7 +448,7 @@ class _MoeEPFunction(torch.autograd.Function):
         # ====================================================================
         # ep_ws.y_symm is (MAX_ROWS_PER_RANK_STATIC, H) symm-mem; the
         # kernel writes [0, offset[E_local]) ≤ MAX_ROWS_PER_RANK_STATIC
-        # and peers gather from those positions via s_rev_symm. 
+        # and peers gather from those positions via s_rev_symm.
         gemm(
             a,
             w2,
@@ -403,13 +462,21 @@ class _MoeEPFunction(torch.autograd.Function):
         # ====================================================================
         # 4. NVLink combine → o_local
         # ====================================================================
-        # Mode-dispatched by ``_do_combine``; barrier placement is internal to each branch there. 
+        # Mode-dispatched by ``_do_combine``; barrier placement is internal to each branch there.
         scores_global: Optional[torch.Tensor] = None
-        if cfg.agg_mode in (CombineMode.RS_COMBINE_TRITON, CombineMode.RANK_DEDUP_COMBINE_TRITON):
+        if cfg.combine_mode in (CombineMode.RS_COMBINE_TRITON, CombineMode.RANK_DEDUP_COMBINE_TRITON):
             scores_global = _all_gather_topk_scores(topk_scores_local, ep_ws.ep_group, ep_ws.world_size, T_local, K)
         o_local = _do_combine(
-            ep_ws, my_dst_rank=my_dst_rank, dst_rank_flat=dst_rank_flat, topk_scores_local=topk_scores_local,
-            scores_global=scores_global, K=K, T_local=T_local, H=H, out_dtype=x_dtype, agg_mode=cfg.agg_mode,
+            ep_ws,
+            my_dst_rank=my_dst_rank,
+            dst_rank_flat=dst_rank_flat,
+            topk_scores_local=topk_scores_local,
+            scores_global=scores_global,
+            K=K,
+            T_local=T_local,
+            H=H,
+            out_dtype=x_dtype,
+            combine_mode=cfg.combine_mode,
             peer_present_mask=peer_present_mask,
         )
 
@@ -419,7 +486,7 @@ class _MoeEPFunction(torch.autograd.Function):
         if not is_inference_mode_enabled:
             # h, a are alloc'd fresh at the runtime row count (step 2);
             # cache-path x_compute is alloc'd fresh in step 1; redispatch
-            # path saves x_local instead. 
+            # path saves x_local instead.
             ctx.save_for_backward(
                 x_local if redispatch_x_in_backward else x_compute,
                 w1,
@@ -451,7 +518,13 @@ class _MoeEPFunction(torch.autograd.Function):
     def backward(ctx, dout_local: torch.Tensor):
         # 14 forward inputs → 14 grads (only the first 6 are tensor inputs).
         (
-            x_local_or_compute, w1, b1, w2, b2, h, topk_scores_local,
+            x_local_or_compute,
+            w1,
+            b1,
+            w2,
+            b2,
+            h,
+            topk_scores_local,
         ) = ctx.saved_tensors
         cfg: RuntimeEPConfig = ctx.cfg
         meta = ctx.meta
@@ -503,23 +576,35 @@ class _MoeEPFunction(torch.autograd.Function):
         else:
             do_recv_buf = ep_ws.a2a_recv
         dout_dispatched = _do_dispatch(
-            do_buf, do_recv_buf, mode, dst_rank_flat=dst_rank_flat, recv_pos=recv_pos, K=K,
-            group=ep_ws.ep_group, H=H, src_peer_bufs=do_peer_bufs, my_rank=ep_ws.my_rank,
-            pair_present_mask=pair_present_mask, rank_dedup_recv_pos=rank_dedup_recv_pos,
+            do_buf,
+            do_recv_buf,
+            mode,
+            dst_rank_flat=dst_rank_flat,
+            recv_pos=recv_pos,
+            K=K,
+            group=ep_ws.ep_group,
+            H=H,
+            src_peer_bufs=do_peer_bufs,
+            my_rank=ep_ws.my_rank,
+            pair_present_mask=pair_present_mask,
+            rank_dedup_recv_pos=rank_dedup_recv_pos,
         )
 
         # ====================================================================
         # 2. Recover x_compute at the shape dW1 will consume
         # ====================================================================
         # Two mutually-exclusive paths, joined right before dW1:
-        #   (a) redispatch=True: AG-CE all-gather of saved x_local on a Copy-Engine stream 
+        #   (a) redispatch=True: AG-CE all-gather of saved x_local on a Copy-Engine stream
         #   (b) cache otherwise: saved x_compute is already dW1-ready
         # Started here (right after do dispatch) so (a) overlaps with the rest of the backward.
         ce_handle = None
         if redispatch:
             x_local = x_local_or_compute  # (T_local, H)
             ce_handle = all_gather_copy_engine_async(
-                x_local, peer_bufs=ep_ws.x_peer_bufs, my_rank=ep_ws.my_rank, out=ep_ws._ag_redispatch_buf,
+                x_local,
+                peer_bufs=ep_ws.x_peer_bufs,
+                my_rank=ep_ws.my_rank,
+                out=ep_ws._ag_redispatch_buf,
             )
             x_compute = ce_handle.out
         else:
@@ -620,7 +705,10 @@ class _MoeEPFunction(torch.autograd.Function):
         # ====================================================================
         ds_local = torch.empty(T_local * K, dtype=ds.dtype, device=ds.device)
         dist.reduce_scatter_tensor(
-            ds_local, ds, op=dist.ReduceOp.SUM, group=ep_ws.ep_group,
+            ds_local,
+            ds,
+            op=dist.ReduceOp.SUM,
+            group=ep_ws.ep_group,
         )
         ds_local = ds_local.view(T_local, K)
 
@@ -643,8 +731,16 @@ class _MoeEPFunction(torch.autograd.Function):
         # 8. Cross-rank combine of dx_expanded → dx_local
         # ====================================================================
         dx_local = _do_combine(
-            ep_ws, my_dst_rank=my_dst_rank, dst_rank_flat=dst_rank_flat, topk_scores_local=None,
-            scores_global=None, K=K, T_local=T_local, H=H, out_dtype=dtype, agg_mode=cfg.agg_mode,
+            ep_ws,
+            my_dst_rank=my_dst_rank,
+            dst_rank_flat=dst_rank_flat,
+            topk_scores_local=None,
+            scores_global=None,
+            K=K,
+            T_local=T_local,
+            H=H,
+            out_dtype=dtype,
+            combine_mode=cfg.combine_mode,
             peer_present_mask=peer_present_mask,
         )
 
@@ -728,7 +824,7 @@ def _build_consumer_metadata(
         x_gather_idx,
         s_scatter_idx,
         s_reverse_local,
-        None, # num_activated_expert_per_token_offset
+        None,  # num_activated_expert_per_token_offset
     )
 
     expert_frequency_offset = expert_frequency_offset[: E_local + 1]
@@ -755,7 +851,7 @@ def _moe_ep_forward_inner(
     concat_layout: bool,
     redispatch_x_in_backward: bool,
     CPU_sync_on_runtime: bool,
-    agg_mode: CombineMode = CombineMode.A2A_TRITON,
+    combine_mode: CombineMode = CombineMode.A2A_TRITON,
 ) -> torch.Tensor:
     W, my_rank = ep_ws.world_size, ep_ws.my_rank
     T_local, d, K, E_local = ep_ws.T_local, ep_ws.d, ep_ws.K, ep_ws.E_local
@@ -775,7 +871,10 @@ def _moe_ep_forward_inner(
         token_indices = a2a_token_indices
 
     metadata = _build_consumer_metadata(
-        expert_indices=expert_local_padded, token_indices=token_indices, TK=TK_global, E_local=E_local,
+        expert_indices=expert_local_padded,
+        token_indices=token_indices,
+        TK=TK_global,
+        E_local=E_local,
         s_reverse_idx_symm=ep_ws.s_rev_symm,
     )
 
@@ -817,10 +916,10 @@ def _moe_ep_forward_inner(
     _E_local = w1.shape[2]
     _W = ep_ws.world_size
     cfg = RuntimeEPConfig(
-        mode=ep_ws.mode,
+        dispatch_mode=ep_ws.mode,
         W=_W,
         K=K,
-        agg_mode=agg_mode if agg_mode is not None else CombineMode.A2A_TRITON,
+        combine_mode=combine_mode if combine_mode is not None else CombineMode.A2A_TRITON,
         I=_I,
         is_glu_act=_is_glu_act,
         E_local=_E_local,
@@ -828,9 +927,9 @@ def _moe_ep_forward_inner(
     )
 
     # peer_present_mask is only consumed by the rank-dedup combine
-    # gather kernel; pass None for the other agg modes to keep the
+    # gather kernel; pass None for the other combine modes to keep the
     # bundle small.
-    needs_dedup_combine = _is_rank_dedup_combine_mode(agg_mode)
+    needs_dedup_combine = _is_rank_dedup_combine_mode(combine_mode)
     peer_present_mask = meta.get("peer_present_mask") if needs_dedup_combine else None
 
     # RANK_DEDUP_DISPATCH_TRITON: build the up-proj A_idx that gathers expert-grouped rows from the packed dispatch buffer.
@@ -860,32 +959,65 @@ def _moe_ep_forward_inner(
         "peer_present_mask": peer_present_mask,
     }
     return _MoeEPFunction.apply(
-        x_local, w1, b1, w2, b2, topk_scores_local, cfg, meta_bundle, activation_type,
-        is_inference_mode_enabled, concat_layout, redispatch_x_in_backward, CPU_sync_on_runtime, ep_ws,
+        x_local,
+        w1,
+        b1,
+        w2,
+        b2,
+        topk_scores_local,
+        cfg,
+        meta_bundle,
+        activation_type,
+        is_inference_mode_enabled,
+        concat_layout,
+        redispatch_x_in_backward,
+        CPU_sync_on_runtime,
+        ep_ws,
     )
 
 
-def _validate_and_resolve(
-    mgr: "SymmMemManager",
-    mode,
-    E: int,
-) -> Tuple[int, int, DispatchMode]:
-    W = mgr.world_size
-    if isinstance(mode, DispatchMode):
-        resolved = mode
-    elif isinstance(mode, str):
-        resolved = DispatchMode(mode.upper())
-    else:
-        raise TypeError(f"mode must be a DispatchMode or str; got {type(mode).__name__}")
-    if E % W != 0:
-        raise ValueError(f"E ({E}) must be divisible by EP world size ({W}).")
-    return W, E // W, resolved
+def _default_ep_config(W: int, K: int) -> RuntimeEPConfig:
+    """Pick a (dispatch, combine) pair without profiling.
+
+    Heuristic (checked in order):
+      * ``W <= 2`` or ``W <= 0.8 * K`` → **AG dispatch + RS combine**.
+        Very small world size, or K large enough relative to W that AG's
+        K-independent ``W·T_local·d`` traffic beats A2A's K-fanout.
+      * ``K >= 1.25 * W`` → **A2A dispatch + A2A combine**.
+        Algebraically equivalent to ``W <= 0.8*K``, so the AG/RS branch
+        already swallows this region; the branch is kept for parity with
+        the documented rule.
+      * otherwise → **rank-dedup dispatch + rank-dedup combine**.
+
+    Override by passing ``ep_config=`` from :meth:`NetworkProfiler.profile`
+    or by constructing a :class:`RuntimeEPConfig` directly.
+    """
+    if W <= 2 or W <= 0.8 * K:
+        return RuntimeEPConfig(
+            dispatch_mode=DispatchMode.AG_TRITON,
+            W=W,
+            K=K,
+            combine_mode=CombineMode.RS_COMBINE_TRITON,
+        )
+    if K >= 1.25 * W:
+        return RuntimeEPConfig(
+            dispatch_mode=DispatchMode.A2A_TRITON,
+            W=W,
+            K=K,
+            combine_mode=CombineMode.A2A_TRITON,
+        )
+    return RuntimeEPConfig(
+        dispatch_mode=DispatchMode.RANK_DEDUP_DISPATCH_TRITON,
+        W=W,
+        K=K,
+        combine_mode=CombineMode.RANK_DEDUP_COMBINE_TRITON,
+    )
 
 
 def _validate_runtime_ep_config(cfg: RuntimeEPConfig, W: int, K: int) -> None:
     if cfg.W != W:
         raise ValueError(
-            f"ep_config.W={cfg.W} does not match mgr.world_size={W}; "
+            f"ep_config.W={cfg.W} does not match the current EP world size ({W}); "
             "rebuild the RuntimeEPConfig with NetworkProfiler on the "
             "current process group."
         )
@@ -913,14 +1045,13 @@ def moe_ep_TC_softmax_topk_forward(
     b2: Optional[torch.Tensor],
     K: int,
     E: int,
-    mgr: SymmMemManager,
     *,
+    group: Optional[dist.ProcessGroup] = None,
     activation_type: ActivationType = ActivationType.SWIGLU,
     is_inference_mode_enabled: bool = False,
     is_softmax_over_topk: bool = True,
     norm_topk_probs: bool = False,
     concat_layout: bool = False,
-    mode: str = "auto",
     ep_config: Optional[RuntimeEPConfig] = None,
     redispatch_x_in_backward: bool = False,
     CPU_sync_on_runtime: bool = False,
@@ -931,24 +1062,31 @@ def moe_ep_TC_softmax_topk_forward(
     automatically all-reduces ``drouter_w`` across the EP group — each
     rank's ``router_w`` accumulates the global-batch gradient.
 
-    ``ep_config`` carries a runtime dispatch decision produced by
-    :class:`NetworkProfiler`. When ``None`` (default), the ``mode``
-    argument is converted to a :class:`DispatchMode` directly (string
-    values must match an enum member exactly, e.g. ``"AG_TRITON"``).
-    When given, ``ep_config.mode`` overrides the ``mode`` argument, and
-    ``ep_config.W`` / ``ep_config.K`` are validated against the
-    actual workload.
+    The symm-mem workspace is cached per ``(group, x.device)`` inside
+    the module — see :func:`clear_ep_cache` for explicit cleanup. Pass
+    ``group=`` to target an EP group other than ``dist.group.WORLD``.
+
+    ``ep_config`` selects the dispatch + combine primitives. When
+    ``None`` (default), one is built via :func:`_default_ep_config` from
+    the EP world size and ``K`` (see that function for the heuristic).
+    Pass the result of :meth:`NetworkProfiler.profile` for a profiled
+    decision, or a hand-built :class:`RuntimeEPConfig` to force a
+    specific pair.
     """
-    agg_mode = CombineMode.A2A_TRITON
-    if ep_config is not None:
-        _validate_runtime_ep_config(ep_config, mgr.world_size, K)
-        mode = ep_config.mode
-        agg_mode = ep_config.agg_mode
-    W, E_local, mode = _validate_and_resolve(mgr, mode, E)
+    mgr = _get_or_create_ep_manager(group, x.device)
+    W = mgr.world_size
+    if E % W != 0:
+        raise ValueError(f"E ({E}) must be divisible by EP world size ({W}).")
+    E_local = E // W
+    if ep_config is None:
+        ep_config = _default_ep_config(W, K)
+    _validate_runtime_ep_config(ep_config, W, K)
+    dispatch_mode = ep_config.dispatch_mode
+    combine_mode = ep_config.combine_mode
     activation_type = _normalize_activation(activation_type)
     T_local, d = x.shape
 
-    ws = mgr._get_or_alloc(T_local, d, K, E_local, x.dtype, mode)
+    ws = mgr._get_or_alloc(T_local, d, K, E_local, x.dtype, dispatch_mode)
 
     # Router projection with EP-aware drouter_w all-reduce.
     router_logits = EP_Router_Replicated_Across_Ranks.apply(x, router_w, ws.ep_group)
@@ -963,10 +1101,20 @@ def moe_ep_TC_softmax_topk_forward(
     ws.x_hdl.barrier()
 
     return _moe_ep_forward_inner(
-        x_local=x, topk_idx_global=topk_idx_g, topk_scores_local=topk_scores_l, w1=w1, b1=b1, w2=w2, b2=b2,
-        ep_ws=ws, activation_type=activation_type, is_inference_mode_enabled=is_inference_mode_enabled,
-        concat_layout=concat_layout, redispatch_x_in_backward=redispatch_x_in_backward,
-        CPU_sync_on_runtime=CPU_sync_on_runtime, agg_mode=agg_mode,
+        x_local=x,
+        topk_idx_global=topk_idx_g,
+        topk_scores_local=topk_scores_l,
+        w1=w1,
+        b1=b1,
+        w2=w2,
+        b2=b2,
+        ep_ws=ws,
+        activation_type=activation_type,
+        is_inference_mode_enabled=is_inference_mode_enabled,
+        concat_layout=concat_layout,
+        redispatch_x_in_backward=redispatch_x_in_backward,
+        CPU_sync_on_runtime=CPU_sync_on_runtime,
+        combine_mode=combine_mode,
     )
 
 
@@ -979,35 +1127,55 @@ def moe_ep_general_routing_forward(
     w2: torch.Tensor,
     b2: Optional[torch.Tensor],
     E: int,
-    mgr: SymmMemManager,
     *,
+    group: Optional[dist.ProcessGroup] = None,
     activation_type: ActivationType = ActivationType.SWIGLU,
     is_inference_mode_enabled: bool = False,
     concat_layout: bool = False,
-    mode: str = "auto",
     ep_config: Optional[RuntimeEPConfig] = None,
     redispatch_x_in_backward: bool = False,
     CPU_sync_on_runtime: bool = False,
 ) -> torch.Tensor:
+    """EP forward with caller-supplied top-K routing.
+
+    Same workspace/cache semantics as :func:`moe_ep_TC_softmax_topk_forward`.
+    When ``ep_config`` is ``None`` a default is built via
+    :func:`_default_ep_config` from the EP world size and the K inferred
+    from ``topk_indices.shape[1]``.
+    """
     K = topk_indices.shape[1]
-    agg_mode = CombineMode.A2A_TRITON
-    if ep_config is not None:
-        _validate_runtime_ep_config(ep_config, mgr.world_size, K)
-        mode = ep_config.mode
-        agg_mode = ep_config.agg_mode
-    W, E_local, mode = _validate_and_resolve(mgr, mode, E)
+    mgr = _get_or_create_ep_manager(group, x.device)
+    W = mgr.world_size
+    if E % W != 0:
+        raise ValueError(f"E ({E}) must be divisible by EP world size ({W}).")
+    E_local = E // W
+    if ep_config is None:
+        ep_config = _default_ep_config(W, K)
+    _validate_runtime_ep_config(ep_config, W, K)
+    dispatch_mode = ep_config.dispatch_mode
+    combine_mode = ep_config.combine_mode
     activation_type = _normalize_activation(activation_type)
     T_local, d = x.shape
 
-    ep_ws = mgr._get_or_alloc(T_local, d, K, E_local, x.dtype, mode)
+    ep_ws = mgr._get_or_alloc(T_local, d, K, E_local, x.dtype, dispatch_mode)
     ep_ws.x_symm.copy_(x)
 
     topk_idx_g = _ag_routing_decision(ep_ws, topk_indices.to(torch.int32))
     ep_ws.x_hdl.barrier()
 
     return _moe_ep_forward_inner(
-        x_local=x, topk_idx_global=topk_idx_g, topk_scores_local=topk_scores, w1=w1, b1=b1, w2=w2, b2=b2,
-        ep_ws=ep_ws, activation_type=activation_type, is_inference_mode_enabled=is_inference_mode_enabled,
-        concat_layout=concat_layout, redispatch_x_in_backward=redispatch_x_in_backward,
-        CPU_sync_on_runtime=CPU_sync_on_runtime, agg_mode=agg_mode,
+        x_local=x,
+        topk_idx_global=topk_idx_g,
+        topk_scores_local=topk_scores,
+        w1=w1,
+        b1=b1,
+        w2=w2,
+        b2=b2,
+        ep_ws=ep_ws,
+        activation_type=activation_type,
+        is_inference_mode_enabled=is_inference_mode_enabled,
+        concat_layout=concat_layout,
+        redispatch_x_in_backward=redispatch_x_in_backward,
+        CPU_sync_on_runtime=CPU_sync_on_runtime,
+        combine_mode=combine_mode,
     )

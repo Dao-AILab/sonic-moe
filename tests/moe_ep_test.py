@@ -32,7 +32,7 @@ import torch.nn.functional as F
 from sonicmoe import MoE
 from sonicmoe.distributed_utils import CombineMode, DispatchMode, RuntimeEPConfig  # type: ignore
 from sonicmoe.enums import ActivationType
-from sonicmoe.functional.ep import SymmMemManager, moe_ep_general_routing_forward, moe_ep_TC_softmax_topk_forward
+from sonicmoe.functional.ep import moe_ep_general_routing_forward, moe_ep_TC_softmax_topk_forward
 
 
 @dataclass
@@ -173,7 +173,6 @@ def _run_one_shape(
     atol: float,
     rtol: float,
     seed: int,
-    keep_alive: Optional[list] = None,
 ) -> ShapeStats:
     T, H, I, E, K = shape.T, shape.H, shape.I, shape.E, shape.K
     assert T % world_size == 0, f"T ({T}) must be divisible by world_size ({world_size})."
@@ -232,10 +231,6 @@ def _run_one_shape(
     dist.broadcast(x_global, src=0)
     x_local = x_global[rank * T_local : (rank + 1) * T_local].contiguous()
 
-    mgr = SymmMemManager(dist.group.WORLD, device)
-    if keep_alive is not None:
-        keep_alive.append(mgr)
-
     # Pre-broadcast a fixed routing decision used by general_routing_forward.
     if rank == 0:
         with torch.no_grad():
@@ -282,10 +277,14 @@ def _run_one_shape(
                 )
 
             # Mode sweep: all three dispatch primitives. The final
-            # iteration of the agg_mode loop below also exercises the
+            # iteration of the combine_mode loop below also exercises the
             # ep_config= path by wrapping a DispatchMode in a
             # RuntimeEPConfig.
-            for mode in (DispatchMode.AG_TRITON, DispatchMode.A2A_TRITON, DispatchMode.RANK_DEDUP_DISPATCH_TRITON):
+            for dispatch_mode in (
+                DispatchMode.AG_TRITON,
+                DispatchMode.A2A_TRITON,
+                DispatchMode.RANK_DEDUP_DISPATCH_TRITON,
+            ):
                 y_local = moe_ep_TC_softmax_topk_forward(
                     x_local,
                     router_w,
@@ -295,17 +294,16 @@ def _run_one_shape(
                     b2_local,
                     K=K,
                     E=E,
-                    mgr=mgr,
                     activation_type=ActivationType.SWIGLU,
                     is_inference_mode_enabled=True,
                     is_softmax_over_topk=is_softmax_over_topk,
                     norm_topk_probs=norm_topk_probs,
                     concat_layout=concat_layout,
-                    mode=mode,
+                    ep_config=RuntimeEPConfig(dispatch_mode=dispatch_mode, W=world_size, K=K),
                 )
                 y_full = _all_gather_y(y_local, world_size)
                 if rank == 0:
-                    tag = f"TC[{variant_name},mode={mode.value}]"
+                    tag = f"TC[{variant_name},dispatch={dispatch_mode.value}]"
                     ok, msg = _check(tag, y_full, ref, atol, rtol, log_prefix)
                     print(msg)
                     if ok:
@@ -323,16 +321,16 @@ def _run_one_shape(
             # two paths produce numerically equivalent outputs (modulo
             # fp32 vs bf16 accumulation order); the same atol/rtol
             # bounds apply.
-            for agg_mode in (
+            for combine_mode in (
                 CombineMode.A2A_TRITON,
                 CombineMode.RS_COMBINE_TRITON,
                 CombineMode.RANK_DEDUP_COMBINE_TRITON,
             ):
                 cfg = RuntimeEPConfig(
-                    mode=DispatchMode.AG_TRITON,
+                    dispatch_mode=DispatchMode.AG_TRITON,
                     W=world_size,
                     K=K,
-                    agg_mode=agg_mode,
+                    combine_mode=combine_mode,
                 )
                 y_local = moe_ep_TC_softmax_topk_forward(
                     x_local,
@@ -343,7 +341,6 @@ def _run_one_shape(
                     b2_local,
                     K=K,
                     E=E,
-                    mgr=mgr,
                     activation_type=ActivationType.SWIGLU,
                     is_inference_mode_enabled=True,
                     is_softmax_over_topk=is_softmax_over_topk,
@@ -353,7 +350,7 @@ def _run_one_shape(
                 )
                 y_full = _all_gather_y(y_local, world_size)
                 if rank == 0:
-                    tag = f"TC[{variant_name},ep_config=mode={cfg.mode.value},agg={cfg.agg_mode.value}]"
+                    tag = f"TC[{variant_name},dispatch={cfg.dispatch_mode.value},combine={cfg.combine_mode.value}]"
                     ok, msg = _check(tag, y_full, ref, atol, rtol, log_prefix)
                     print(msg)
                     if ok:
@@ -376,7 +373,7 @@ def _run_one_shape(
                 concat_layout=concat_layout,
             )
 
-        for mode in (DispatchMode.AG_TRITON, DispatchMode.A2A_TRITON):
+        for dispatch_mode in (DispatchMode.AG_TRITON, DispatchMode.A2A_TRITON):
             y_local = moe_ep_general_routing_forward(
                 x_local,
                 idx_local,
@@ -386,15 +383,14 @@ def _run_one_shape(
                 w2_local,
                 b2_local,
                 E=E,
-                mgr=mgr,
                 activation_type=ActivationType.SWIGLU,
                 is_inference_mode_enabled=True,
                 concat_layout=concat_layout,
-                mode=mode,
+                ep_config=RuntimeEPConfig(dispatch_mode=dispatch_mode, W=world_size, K=K),
             )
             y_full = _all_gather_y(y_local, world_size)
             if rank == 0:
-                tag = f"general[mode={mode.value}]"
+                tag = f"general[dispatch={dispatch_mode.value}]"
                 ok, msg = _check(tag, y_full, ref_general, atol, rtol, log_prefix)
                 print(msg)
                 if ok:
@@ -406,12 +402,16 @@ def _run_one_shape(
 
         # ep_config= round-trip for general_routing_forward.
         # Sweep both combine modes (see TC entry above).
-        for agg_mode in (CombineMode.A2A_TRITON, CombineMode.RS_COMBINE_TRITON, CombineMode.RANK_DEDUP_COMBINE_TRITON):
+        for combine_mode in (
+            CombineMode.A2A_TRITON,
+            CombineMode.RS_COMBINE_TRITON,
+            CombineMode.RANK_DEDUP_COMBINE_TRITON,
+        ):
             cfg = RuntimeEPConfig(
-                mode=DispatchMode.AG_TRITON,
+                dispatch_mode=DispatchMode.AG_TRITON,
                 W=world_size,
                 K=K,
-                agg_mode=agg_mode,
+                combine_mode=combine_mode,
             )
             y_local = moe_ep_general_routing_forward(
                 x_local,
@@ -422,7 +422,6 @@ def _run_one_shape(
                 w2_local,
                 b2_local,
                 E=E,
-                mgr=mgr,
                 activation_type=ActivationType.SWIGLU,
                 is_inference_mode_enabled=True,
                 concat_layout=concat_layout,
@@ -430,7 +429,7 @@ def _run_one_shape(
             )
             y_full = _all_gather_y(y_local, world_size)
             if rank == 0:
-                tag = f"general[ep_config=mode={cfg.mode.value},agg={cfg.agg_mode.value}]"
+                tag = f"general[ep_config=dispatch={cfg.dispatch_mode.value},combine={cfg.combine_mode.value}]"
                 ok, msg = _check(tag, y_full, ref_general, atol, rtol, log_prefix)
                 print(msg)
                 if ok:
@@ -516,14 +515,6 @@ def main() -> int:
             f"shapes={len(SHAPES)})\n"
         )
 
-    # Pin SymmMemManager instances created per-shape so their symm-mem
-    # tensors never destruct mid-loop. ~CUDASymmetricMemory calls
-    # cuMemUnmap from a C++ destructor; if that runs while peer mappings
-    # are still in flight (or during interpreter shutdown) it raises a
-    # c10::Error → std::terminate → SIGABRT. The benchmark uses the
-    # same pattern (see benchmarks/distributed/moe-ep.py keep_alive comment).
-    keep_alive: list = []
-
     all_stats: List[ShapeStats] = []
     try:
         for shape in SHAPES:
@@ -538,7 +529,6 @@ def main() -> int:
                     atol=5e-2,
                     rtol=5e-2,
                     seed=1111,
-                    keep_alive=keep_alive,
                 )
             except Exception as e:
                 if rank == 0:
@@ -571,18 +561,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    # Hard-exit via os._exit to bypass the Python destructor chain.
-    # Symm-mem tensors held in ``keep_alive`` (and internal
-    # ``torch.distributed._symmetric_memory`` module-level state) would
-    # otherwise have their C++ destructors run during interpreter
-    # shutdown: ``~CUDASymmetricMemory → cuMemUnmap`` then runs against
-    # a torn-down CUDA context, raises c10::Error from a noexcept
-    # destructor, and trips ``std::terminate → SIGABRT`` *after* the
-    # tests have already passed. ``sys.stdout/stderr.flush()`` first so
-    # the pass/fail summary still appears on the console; os._exit
-    # then skips all module destructors. (Same pattern as
+    # Hard-exit via os._exit to bypass the Python destructor chain on
+    # paths where ``clear_ep_cache``'s atexit hook may not get to run
+    # ahead of ``~CUDASymmetricMemory → cuMemUnmap`` (e.g. a test
+    # exception that propagates past atexit ordering). Same pattern as
     # ``benchmarks/distributed/moe-ep.py`` and ``tests/distributed/
-    # collectives_test.py``.)
+    # collectives_test.py``.
     rc = main()
     sys.stdout.flush()
     sys.stderr.flush()

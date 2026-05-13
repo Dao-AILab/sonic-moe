@@ -435,7 +435,7 @@ def _worker_rank_dedup_dispatch(rank, world_size, device):
 
 # ============================================================================
 # Worker: local_combine — explicit fp32 K-loop reference matching the
-# kernel's static_range accumulation order. 
+# kernel's static_range accumulation order.
 # ============================================================================
 
 
@@ -673,7 +673,6 @@ def _worker_rank_dedup_combine(rank, world_size, device):
             del y, sr, partial_combine_buf, scores_local, scores_global
         torch.cuda.empty_cache()
     return fails
-
 
 
 class EPCollectivesTest(TestCommons):

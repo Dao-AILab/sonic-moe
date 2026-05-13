@@ -28,7 +28,7 @@ from ..collectives import _CUDA_MAX_GRID_Y, _prune_block_d_vs_d, reduce_scatter_
 #        (folded inline — no separate resolve kernel/barrier
 #     3. Load peer.y_symm[s_peer, d-tile] via NVLink, multiply by score,
 #        accumulate into an fp32 register block.
-#   After the K-loop, store the register block (cast to dtype) into out[t, d-tile]. 
+#   After the K-loop, store the register block (cast to dtype) into out[t, d-tile].
 # ============================================================================
 
 _A2A_COMBINE_CONFIGS = [
@@ -164,7 +164,15 @@ def a2a_combine_triton(
 
     grid = lambda META: (T_local, triton.cdiv(d, META["BLOCK_D"]))
     _a2a_combine_kernel[grid](
-        y_peer_bufs, s_peer_bufs, src_flat, scores_flat, out, my_rank_offset, K=K, d=d, world_size=W,
+        y_peer_bufs,
+        s_peer_bufs,
+        src_flat,
+        scores_flat,
+        out,
+        my_rank_offset,
+        K=K,
+        d=d,
+        world_size=W,
         WITH_SCORES=with_scores,
     )
 
@@ -441,8 +449,19 @@ def local_combine(
         triton.cdiv(d, META["BLOCK_D"]),
     )
     _local_combine_kernel[grid](
-        y_symm, s_reverse, dst_rank_flat, scores_flat, partial_combine_buf, out_self_arg, T_local=T_local,
-        my_rank=my_rank, world_size=W, K=K, d=d, WITH_SCORES=with_scores, SKIP_EMPTY=skip_empty,
+        y_symm,
+        s_reverse,
+        dst_rank_flat,
+        scores_flat,
+        partial_combine_buf,
+        out_self_arg,
+        T_local=T_local,
+        my_rank=my_rank,
+        world_size=W,
+        K=K,
+        d=d,
+        WITH_SCORES=with_scores,
+        SKIP_EMPTY=skip_empty,
         WITH_OUT_FOR_SELF=with_out_for_self,
     )
 
@@ -661,8 +680,16 @@ def rank_dedup_combine_triton(
     # into ``out`` so the consumer can pick it up via its initial
     # accumulator load and elide the q == my_rank symm-mem self-read.
     local_combine(
-        y_symm, s_reverse, dst_rank_flat, scores, partial_combine_buf, K, T_local, group=group,
-        skip_empty=True, out_for_self=out,
+        y_symm,
+        s_reverse,
+        dst_rank_flat,
+        scores,
+        partial_combine_buf,
+        K,
+        T_local,
+        group=group,
+        skip_empty=True,
+        out_for_self=out,
     )
 
     # Step 2: per-token sparse gather (communication only). Internally
@@ -672,9 +699,15 @@ def rank_dedup_combine_triton(
     # from ``out`` (the self contribution) and skips the q == my_rank
     # symm-mem self-read.
     _rank_dedup_combine_communication_triton(
-        partial_combine_buf, peer_present_mask, out, T_local=T_local, group=group,
-        partial_combine_hdl=partial_combine_hdl, partial_combine_peer_bufs=partial_combine_peer_bufs,
-        my_rank=my_rank, init_acc_from_out=True,
+        partial_combine_buf,
+        peer_present_mask,
+        out,
+        T_local=T_local,
+        group=group,
+        partial_combine_hdl=partial_combine_hdl,
+        partial_combine_peer_bufs=partial_combine_peer_bufs,
+        my_rank=my_rank,
+        init_acc_from_out=True,
     )
 
 
@@ -726,7 +759,8 @@ def _rank_dedup_combine_communication_triton(
         W = partial_combine_hdl.world_size
         my_rank = partial_combine_hdl.rank if my_rank is None else my_rank
         partial_combine_peer_bufs = tuple(
-            partial_combine_hdl.get_buffer(r, tuple(partial_combine_buf.shape), partial_combine_buf.dtype) for r in range(W)
+            partial_combine_hdl.get_buffer(r, tuple(partial_combine_buf.shape), partial_combine_buf.dtype)
+            for r in range(W)
         )
     else:
         W = len(partial_combine_peer_bufs)
@@ -743,8 +777,14 @@ def _rank_dedup_combine_communication_triton(
         triton.cdiv(d, META["BLOCK_D"]),
     )
     _rank_dedup_combine_kernel[grid](
-        partial_combine_peer_bufs, peer_present_mask, out, T_local=T_local, my_rank=my_rank, world_size=W,
-        d=d, WITH_OUT_FOR_SELF=init_acc_from_out,
+        partial_combine_peer_bufs,
+        peer_present_mask,
+        out,
+        T_local=T_local,
+        my_rank=my_rank,
+        world_size=W,
+        d=d,
+        WITH_OUT_FOR_SELF=init_acc_from_out,
     )
 
 
@@ -794,7 +834,14 @@ def rs_combine_triton(
     # before this kernel; same-stream ordering with the prior write to
     # y_symm is sufficient.
     local_combine(
-        y_symm, s_reverse, dst_rank_flat, scores_ag, partial_combine_buf, K, T_local, group=group,
+        y_symm,
+        s_reverse,
+        dst_rank_flat,
+        scores_ag,
+        partial_combine_buf,
+        K,
+        T_local,
+        group=group,
     )
 
     # Barrier before the reduce-scatter peer-reads partial_combine_buf.
@@ -803,7 +850,11 @@ def rs_combine_triton(
     partial_combine_hdl.barrier()
 
     reduce_scatter_triton(
-        partial_combine_buf, group, out=out, hdl=partial_combine_hdl, peer_bufs=partial_combine_peer_bufs,
+        partial_combine_buf,
+        group,
+        out=out,
+        hdl=partial_combine_hdl,
+        peer_bufs=partial_combine_peer_bufs,
         my_rank=my_rank,
     )
     return out
