@@ -216,7 +216,7 @@ Override `--dispatch_mode` / `--combine_mode` to lock a specific dispatch / comb
 ```bash
 torchrun --nproc_per_node=8 --standalone benchmarks/distributed/moe-ep.py \
     --thiek 131072,4096,1536,128,8 \
-    --dispatch_mode RANK_DEDUP_DISPATCH_TRITON --combine_mode A2A_TRITON
+    --dispatch_mode RANK_DEDUP_DISPATCH_TRITON --combine_mode A2A_COMBINE_TRITON
 ```
 
 The EP forward exposes two optional flags that trade off activation memory, NVLink bandwidth in backward, and a host-stall on the forward.

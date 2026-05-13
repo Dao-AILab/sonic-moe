@@ -227,14 +227,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--concat_layout", action="store_true", default=False)
     parser.add_argument(
         "--dispatch_mode",
-        choices=["AG_TRITON", "A2A_TRITON", "RANK_DEDUP_DISPATCH_TRITON"],
+        choices=["AG_DISPATCH_TRITON", "A2A_DISPATCH_TRITON", "RANK_DEDUP_DISPATCH_TRITON"],
         default=None,
         help="Manual dispatch-mode override. When unset, the profiled "
         "winner from NetworkProfiler.profile() is used.",
     )
     parser.add_argument(
         "--combine_mode",
-        choices=["A2A_TRITON", "RS_COMBINE_TRITON", "RANK_DEDUP_COMBINE_TRITON"],
+        choices=["A2A_COMBINE_TRITON", "RS_COMBINE_TRITON", "RANK_DEDUP_COMBINE_TRITON"],
         default=None,
         help="Manual combine-mode override. When unset, the profiled "
         "winner from NetworkProfiler.profile() is used.",

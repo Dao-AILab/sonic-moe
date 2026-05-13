@@ -211,9 +211,12 @@
 # ============================================================================
 # Triton implementation — three-phase scan, then optional dedup phases.
 # ----------------------------------------------------------------------------
-# Phases 1/2/3 are always run. Phases D1/D2/D3 + the peer_present_mask
-# kernel run only when ``emit_dedup=True``. All kernels share `dst_rank_flat`
-# via HBM (written in phase 1, read in phase 3 / D1 / D3 / mask).
+# Phases 1/2/3 are always run. The canonical-slot-mark-and-tile-pair-
+# histogram / per-pair-tile-prefix-scan / pair-offset-cumsum-and-dedup-
+# recv-pos-emit phases + the peer_present_mask kernel run only when
+# ``emit_dedup=True``. All kernels share `dst_rank_flat` via HBM
+# (written in phase 1, read in phase 3, the canonical-slot-mark pass,
+# the dedup-recv-pos-emit pass, and the mask kernel).
 #
 #   Phase 1 (`_metadata_a2a_phase1_reduce_kernel`, grid (W, n_tiles)):
 #     One program per (src_rank, BLOCK_TK-tile). Builds the (BLOCK_TK, W)
@@ -236,25 +239,31 @@
 #     for this (src, tile) and computes early_count from peer_count_per_rank
 #     in registers. Emits slot_per_rank, slot_global, a2a_token_indices.
 #
-#   Phase D1 (`_metadata_dedup_phase1_reduce_kernel`, grid (W, n_token_tiles)):
+#   Canonical-slot-mark-and-tile-pair-histogram phase
+#     (`_metadata_dedup_phase1_reduce_kernel`, grid (W, n_token_tiles)):
 #     Per (src_rank, BLOCK_T-token-tile). Builds the (BLOCK_T, K_PAD, W)
-#     one-hot, cumsum-along-K to find canonical slots, reduces over
-#     BLOCK_T for the per-(p, n_token_tile, q) presence histogram.
+#     one-hot, cumsums along K to mark the lowest-k canonical slot per
+#     (token, dst) into pair_present_mask, then reduces over BLOCK_T to
+#     emit the per-(src, n_token_tile, dst) tile-level pair histogram.
 #
-#   Phase D2 (`_metadata_dedup_phase2_scan_kernel`, grid (W, W)):
-#     Mirror of phase 2 on the token-tile axis. Emits tile_token_prefix
-#     and pair_count.
+#   Per-pair-tile-prefix-scan phase
+#     (`_metadata_dedup_phase2_scan_kernel`, grid (W, W)):
+#     Mirror of phase 2 on the token-tile axis. Cumsums the per-tile
+#     pair histogram along the tile dim to emit tile_token_prefix
+#     (exclusive scan) and the per-(src, dst) pair_count total.
 #
-#   Phase D3 (`_metadata_dedup_phase3_emit_kernel`, grid (W, n_token_tiles)):
+#   Pair-offset-cumsum-and-dedup-recv-pos-emit phase
+#     (`_metadata_dedup_phase3_emit_kernel`, grid (W, n_token_tiles)):
 #     Recomputes within-tile per-(t, q) prefix in registers. Loads the
 #     full (W, W) pair_count, builds pair_offset (exclusive cumsum across
-#     p) in registers; the (pid_tile == 0) program publishes pair_offset
-#     to HBM. Emits rank_dedup_recv_pos.
+#     src-rank) in registers; the (pid_tile == 0) program publishes
+#     pair_offset to HBM. Emits rank_dedup_recv_pos.
 #
 #   peer_present_mask kernel (`_build_peer_present_mask_kernel`, grid
 #   (cdiv(T_local, BLOCK_T_MASK),)):
 #     Reads only my_rank's stripe of dst_rank_flat. Same one-hot trick
-#     as D1 but per-token, no cumsum / cross-tile coordination.
+#     as the canonical-slot-mark phase but per-token, no cumsum /
+#     cross-tile coordination.
 # ============================================================================
 
 from __future__ import annotations
@@ -658,9 +667,10 @@ def compute_dispatch_metadata(
         return out
 
     K_PAD = max(triton.next_power_of_2(K), 1)
-    # D1/D3 build a (BLOCK_T, K_PAD, W) one-hot int32 plus an equally-sized
-    # cumsum in registers / SMEM. Cap one-hot at ~8K elements per CTA so we
-    # stay under B200's per-CTA SMEM budget at large W·K.
+    # The canonical-slot-mark and dedup-recv-pos-emit phases build a
+    # (BLOCK_T, K_PAD, W) one-hot int32 plus an equally-sized cumsum in
+    # registers / SMEM. Cap one-hot at ~8K elements per CTA so we stay
+    # under B200's per-CTA SMEM budget at large W·K.
     MAX_OH_ELEMS = 8192
     oh_per_t = K_PAD * max(W, 1)
     BLOCK_T = max(

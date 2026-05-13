@@ -350,13 +350,13 @@ def _worker_rank_dedup_dispatch(rank, world_size, device):
             # Build the up-proj A_idx that maps expert-grouped row →
             # packed row.
             MAX_ROWS_PER_RANK = T_local * world_size * min(K, E_local)
-            a_idx_rank_dedup = torch.empty(MAX_ROWS_PER_RANK, dtype=torch.int32, device=device)
+            x_idx_expanded_remap_for_rank_dedup = torch.empty(MAX_ROWS_PER_RANK, dtype=torch.int32, device=device)
             build_rank_dedup_a_idx(
                 dst_rank_flat=meta["dst_rank_flat"],
                 s_reverse_local=s_reverse_local,
                 rank_dedup_recv_pos=meta["rank_dedup_recv_pos"],
                 my_rank=rank,
-                out=a_idx_rank_dedup,
+                out=x_idx_expanded_remap_for_rank_dedup,
             )
 
             # Reference 1 — bit-exact agreement with the A2A dispatch on the
@@ -377,7 +377,7 @@ def _worker_rank_dedup_dispatch(rank, world_size, device):
             # expert_frequency_offset[E_local] ≤ MAX_ROWS_PER_RANK).
             n_routed = int(expert_freq_off[E_local].item())
             if n_routed > 0:
-                gathered = recv_packed[a_idx_rank_dedup[:n_routed].long()]
+                gathered = recv_packed[x_idx_expanded_remap_for_rank_dedup[:n_routed].long()]
                 want = ref_grouped[:n_routed]
                 if not torch.equal(gathered, want):
                     n_diff = (gathered != want).any(dim=-1).sum().item()
@@ -427,7 +427,7 @@ def _worker_rank_dedup_dispatch(rank, world_size, device):
                     f"{mismatched}/{checked} rows mismatch"
                 )
 
-            del x, recv_packed, ref_grouped, x_all, a_idx_rank_dedup
+            del x, recv_packed, ref_grouped, x_all, x_idx_expanded_remap_for_rank_dedup
             del s_reverse_local, x_gather_idx, s_scatter_idx, expert_freq, expert_freq_off
         torch.cuda.empty_cache()
     return fails

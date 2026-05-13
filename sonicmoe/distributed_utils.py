@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import atexit
 import os
-import threading
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional, Sequence, Tuple, Union
@@ -44,25 +43,25 @@ __all__ = [
 class DispatchMode(str, Enum):
     """Dispatch strategy for the EP forward / backward."""
 
-    AG_TRITON = "AG_TRITON"
-    A2A_TRITON = "A2A_TRITON"
+    AG_DISPATCH_TRITON = "AG_DISPATCH_TRITON"
+    A2A_DISPATCH_TRITON = "A2A_DISPATCH_TRITON"
     RANK_DEDUP_DISPATCH_TRITON = "RANK_DEDUP_DISPATCH_TRITON"
 
 
 class CombineMode(str, Enum):
     """Combine strategy for the forward combine + backward dx combine."""
 
-    A2A_TRITON = "A2A_TRITON"
+    A2A_COMBINE_TRITON = "A2A_COMBINE_TRITON"
     RS_COMBINE_TRITON = "RS_COMBINE_TRITON"
     RANK_DEDUP_COMBINE_TRITON = "RANK_DEDUP_COMBINE_TRITON"
 
 
 def _is_ag_dispatch_mode(mode: DispatchMode) -> bool:
-    return mode == DispatchMode.AG_TRITON
+    return mode == DispatchMode.AG_DISPATCH_TRITON
 
 
 def _is_a2a_dispatch_mode(mode: DispatchMode) -> bool:
-    return mode == DispatchMode.A2A_TRITON
+    return mode == DispatchMode.A2A_DISPATCH_TRITON
 
 
 def _is_rank_dedup_dispatch_mode(mode: DispatchMode) -> bool:
@@ -70,7 +69,7 @@ def _is_rank_dedup_dispatch_mode(mode: DispatchMode) -> bool:
 
 
 def _is_a2a_combine_mode(mode: CombineMode) -> bool:
-    return mode == CombineMode.A2A_TRITON
+    return mode == CombineMode.A2A_COMBINE_TRITON
 
 
 def _is_rs_combine_mode(mode: CombineMode) -> bool:
@@ -117,7 +116,7 @@ class _EPWorkspace:
     _T_local: int
     _K: int
     _d: int
-    mode: DispatchMode = DispatchMode.AG_TRITON
+    dispatch_mode: DispatchMode = DispatchMode.AG_DISPATCH_TRITON
 
     a2a_recv: Optional[torch.Tensor] = None
     ag_compute: Optional[torch.Tensor] = None
@@ -162,13 +161,14 @@ class _EPWorkspace:
     partial_combine_hdl: Any = None
     partial_combine_peer_bufs: Tuple[torch.Tensor, ...] = ()
 
-    # a_idx_rank_dedup_buf — (MAX_ROWS_PER_RANK_STATIC,) int32 plain HBM,
+    # x_idx_expanded_remap_for_rank_dedup_buf — (MAX_ROWS_PER_RANK_STATIC,) int32 plain HBM,
     # the up-proj GEMM's A_idx for the dedup mode. Built every forward
     # by ``build_rank_dedup_a_idx`` and consumed by gemm_gated /
     # gemm_dgated / dW2 / dW1 GEMMs. Allocated only when the workspace
-    # is configured for RANK_DEDUP_DISPATCH_TRITON (``mode == DispatchMode.RANK_DEDUP_DISPATCH_TRITON``);
+    # is configured for RANK_DEDUP_DISPATCH_TRITON
+    # (``dispatch_mode == DispatchMode.RANK_DEDUP_DISPATCH_TRITON``);
     # None otherwise.
-    a_idx_rank_dedup_buf: Optional[torch.Tensor] = None
+    x_idx_expanded_remap_for_rank_dedup_buf: Optional[torch.Tensor] = None
 
     @property
     def T_local(self) -> int:
@@ -269,7 +269,7 @@ class _EPWorkspace:
         self.ag_compute = None
         self.t_global_pattern = None
         self._ag_redispatch_buf = None
-        self.a_idx_rank_dedup_buf = None
+        self.x_idx_expanded_remap_for_rank_dedup_buf = None
 
 
 # ============================================================================
@@ -278,12 +278,51 @@ class _EPWorkspace:
 
 
 class SymmMemManager:
-    def __init__(self, ep_group: dist.ProcessGroup, device: torch.device):
+    # Process-wide intern table keyed by ``(id(group), str(device))`` —
+    # one manager per ``(group, device)`` pair so workspaces and the
+    # symm-mem rendezvous they hold are reused across forward calls.
+    # ``__new__`` returns the cached instance on a hit; ``__init__`` is
+    # guarded by ``_initialized`` so the body runs exactly once per
+    # intern. CPython's GIL makes the get/setitem pair atomic for our
+    # single-main-thread usage; concurrent rendezvous would already be
+    # broken at the collectives layer so we don't add a lock.
+    _instances: "dict[Tuple[int, str], SymmMemManager]" = {}
+
+    def __new__(
+        cls,
+        ep_group: Optional[dist.ProcessGroup] = None,
+        device: Optional[Union[torch.device, int, str]] = None,
+    ) -> "SymmMemManager":
+        if ep_group is None:
+            ep_group = dist.group.WORLD
+        if device is None:
+            device = torch.cuda.current_device()
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        key = (id(ep_group), str(dev))
+        inst = cls._instances.get(key)
+        if inst is None:
+            inst = super().__new__(cls)
+            inst._initialized = False
+            cls._instances[key] = inst
+        return inst
+
+    def __init__(
+        self,
+        ep_group: Optional[dist.ProcessGroup] = None,
+        device: Optional[Union[torch.device, int, str]] = None,
+    ) -> None:
+        if getattr(self, "_initialized", False):
+            return
+        if ep_group is None:
+            ep_group = dist.group.WORLD
+        if device is None:
+            device = torch.cuda.current_device()
         self.ep_group = ep_group
-        self.device = torch.device(device)
+        self.device = torch.device(device) if not isinstance(device, torch.device) else device
         self.world_size = dist.get_world_size(ep_group)
         self.rank = dist.get_rank(ep_group)
         self._cache: dict = dict()
+        self._initialized = True
 
     def clear(self) -> None:
         # Release each workspace's tensor refs explicitly. Dropping
@@ -344,17 +383,17 @@ class SymmMemManager:
         a2a_recv = None
         ag_compute = None
         t_global_pattern = None
-        a_idx_rank_dedup_buf = None
+        x_idx_expanded_remap_for_rank_dedup_buf = None
 
-        # A2A_TRITON consumes an expert-grouped recv buffer; allocate ``a2a_recv``.
+        # A2A_DISPATCH_TRITON consumes an expert-grouped recv buffer; allocate ``a2a_recv``.
         # RANK_DEDUP_DISPATCH_TRITON consumes the dedup packed buffer DIRECTLY via an
         # A_idx-driven GEMM gather — no separate expert-grouped buffer
-        # needed. The A_idx tensor itself lives in ``a_idx_rank_dedup_buf``.
-        # AG_TRITON uses the (W*T_local, d) gather buffer instead.
+        # needed. The A_idx tensor itself lives in ``x_idx_expanded_remap_for_rank_dedup_buf``.
+        # AG_DISPATCH_TRITON uses the (W*T_local, d) gather buffer instead.
         if _is_a2a_dispatch_mode(mode):
             a2a_recv = torch.empty((W, TK_local, d), dtype=dtype, device=dev)
         elif _is_rank_dedup_dispatch_mode(mode):
-            a_idx_rank_dedup_buf = torch.empty(MAX_ROWS_PER_RANK, dtype=torch.int32, device=dev)
+            x_idx_expanded_remap_for_rank_dedup_buf = torch.empty(MAX_ROWS_PER_RANK, dtype=torch.int32, device=dev)
         else:
             ag_compute = torch.empty((W * T_local, d), dtype=dtype, device=dev)
             t_global_pattern = torch.arange(TK_global, device=dev, dtype=torch.int32) // K
@@ -376,11 +415,11 @@ class SymmMemManager:
             _T_local=T_local,
             _K=K,
             _d=d,
-            mode=mode,
+            dispatch_mode=mode,
             a2a_recv=a2a_recv,
             ag_compute=ag_compute,
             t_global_pattern=t_global_pattern,
-            a_idx_rank_dedup_buf=a_idx_rank_dedup_buf,
+            x_idx_expanded_remap_for_rank_dedup_buf=x_idx_expanded_remap_for_rank_dedup_buf,
         )
 
     def _get_or_alloc(
@@ -403,36 +442,33 @@ class SymmMemManager:
 # ============================================================================
 # Process-wide EP workspace cache
 # ----------------------------------------------------------------------------
-# A `SymmMemManager` holds symm-mem allocations + peer-buffer handles that
-# need to be released BEFORE the CUDA context tears down — otherwise
-# `~CUDASymmetricMemory` calls `cuMemUnmap` on a dead context and throws
-# from a destructor → `std::terminate`. We cache a single manager per
-# `(process_group, device)` pair so users don't have to construct one,
-# and register an `atexit` hook that explicitly drops the cache before
-# interpreter teardown (and runs ahead of PyTorch's own CUDA-teardown
-# atexit because PyTorch's runs first in import order → ours in reverse).
-# A fork hook clears the cache in the child so inherited symm-mem
-# objects bound to the parent's context don't get freed in the child.
+# ``SymmMemManager`` interns one instance per ``(group, device)`` pair on
+# its own class — see ``SymmMemManager._instances``. The cache state
+# lives there; this section just wires the lifecycle hooks.
+#
+# Why hooks at all: a manager holds symm-mem allocations + peer-buffer
+# handles that need to be released BEFORE the CUDA context tears down —
+# otherwise ``~CUDASymmetricMemory`` calls ``cuMemUnmap`` on a dead
+# context and throws from a destructor → ``std::terminate``. The
+# ``atexit`` hook runs ahead of PyTorch's own CUDA-teardown atexit
+# (reverse-registration order, and we import after torch.cuda is set up)
+# so symm-mem is freed while the driver is still live. The fork hook
+# drops cached entries in the child so inherited mappings — which point
+# at the parent's CUDA context — don't get freed in-child.
 # ============================================================================
-
-
-_MGR_CACHE: "dict[Tuple[int, str], SymmMemManager]" = {}
-_MGR_CACHE_LOCK = threading.Lock()
-_ATEXIT_REGISTERED = False
 
 
 def clear_ep_cache() -> None:
     """Release every cached EP symm-mem workspace.
 
-    Registered as an ``atexit`` and fork-after-in-child hook on first
-    use, so normally there's no need to call this explicitly. Useful
+    Registered as an ``atexit`` and fork-after-in-child hook at import
+    time, so normally there's no need to call this explicitly. Useful
     if you destroy and re-create a process group mid-process, or want
     to free GPU memory between independent runs in the same script.
     """
-    with _MGR_CACHE_LOCK:
-        mgrs = list(_MGR_CACHE.values())
-        _MGR_CACHE.clear()
-    for mgr in mgrs:
+    instances = list(SymmMemManager._instances.values())
+    SymmMemManager._instances.clear()
+    for mgr in instances:
         try:
             mgr.clear()
         except Exception:
@@ -441,35 +477,8 @@ def clear_ep_cache() -> None:
             pass
 
 
-def _get_or_create_ep_manager(
-    group: Optional[dist.ProcessGroup],
-    device: Union[torch.device, int, str],
-) -> SymmMemManager:
-    """Return the cached SymmMemManager for ``(group, device)``, creating it on miss.
-
-    Keying on ``id(group)`` is safe within a single process; if a user
-    destroys and recreates a process group with the same Python handle,
-    the new group will hash to a stale entry — call :func:`clear_ep_cache`
-    first in that flow.
-    """
-    global _ATEXIT_REGISTERED
-    if group is None:
-        group = dist.group.WORLD
-    dev = torch.device(device) if not isinstance(device, torch.device) else device
-    key = (id(group), str(dev))
-    with _MGR_CACHE_LOCK:
-        mgr = _MGR_CACHE.get(key)
-        if mgr is None:
-            mgr = SymmMemManager(group, dev)
-            _MGR_CACHE[key] = mgr
-            if not _ATEXIT_REGISTERED:
-                atexit.register(clear_ep_cache)
-                # Forked child inherits parent's mappings — they refer to
-                # the parent's CUDA context and must not be freed in-child.
-                # Dropping refs (not calling cuMemUnmap) is enough.
-                os.register_at_fork(after_in_child=_MGR_CACHE.clear)
-                _ATEXIT_REGISTERED = True
-        return mgr
+atexit.register(clear_ep_cache)
+os.register_at_fork(after_in_child=SymmMemManager._instances.clear)
 
 
 # ============================================================================
@@ -486,11 +495,11 @@ def _get_or_create_ep_manager(
 @dataclass(frozen=True)
 class RuntimeEPConfig:
     """End-to-end EP runtime config: workload-level decisions + layer-static dims.
-    * ``dispatch_mode`` — dispatch mode (AG_TRITON / A2A_TRITON / RANK_DEDUP_DISPATCH_TRITON),
+    * ``dispatch_mode`` — dispatch mode (AG_DISPATCH_TRITON / A2A_DISPATCH_TRITON / RANK_DEDUP_DISPATCH_TRITON),
       used for the forward x dispatch and the backward dO dispatch.
     * ``W`` — EP world size (validated against the current process group at call time).
     * ``K`` — top-K experts per token (validated against the call's K).
-    * ``combine_mode`` — combine mode (A2A_TRITON / RS_COMBINE_TRITON /
+    * ``combine_mode`` — combine mode (A2A_COMBINE_TRITON / RS_COMBINE_TRITON /
       RANK_DEDUP_COMBINE_TRITON), used for the forward combine and the
       backward dx combine.
     * ``MAX_ROWS_PER_RANK_STATIC`` — worst-case (token, expert) slots
@@ -505,8 +514,8 @@ class RuntimeEPConfig:
 
     W: int
     K: int
-    dispatch_mode: DispatchMode = DispatchMode.A2A_TRITON
-    combine_mode: CombineMode = CombineMode.A2A_TRITON
+    dispatch_mode: DispatchMode = DispatchMode.A2A_DISPATCH_TRITON
+    combine_mode: CombineMode = CombineMode.A2A_COMBINE_TRITON
     I: Optional[int] = None
     is_glu_act: Optional[bool] = None
     E_local: Optional[int] = None
@@ -518,7 +527,7 @@ class RuntimeEPConfig:
 
 
 class NetworkProfiler:
-    """Benchmark AG_TRITON / A2A_TRITON / RANK_DEDUP_DISPATCH_TRITON and pick a winner.
+    """Benchmark AG_DISPATCH_TRITON / A2A_DISPATCH_TRITON / RANK_DEDUP_DISPATCH_TRITON and pick a winner.
 
     Time each dispatch primitive on the local hardware for the given
     ``(T_local, d, K)`` shape, with synthetic uniform routing for the
@@ -558,7 +567,7 @@ class NetworkProfiler:
     ) -> None:
         if device is None:
             device = torch.cuda.current_device()
-        self.mgr = _get_or_create_ep_manager(group, device)
+        self.mgr = SymmMemManager(group, device)
         self.T_local = T_local
         self.H = H
         self.K = K
@@ -693,8 +702,8 @@ class NetworkProfiler:
         t_rank_dedup_dispatch = self._bench(rank_dedup_dispatch_call)
 
         timings = {
-            DispatchMode.AG_TRITON: t_ag_triton,
-            DispatchMode.A2A_TRITON: t_a2a,
+            DispatchMode.AG_DISPATCH_TRITON: t_ag_triton,
+            DispatchMode.A2A_DISPATCH_TRITON: t_a2a,
             DispatchMode.RANK_DEDUP_DISPATCH_TRITON: t_rank_dedup_dispatch,
         }
         winner = min(timings, key=timings.get)
@@ -790,11 +799,25 @@ class NetworkProfiler:
         t_rs = self._bench(rs_call)
         t_dedup = self._bench(dedup_call)
         combine_timings = {
-            CombineMode.A2A_TRITON: t_gather,
+            CombineMode.A2A_COMBINE_TRITON: t_gather,
             CombineMode.RS_COMBINE_TRITON: t_rs,
             CombineMode.RANK_DEDUP_COMBINE_TRITON: t_dedup,
         }
         combine_winner = min(combine_timings, key=combine_timings.get)
+
+        # ── Dispatch-dedup byte volume from the actual routing ───────
+        # Compute the per-rank cross-rank receive count from the
+        # measured (W, W) pair_count, then average across ranks so it
+        # matches the per-rank mean time used in the GB/s reporting
+        # below. The previous analytical fallback
+        # ``(W-1) · T_local · (1 - (1-1/W)^K) · H · itemsize`` is only
+        # exact under balanced uniform routing.
+        itemsize = torch.tensor([], dtype=dtype).element_size()
+        pc = meta["pair_count"]
+        dedup_rows_local = int(pc[:, rank].sum().item() - pc[rank, rank].item())
+        _dedup_rows_t = torch.tensor([dedup_rows_local], dtype=torch.int64, device=device)
+        dist.all_reduce(_dedup_rows_t, op=dist.ReduceOp.SUM, group=mgr.ep_group)
+        dedup_bytes = (_dedup_rows_t.item() / W) * H * itemsize
 
         # Expose per-rank-mean timings (ms) so callers can report the
         # measured cost of the chosen dispatch/combine pair without
@@ -826,17 +849,16 @@ class NetworkProfiler:
             # Bytes traversing NVLink per rank per call:
             #   AG: (W-1) · T_local · H · itemsize_dtype     (received)
             #   A2A: (W-1)/W · TK_local · H · itemsize_dtype (received)
-            #   A2A_TRITON: same as A2A (peer y_symm reads).
+            #   A2A_COMBINE_TRITON: same as A2A_DISPATCH_TRITON's volume (peer y_symm reads).
             #   RS pipeline: dominated by reduce_scatter, which moves
             #     (W-1) · T_local · H · itemsize_dtype bytes per rank
             #     (partial_combine_buf is now stored in the model dtype; reducer
             #     register acc stays fp32, store casts at the boundary).
-            itemsize = torch.tensor([], dtype=dtype).element_size()
             ag_bytes = (W - 1) * T_local * H * itemsize
             a2a_bytes = ((W - 1) / W) * TK_local * H * itemsize
             gather_bytes = a2a_bytes
-            # Dedup-dispatch: (W-1) · T_local · (1 - (1 - 1/W)^K) · d · itemsize.
-            dedup_bytes = (W - 1) * T_local * (1.0 - (1.0 - 1.0 / W) ** K) * H * itemsize
+            # ``dedup_bytes`` was already computed above from the actual
+            # ``meta["pair_count"]`` (cross-rank averaged).
             t_ag_triton_mean = t_ag_triton / W
             t_a2a_mean = t_a2a / W
             t_rank_dedup_dispatch_mean = t_rank_dedup_dispatch / W
@@ -857,12 +879,12 @@ class NetworkProfiler:
             print(
                 f"{head}\n"
                 f"  Dispatch:    "
-                f"AG_TRITON={t_ag_triton_mean * 1e3:.2f}ms ({ag_triton_gbs:.1f} GB/s)  "
-                f"A2A_TRITON={t_a2a_mean * 1e3:.2f}ms ({a2a_gbs:.1f} GB/s)  "
+                f"AG_DISPATCH_TRITON={t_ag_triton_mean * 1e3:.2f}ms ({ag_triton_gbs:.1f} GB/s)  "
+                f"A2A_DISPATCH_TRITON={t_a2a_mean * 1e3:.2f}ms ({a2a_gbs:.1f} GB/s)  "
                 f"RANK_DEDUP_DISPATCH_TRITON={t_rank_dedup_dispatch_mean * 1e3:.2f}ms ({rank_dedup_dispatch_gbs:.1f} GB/s)  "
                 f"→  winner={winner.value}\n"
                 f"  Combine: "
-                f"A2A_TRITON={t_gather_mean * 1e3:.2f}ms ({gather_gbs:.1f} GB/s)  "
+                f"A2A_COMBINE_TRITON={t_gather_mean * 1e3:.2f}ms ({gather_gbs:.1f} GB/s)  "
                 f"RS_COMBINE_TRITON={t_rs_mean * 1e3:.2f}ms  "
                 f"RANK_DEDUP_COMBINE_TRITON={t_dedup_mean * 1e3:.2f}ms  "
                 f"→  winner={combine_winner.value}",

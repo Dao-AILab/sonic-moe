@@ -281,8 +281,8 @@ def _run_one_shape(
             # ep_config= path by wrapping a DispatchMode in a
             # RuntimeEPConfig.
             for dispatch_mode in (
-                DispatchMode.AG_TRITON,
-                DispatchMode.A2A_TRITON,
+                DispatchMode.AG_DISPATCH_TRITON,
+                DispatchMode.A2A_DISPATCH_TRITON,
                 DispatchMode.RANK_DEDUP_DISPATCH_TRITON,
             ):
                 y_local = moe_ep_TC_softmax_topk_forward(
@@ -316,18 +316,18 @@ def _run_one_shape(
             # ep_config= round-trip: sweep both combine modes.
             # Delivers the dispatch decision via RuntimeEPConfig so the
             # validate path is exercised, and exercises both
-            # A2A_TRITON (the fused kernel) and RS_COMBINE_TRITON
+            # A2A_COMBINE_TRITON (the fused kernel) and RS_COMBINE_TRITON
             # (the producer + reduce-scatter pipeline) end-to-end. The
             # two paths produce numerically equivalent outputs (modulo
             # fp32 vs bf16 accumulation order); the same atol/rtol
             # bounds apply.
             for combine_mode in (
-                CombineMode.A2A_TRITON,
+                CombineMode.A2A_COMBINE_TRITON,
                 CombineMode.RS_COMBINE_TRITON,
                 CombineMode.RANK_DEDUP_COMBINE_TRITON,
             ):
                 cfg = RuntimeEPConfig(
-                    dispatch_mode=DispatchMode.AG_TRITON,
+                    dispatch_mode=DispatchMode.AG_DISPATCH_TRITON,
                     W=world_size,
                     K=K,
                     combine_mode=combine_mode,
@@ -373,7 +373,7 @@ def _run_one_shape(
                 concat_layout=concat_layout,
             )
 
-        for dispatch_mode in (DispatchMode.AG_TRITON, DispatchMode.A2A_TRITON):
+        for dispatch_mode in (DispatchMode.AG_DISPATCH_TRITON, DispatchMode.A2A_DISPATCH_TRITON):
             y_local = moe_ep_general_routing_forward(
                 x_local,
                 idx_local,
@@ -403,12 +403,12 @@ def _run_one_shape(
         # ep_config= round-trip for general_routing_forward.
         # Sweep both combine modes (see TC entry above).
         for combine_mode in (
-            CombineMode.A2A_TRITON,
+            CombineMode.A2A_COMBINE_TRITON,
             CombineMode.RS_COMBINE_TRITON,
             CombineMode.RANK_DEDUP_COMBINE_TRITON,
         ):
             cfg = RuntimeEPConfig(
-                dispatch_mode=DispatchMode.AG_TRITON,
+                dispatch_mode=DispatchMode.AG_DISPATCH_TRITON,
                 W=world_size,
                 K=K,
                 combine_mode=combine_mode,
