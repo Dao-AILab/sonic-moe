@@ -9,11 +9,15 @@ import cutlass.cute as cute
 import torch
 import triton
 import triton.language as tl
-from quack.gemm_interface import gemm, gemm_dgated
+from quack.gemm_interface import gemm, gemm_dact, gemm_dgated
 
 from ..enums import LIBRARY_NAME
 from ..utils import get_powers_of_2
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
+
+
+def _quack_activation_name(activation_type: str) -> str:
+    return "gelu_tanh_approx" if activation_type == "gelu" else activation_type
 
 
 def _get_autotune_configs_for_db2_and_ds() -> list[triton.Config]:
@@ -224,13 +228,11 @@ def _down_projection_backward_act(
     s_scatter_idx: torch.Tensor,
     activation_type: str,
 ) -> None:
-    assert activation_type in (
-        "swiglu",
-        "geglu",
-    ), f"QuACK gemm_gated only supports glu activations, got {activation_type}"
+    activation_type = _quack_activation_name(activation_type)
 
     s = topk_scores[s_scatter_idx]
-    _, _, ds_scattered = gemm_dgated(
+    gemm_dact_fn = gemm_dgated if activation_type in ("swiglu", "geglu", "reglu") else gemm_dact
+    _, _, ds_scattered = gemm_dact_fn(
         dout,
         w2.permute(2, 0, 1),
         PreAct=h,

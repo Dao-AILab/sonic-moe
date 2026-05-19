@@ -6,7 +6,7 @@ import os
 
 import torch
 import torch.nn.functional as F
-from quack.gemm_interface import gemm, gemm_dgated, gemm_gated
+from quack.gemm_interface import gemm, gemm_act, gemm_gated
 
 from ..enums import ActivationType, is_glu
 from .backward import (
@@ -17,6 +17,12 @@ from .backward import (
 )
 from .forward import _router_forward, _topk_softmax_fwd
 from .triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
+
+
+def _quack_activation_name(activation_type: ActivationType) -> str:
+    if activation_type == ActivationType.GELU:
+        return "gelu_tanh_approx"
+    return activation_type.value
 
 
 class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
@@ -105,22 +111,38 @@ class _UpProjection(torch.autograd.Function):
             else None
         )
 
-        assert activation_type.value in (
-            "swiglu",
-            "geglu",
-        ), f"QuACK gemm_gated only supports glu activations, got {activation_type.value}"
-        gemm_gated(
-            x,
-            w1.permute(2, 1, 0),
-            activation=activation_type.value,
-            cu_seqlens_m=expert_frequency_offset,
-            A_idx=x_gather_idx,
-            preact_out=h,
-            postact_out=a,
-            store_preact=(not is_inference_mode_enabled),
-            bias=b1,
-            concat_layout=(("B", "bias") if b1 is not None else ("B",)) if concat_layout else None,
-        )
+        activation_name = _quack_activation_name(activation_type)
+        if is_glu_activation:
+            assert activation_type.value in (
+                "swiglu",
+                "geglu",
+                "reglu",
+            ), f"QuACK gemm_gated does not support {activation_type.value}"
+            gemm_gated(
+                x,
+                w1.permute(2, 1, 0),
+                activation=activation_name,
+                cu_seqlens_m=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                preact_out=h,
+                postact_out=a,
+                store_preact=(not is_inference_mode_enabled),
+                bias=b1,
+                concat_layout=(("B", "bias") if b1 is not None else ("B",)) if concat_layout else None,
+            )
+        else:
+            assert not concat_layout, "concat_layout is only valid for GLU activations"
+            gemm_act(
+                x,
+                w1.permute(2, 1, 0),
+                activation=activation_name,
+                cu_seqlens_m=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                preact_out=h,
+                postact_out=a,
+                store_preact=(not is_inference_mode_enabled),
+                bias=b1,
+            )
 
         ctx.T = T
         ctx.TK = TK
@@ -369,8 +391,6 @@ def moe_TC_softmax_topk_layer(
         activation_type = ActivationType(activation_type)
 
     assert not torch.compiler.is_compiling()
-    assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
-
     a, h = _UpProjection.apply(
         x,
         w1,
@@ -467,8 +487,6 @@ def moe_general_routing_inputs(
     )
 
     assert not torch.compiler.is_compiling()
-    assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
-
     a, h = _UpProjection.apply(
         x,
         w1,

@@ -146,3 +146,55 @@ class MoETest(TestCommons):
 
         torch_grads = kernel_grads = None
         torch.cuda.empty_cache()
+
+    @parameterized.expand([ActivationType.GELU, ActivationType.RELU])
+    def test_moe_quack_nonglu_activation(self, activation: ActivationType) -> None:
+        device = torch.device("cuda")
+        if not torch.cuda.is_available():
+            self.skipTest("cuda required")
+
+        self.set_seed(_SEED)
+        T, H, I, E, K = 1024, 512, 256, 16, 2
+        dtype = torch.bfloat16
+        with torch.device(device):
+            moe = MoE(
+                num_experts=E,
+                num_experts_per_tok=K,
+                hidden_size=H,
+                intermediate_size=I,
+                activation_function=activation,
+                add_bias=False,
+                std=0.02,
+            ).to(dtype=dtype)
+
+        x_torch = 0.02 * torch.randn(T, H, device=device, dtype=dtype, requires_grad=True)
+        x_kernel = x_torch.clone().detach().requires_grad_()
+
+        with torch.autocast(x_torch.device.type, torch.float32):
+            y_kernel = moe(x_kernel, kernel_backend_moe=KernelBackendMoE.sonicmoe)[0]
+            y_torch = moe(x_torch, kernel_backend_moe=KernelBackendMoE.torch)[0]
+            self.assert_equal_tensors(
+                y_kernel.float(),
+                y_torch.float(),
+                False,
+                atol_bfloat16=1.4e-2,
+                rtol_bfloat16=2e-2,
+                dtype=dtype,
+            )
+
+        dy_torch = 0.02 * torch.randn(T, H, device=device, dtype=dtype, requires_grad=True)
+        dy_kernel = dy_torch.clone().detach().requires_grad_()
+        W = list(moe.parameters())
+
+        with torch.autocast(x_torch.device.type, torch.float32):
+            kernel_grads = torch.autograd.grad(y_kernel, [x_kernel] + W, grad_outputs=dy_kernel, retain_graph=True)
+            torch_grads = torch.autograd.grad(y_torch, [x_torch] + W, grad_outputs=dy_torch, retain_graph=True)
+            for _torch_grad, _kernel_grad in zip(torch_grads, kernel_grads):
+                self.assert_equal_tensors(
+                    _kernel_grad.float(),
+                    _torch_grad.float(),
+                    False,
+                    atol_bfloat16=2e-2,
+                    rtol_bfloat16=2e-2,
+                    dtype=dtype,
+                )
