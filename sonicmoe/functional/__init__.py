@@ -9,6 +9,32 @@ import torch.nn.functional as F
 from quack.gemm_interface import gemm, gemm_dgated, gemm_gated
 
 from ..enums import ActivationType, is_glu
+
+_FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+_FP8_E5M2_MAX = torch.finfo(torch.float8_e5m2).max    # 57344.0
+
+
+def _to_fp8_e4m3(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    scale = x.abs().amax().clamp(min=1e-12) / _FP8_E4M3_MAX
+    return (x / scale).to(torch.float8_e4m3fn), scale
+
+
+def _to_fp8_e5m2(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    scale = x.abs().amax().clamp(min=1e-12) / _FP8_E5M2_MAX
+    return (x / scale).to(torch.float8_e5m2), scale
+
+
+def _apply_glu_act(h: torch.Tensor, activation_type: ActivationType, concat_layout: bool) -> torch.Tensor:
+    if concat_layout:
+        gate, up = h.chunk(2, dim=-1)
+    else:
+        gate, up = h[..., ::2], h[..., 1::2]
+    if activation_type == ActivationType.SWIGLU:
+        return F.silu(gate) * up
+    elif activation_type == ActivationType.GEGLU:
+        return F.gelu(gate.float()).to(gate.dtype) * up
+    else:
+        raise ValueError(f"unsupported activation for fp8 path: {activation_type}")
 from .backward import (
     _down_projection_backward_act,
     _token_broadcast_backward,
@@ -110,20 +136,37 @@ class _UpProjection(torch.autograd.Function):
             "swiglu",
             "geglu",
         ), f"QuACK gemm_gated only supports glu activations, got {activation_type.value}"
-        x_in = x.to(torch.float8_e4m3fn) if use_fp8 else x
-        w1_in = w1.permute(2, 1, 0).to(torch.float8_e4m3fn) if use_fp8 else w1.permute(2, 1, 0)
-        gemm_gated(
-            x_in,
-            w1_in,
-            activation=activation_type.value,
-            cu_seqlens_m=expert_frequency_offset,
-            A_idx=x_gather_idx,
-            preact_out=h,
-            postact_out=a,
-            store_preact=(not is_inference_mode_enabled),
-            bias=b1,
-            concat_layout=(("B", "bias") if b1 is not None else ("B",)) if concat_layout else None,
-        )
+
+        if use_fp8:
+            # Use plain gemm so we can descale before the nonlinear activation.
+            # gemm_gated fuses swiglu, making descaling incorrect: swiglu(x/s) ≠ swiglu(x)/s.
+            x_fp8, x_sc = _to_fp8_e4m3(x)
+            w1_fp8, w1_sc = _to_fp8_e4m3(w1.permute(2, 1, 0))
+            h_buf = torch.empty(TK, 2 * I if is_glu_activation else I, dtype=x.dtype, device=x.device)
+            gemm(
+                x_fp8, w1_fp8,
+                out=h_buf,
+                cu_seqlens_m=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                dynamic_scheduler=False,
+            )
+            h_buf.mul_(x_sc * w1_sc)
+            if not is_inference_mode_enabled:
+                h.copy_(h_buf)
+            a[:] = _apply_glu_act(h_buf, activation_type, concat_layout)
+        else:
+            gemm_gated(
+                x,
+                w1.permute(2, 1, 0),
+                activation=activation_type.value,
+                cu_seqlens_m=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                preact_out=h,
+                postact_out=a,
+                store_preact=(not is_inference_mode_enabled),
+                bias=b1,
+                concat_layout=(("B", "bias") if b1 is not None else ("B",)) if concat_layout else None,
+            )
 
         ctx.T = T
         ctx.TK = TK
@@ -178,30 +221,49 @@ class _UpProjection(torch.autograd.Function):
         dw1 = torch.empty_like(w1)
         db1 = None if b1 is None else torch.empty_like(b1)
 
-        w1_bwd = w1.to(torch.float8_e4m3fn) if ctx.use_fp8 else w1
-        dh_bwd = dh.to(torch.float8_e5m2) if ctx.use_fp8 else dh
-        x_bwd = x.to(torch.float8_e4m3fn) if ctx.use_fp8 else x
-
-        _up_projection_backward_act(
-            w1=w1_bwd,
-            dx_expanded=dx_expanded,
-            dh=dh_bwd,
-            db1=db1,
-            expert_frequency_offset=expert_frequency_offset,
-            is_glu_activation=is_glu_activation,
-            concat_layout=concat_layout,
-        )
-
-        gemm(
-            x_bwd.T,
-            dh_bwd,
-            out=dw1.permute(2, 1, 0),
-            cu_seqlens_k=expert_frequency_offset,
-            A_idx=x_gather_idx,
-            batch_idx_permute=None,
-            dynamic_scheduler=False,
-            concat_layout=(("out",) if concat_layout else None),
-        )
+        if ctx.use_fp8:
+            w1_fp8, w1_sc = _to_fp8_e4m3(w1)
+            dh_fp8, dh_sc = _to_fp8_e5m2(dh)
+            x_fp8, x_sc = _to_fp8_e4m3(x)
+            _up_projection_backward_act(
+                w1=w1_fp8,
+                dx_expanded=dx_expanded,
+                dh=dh_fp8,
+                db1=db1,
+                expert_frequency_offset=expert_frequency_offset,
+                is_glu_activation=is_glu_activation,
+                concat_layout=concat_layout,
+            )
+            dx_expanded.mul_(w1_sc * dh_sc)
+            gemm(
+                x_fp8.T, dh_fp8,
+                out=dw1.permute(2, 1, 0),
+                cu_seqlens_k=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                batch_idx_permute=None,
+                dynamic_scheduler=False,
+                concat_layout=(("out",) if concat_layout else None),
+            )
+            dw1.mul_(x_sc * dh_sc)
+        else:
+            _up_projection_backward_act(
+                w1=w1,
+                dx_expanded=dx_expanded,
+                dh=dh,
+                db1=db1,
+                expert_frequency_offset=expert_frequency_offset,
+                is_glu_activation=is_glu_activation,
+                concat_layout=concat_layout,
+            )
+            gemm(
+                x.T, dh,
+                out=dw1.permute(2, 1, 0),
+                cu_seqlens_k=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                batch_idx_permute=None,
+                dynamic_scheduler=False,
+                concat_layout=(("out",) if concat_layout else None),
+            )
 
         dx_reduced = torch.empty(T, H, dtype=dh.dtype, device=dh.device)
 
@@ -243,9 +305,13 @@ class _DownProjection(torch.autograd.Function):
 
         y = torch.empty(TK, H, dtype=a.dtype, device=a.device)
 
-        a_in = a.to(torch.float8_e4m3fn) if use_fp8 else a
-        w2_in = w2.permute(2, 1, 0).to(torch.float8_e4m3fn) if use_fp8 else w2.permute(2, 1, 0)
-        gemm(a_in, w2_in, out=y, cu_seqlens_m=expert_frequency_offset, bias=b2)
+        if use_fp8:
+            a_fp8, a_sc = _to_fp8_e4m3(a)
+            w2_fp8, w2_sc = _to_fp8_e4m3(w2.permute(2, 1, 0))
+            gemm(a_fp8, w2_fp8, out=y, cu_seqlens_m=expert_frequency_offset)
+            y.mul_(a_sc * w2_sc)
+        else:
+            gemm(a, w2.permute(2, 1, 0), out=y, cu_seqlens_m=expert_frequency_offset, bias=b2)
 
         o = torch.empty(T, H, device=a.device, dtype=a.dtype)
         topk_scores = topk_scores.view(-1)
@@ -306,35 +372,59 @@ class _DownProjection(torch.autograd.Function):
         a_prime = torch.empty(TK, I, dtype=h.dtype, device=h.device)
         ds = torch.empty_like(topk_scores)
 
-        dout_bwd = dout.to(torch.float8_e5m2) if ctx.use_fp8 else dout
-        w2_bwd = w2.to(torch.float8_e4m3fn) if ctx.use_fp8 else w2
-
-        _down_projection_backward_act(
-            dout=dout_bwd,
-            h=h,  # must stay bf16: gemm_dgated asserts PreAct.element_size() == 2
-            w2=w2_bwd,
-            dh=dh,
-            ds=ds,
-            b2=b2,
-            db2=db2,
-            a_prime=a_prime,
-            topk_scores=topk_scores,
-            expert_frequency_offset=expert_frequency_offset,
-            x_gather_idx=x_gather_idx,
-            s_scatter_idx=s_scatter_idx,
-            activation_type=activation_type.value,
-        )
-
-        a_prime_bwd = a_prime.to(torch.float8_e4m3fn) if ctx.use_fp8 else a_prime
-        gemm(
-            dout_bwd.T,
-            a_prime_bwd,
-            out=dw2.permute(2, 0, 1),
-            cu_seqlens_k=expert_frequency_offset,
-            A_idx=x_gather_idx,
-            batch_idx_permute=None,
-            dynamic_scheduler=False,
-        )
+        if ctx.use_fp8:
+            dout_fp8, dout_sc = _to_fp8_e5m2(dout)
+            w2_fp8, w2_sc = _to_fp8_e4m3(w2)
+            _down_projection_backward_act(
+                dout=dout_fp8,
+                h=h,  # must stay bf16: gemm_dgated asserts PreAct.element_size() == 2
+                w2=w2_fp8,
+                dh=dh,
+                ds=ds,
+                b2=b2,
+                db2=db2,
+                a_prime=a_prime,
+                topk_scores=topk_scores,
+                expert_frequency_offset=expert_frequency_offset,
+                x_gather_idx=x_gather_idx,
+                s_scatter_idx=s_scatter_idx,
+                activation_type=activation_type.value,
+            )
+            dh.mul_(dout_sc * w2_sc)
+            a_prime_fp8, ap_sc = _to_fp8_e4m3(a_prime)
+            gemm(
+                dout_fp8.T, a_prime_fp8,
+                out=dw2.permute(2, 0, 1),
+                cu_seqlens_k=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                batch_idx_permute=None,
+                dynamic_scheduler=False,
+            )
+            dw2.mul_(dout_sc * ap_sc)
+        else:
+            _down_projection_backward_act(
+                dout=dout,
+                h=h,
+                w2=w2,
+                dh=dh,
+                ds=ds,
+                b2=b2,
+                db2=db2,
+                a_prime=a_prime,
+                topk_scores=topk_scores,
+                expert_frequency_offset=expert_frequency_offset,
+                x_gather_idx=x_gather_idx,
+                s_scatter_idx=s_scatter_idx,
+                activation_type=activation_type.value,
+            )
+            gemm(
+                dout.T, a_prime,
+                out=dw2.permute(2, 0, 1),
+                cu_seqlens_k=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                batch_idx_permute=None,
+                dynamic_scheduler=False,
+            )
 
         # TC top-K routing
         if not is_varlen_K:
