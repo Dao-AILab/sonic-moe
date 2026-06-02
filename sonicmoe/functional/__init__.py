@@ -27,10 +27,23 @@ from .triton_kernels import TC_topk_router_metadata_triton, general_routing_rout
 
 _FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
 
+# Keyed by (data_ptr, perm); invalidated by _version after each optimizer step.
+_fp8_weight_cache: dict[tuple, tuple[int, torch.Tensor, torch.Tensor]] = {}
+
 
 def _to_fp8_e4m3(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scale = x.abs().amax().clamp(min=1e-12) / _FP8_E4M3_MAX
     return (x / scale).to(torch.float8_e4m3fn), scale
+
+
+def _to_fp8_e4m3_weight(x: torch.Tensor, perm: tuple) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (x.data_ptr(), perm)
+    cached = _fp8_weight_cache.get(key)
+    if cached is None or cached[0] != x._version:
+        fp8, sc = _to_fp8_e4m3(x.permute(*perm).contiguous())
+        _fp8_weight_cache[key] = (x._version, fp8, sc)
+        return fp8, sc
+    return cached[1], cached[2]
 
 
 def _apply_glu_act(h: torch.Tensor, activation_type: ActivationType, concat_layout: bool) -> torch.Tensor:
@@ -142,7 +155,7 @@ class _UpProjection(torch.autograd.Function):
             # Use plain gemm so we can descale before the nonlinear activation.
             # gemm_gated fuses swiglu, making descaling incorrect: swiglu(x/s) ≠ swiglu(x)/s.
             x_fp8, x_sc = _to_fp8_e4m3(x)
-            w1_fp8, w1_sc = _to_fp8_e4m3(w1.permute(2, 1, 0))
+            w1_fp8, w1_sc = _to_fp8_e4m3_weight(w1, (2, 1, 0))
             h_buf = torch.empty(TK, 2 * I if is_glu_activation else I, dtype=x.dtype, device=x.device)
             gemm(
                 x_fp8, w1_fp8,
@@ -154,6 +167,8 @@ class _UpProjection(torch.autograd.Function):
             h_buf.mul_(x_sc * w1_sc)
             if not is_inference_mode_enabled:
                 h.copy_(h_buf)
+                ctx.x_fp8 = x_fp8
+                ctx.x_sc = x_sc
             a[:] = _apply_glu_act(h_buf, activation_type, concat_layout)
         else:
             gemm_gated(
@@ -224,11 +239,9 @@ class _UpProjection(torch.autograd.Function):
 
         if ctx.use_fp8:
             assert b1 is None, "fp8 path does not support bias"
-            # Permute before quantizing: _to_fp8_e4m3 returns a contiguous tensor,
-            # so quantizing w1 as (2I,H,E) then permuting gives wrong K-major strides.
-            w1_fp8, w1_sc = _to_fp8_e4m3(w1.permute(2, 0, 1).contiguous())
+            w1_fp8, w1_sc = _to_fp8_e4m3_weight(w1, (2, 0, 1))
             dh_fp8, dh_sc = _to_fp8_e4m3(dh)
-            x_fp8, x_sc = _to_fp8_e4m3(x)
+            x_fp8, x_sc = ctx.x_fp8, ctx.x_sc
             gemm(
                 dh_fp8,
                 w1_fp8,
@@ -310,7 +323,7 @@ class _DownProjection(torch.autograd.Function):
 
         if use_fp8:
             a_fp8, a_sc = _to_fp8_e4m3(a)
-            w2_fp8, w2_sc = _to_fp8_e4m3(w2.permute(2, 1, 0))
+            w2_fp8, w2_sc = _to_fp8_e4m3_weight(w2, (2, 1, 0))
             gemm(a_fp8, w2_fp8, out=y, cu_seqlens_m=expert_frequency_offset)
             y.mul_(a_sc * w2_sc)
         else:
@@ -378,8 +391,7 @@ class _DownProjection(torch.autograd.Function):
         if ctx.use_fp8:
             assert b2 is None, "fp8 path does not support bias"
             dout_fp8, dout_sc = _to_fp8_e4m3(dout)
-            # Permute before quantizing to preserve K-major strides (same issue as up-proj).
-            w2_fp8, w2_sc = _to_fp8_e4m3(w2.permute(2, 0, 1).contiguous())
+            w2_fp8, w2_sc = _to_fp8_e4m3_weight(w2, (2, 0, 1))
             s = topk_scores[s_scatter_idx]
             _, _, ds_scattered = gemm_dgated(
                 dout_fp8,
