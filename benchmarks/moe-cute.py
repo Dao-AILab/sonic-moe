@@ -173,7 +173,7 @@ def parse_arguments() -> argparse.Namespace:
         "--fp8",
         action="store_true",
         default=False,
-        help="Use mixed fp8 forward (MXFP8 expert GEMMs) with bf16 backward (SM100/Blackwell only)",
+        help="Use mixed fp8 forward (fp8 expert GEMMs) with bf16 backward (SM90+)",
     )
     args = parser.parse_args()
 

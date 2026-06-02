@@ -149,14 +149,42 @@ class MoETest(TestCommons):
         torch.cuda.empty_cache()
 
 
-# Small shapes where H and I are divisible by 32 (MXFP8 block-size requirement)
 _FP8_SHAPES = [
     (512, 512, 256, 32, 2),
     (1024, 1024, 512, 64, 4),
 ]
 
 
-class MixedFp8TrainingTest(TestCommons):
+class Fp8TrainingTest(TestCommons):
+    @classmethod
+    def setUpClass(cls):
+        # Reduce SM100 autotuner search space so fp8 kernel compilation is tractable.
+        # The full config set has hundreds of variants; a small subset is enough for tests.
+        import quack.gemm_config as _gc
+        from quack.autotuner import AutotuneConfig
+        from quack.gemm_config import GemmConfig
+        from quack.gemm_interface import gemm_dgated_tuned, gemm_gated_tuned, gemm_tuned
+        from functools import partial
+
+        def _fast_sm100_configs(epilogue=None):
+            tile_mn_cluster_vals = (
+                [(128, n, (1, 2)) for n in [128, 256]]
+                + [(256, n, (2, 1)) for n in [128, 256]]
+            )
+            GemmConfigCls = partial(GemmConfig, pingpong=False, device_capacity=10)
+            return [
+                GemmConfigCls(tile_m=m, tile_n=n, cluster_m=cm, cluster_n=cn,
+                              swap_ab=False, max_swizzle_size=8,
+                              is_dynamic_persistent=False, use_tma_gather=False)
+                for (m, n, (cm, cn)) in tile_mn_cluster_vals
+            ]
+
+        _gc._get_sm100_configs = _fast_sm100_configs
+        for _fn in (gemm_tuned, gemm_gated_tuned, gemm_dgated_tuned):
+            _fn.configs = [AutotuneConfig(config=c) for c in _gc.get_all_configs()]
+        gemm_gated_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_configs("gated")]
+        gemm_dgated_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_configs("gated")]
+
     @parameterized.expand(
         TestCommons.make_args_matrix(
             [torch.device("cuda")],
@@ -168,10 +196,9 @@ class MixedFp8TrainingTest(TestCommons):
         device: torch.device,
         problem_shape: tuple[int, int, int, int, int],
     ) -> None:
-        # Require SM100 (Blackwell) for MXFP8 block-scaled GEMMs
         cap = torch.cuda.get_device_capability()
-        if cap < (10, 0):
-            self.skipTest(f"mixed fp8 requires SM100+, got SM{cap[0]}{cap[1]}")
+        if cap < (9, 0):
+            self.skipTest(f"fp8 requires SM90+, got SM{cap[0]}{cap[1]}")
 
         self.set_seed(_SEED)
         T, H, I, E, K = problem_shape
@@ -192,8 +219,9 @@ class MixedFp8TrainingTest(TestCommons):
         w2 = moe.c_proj.weight.permute(1, 2, 0)  # (H, I, E)
         router_w = moe.router.weight
 
-        x_ref = 0.02 * torch.randn(T, H, device=device, dtype=dtype, requires_grad=True)
-        x_fp8 = x_ref.clone().detach().requires_grad_()
+        _x = (0.02 * torch.randn(T, H, device=device, dtype=dtype)).detach()
+        x_ref = _x.clone().requires_grad_(True)
+        x_fp8 = _x.clone().requires_grad_(True)
         dout = 0.02 * torch.randn(T, H, device=device, dtype=dtype)
 
         # bf16 reference forward + backward
@@ -204,7 +232,7 @@ class MixedFp8TrainingTest(TestCommons):
         o_ref.backward(dout)
         dx_ref = x_ref.grad.clone()
 
-        # mixed fp8 forward + bf16 backward
+        # fp8 forward + backward
         o_fp8, _, _ = moe_TC_softmax_topk_layer(
             x_fp8, router_w, w1, None, w2, None, K, None,
             ActivationType.SWIGLU, is_inference_mode_enabled=False, use_fp8=True,
@@ -212,6 +240,6 @@ class MixedFp8TrainingTest(TestCommons):
         o_fp8.backward(dout)
         dx_fp8 = x_fp8.grad.clone()
 
-        # Loose tolerance — mixed fp8 fwd, bf16 bwd
-        torch.testing.assert_close(o_fp8.float(), o_ref.float(), rtol=0.2, atol=0.2)
-        torch.testing.assert_close(dx_fp8.float(), dx_ref.float(), rtol=0.2, atol=0.2)
+        # ~10-15% mean relative error expected; atol covers near-zero elements.
+        torch.testing.assert_close(o_fp8.float(), o_ref.float(), rtol=0.2, atol=1e-5)
+        torch.testing.assert_close(dx_fp8.float(), dx_ref.float(), rtol=0.2, atol=1e-5)

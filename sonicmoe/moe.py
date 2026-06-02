@@ -209,6 +209,7 @@ class MoE(nn.Module):
         hidden_states: torch.Tensor,
         kernel_backend_moe: KernelBackendMoE = KernelBackendMoE.sonicmoe,
         is_inference_mode: bool = False,
+        use_fp8: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         original_shape = hidden_states.shape
 
@@ -227,6 +228,7 @@ class MoE(nn.Module):
                 self.stream_id,
                 self.activation_function,
                 is_inference_mode or not self.training,
+                use_fp8=use_fp8,
             )
         else:
             # hidden_states -> (total_q, hidden_size)

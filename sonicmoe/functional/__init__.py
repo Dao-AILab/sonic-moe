@@ -6,22 +6,31 @@ import os
 
 import torch
 import torch.nn.functional as F
+import cutlass
 from quack.gemm_interface import gemm, gemm_dgated, gemm_gated
+from quack.cute_dsl_utils import torch2cute_dtype_map
+
+# Extend quack's dtype dispatch to cover fp8 — the kernels support it
+# but the Python dispatch layer only maps bf16/fp16/fp32 by default.
+torch2cute_dtype_map[torch.float8_e4m3fn] = cutlass.Float8E4M3FN
+torch2cute_dtype_map[torch.float8_e5m2]   = cutlass.Float8E5M2
 
 from ..enums import ActivationType, is_glu
+from .backward import (
+    _down_projection_backward_act,
+    _token_broadcast_backward,
+    _topk_softmax_bwd,
+    _up_projection_backward_act,
+)
+from .forward import _router_forward, _topk_softmax_fwd
+from .triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
 
 _FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-_FP8_E5M2_MAX = torch.finfo(torch.float8_e5m2).max    # 57344.0
 
 
 def _to_fp8_e4m3(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scale = x.abs().amax().clamp(min=1e-12) / _FP8_E4M3_MAX
     return (x / scale).to(torch.float8_e4m3fn), scale
-
-
-def _to_fp8_e5m2(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    scale = x.abs().amax().clamp(min=1e-12) / _FP8_E5M2_MAX
-    return (x / scale).to(torch.float8_e5m2), scale
 
 
 def _apply_glu_act(h: torch.Tensor, activation_type: ActivationType, concat_layout: bool) -> torch.Tensor:
@@ -35,14 +44,6 @@ def _apply_glu_act(h: torch.Tensor, activation_type: ActivationType, concat_layo
         return F.gelu(gate.float()).to(gate.dtype) * up
     else:
         raise ValueError(f"unsupported activation for fp8 path: {activation_type}")
-from .backward import (
-    _down_projection_backward_act,
-    _token_broadcast_backward,
-    _topk_softmax_bwd,
-    _up_projection_backward_act,
-)
-from .forward import _router_forward, _topk_softmax_fwd
-from .triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
 
 
 class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
@@ -222,17 +223,19 @@ class _UpProjection(torch.autograd.Function):
         db1 = None if b1 is None else torch.empty_like(b1)
 
         if ctx.use_fp8:
-            w1_fp8, w1_sc = _to_fp8_e4m3(w1)
-            dh_fp8, dh_sc = _to_fp8_e5m2(dh)
+            assert b1 is None, "fp8 path does not support bias"
+            # Permute before quantizing: _to_fp8_e4m3 returns a contiguous tensor,
+            # so quantizing w1 as (2I,H,E) then permuting gives wrong K-major strides.
+            w1_fp8, w1_sc = _to_fp8_e4m3(w1.permute(2, 0, 1).contiguous())
+            dh_fp8, dh_sc = _to_fp8_e4m3(dh)
             x_fp8, x_sc = _to_fp8_e4m3(x)
-            _up_projection_backward_act(
-                w1=w1_fp8,
-                dx_expanded=dx_expanded,
-                dh=dh_fp8,
-                db1=db1,
-                expert_frequency_offset=expert_frequency_offset,
-                is_glu_activation=is_glu_activation,
-                concat_layout=concat_layout,
+            gemm(
+                dh_fp8,
+                w1_fp8,
+                cu_seqlens_m=expert_frequency_offset,
+                dynamic_scheduler=False,
+                out=dx_expanded,
+                concat_layout=(("B",) if concat_layout else None),
             )
             dx_expanded.mul_(w1_sc * dh_sc)
             gemm(
@@ -373,23 +376,25 @@ class _DownProjection(torch.autograd.Function):
         ds = torch.empty_like(topk_scores)
 
         if ctx.use_fp8:
-            dout_fp8, dout_sc = _to_fp8_e5m2(dout)
-            w2_fp8, w2_sc = _to_fp8_e4m3(w2)
-            _down_projection_backward_act(
-                dout=dout_fp8,
-                h=h,  # must stay bf16: gemm_dgated asserts PreAct.element_size() == 2
-                w2=w2_fp8,
-                dh=dh,
-                ds=ds,
-                b2=b2,
-                db2=db2,
-                a_prime=a_prime,
-                topk_scores=topk_scores,
-                expert_frequency_offset=expert_frequency_offset,
-                x_gather_idx=x_gather_idx,
-                s_scatter_idx=s_scatter_idx,
-                activation_type=activation_type.value,
+            assert b2 is None, "fp8 path does not support bias"
+            dout_fp8, dout_sc = _to_fp8_e4m3(dout)
+            # Permute before quantizing to preserve K-major strides (same issue as up-proj).
+            w2_fp8, w2_sc = _to_fp8_e4m3(w2.permute(2, 0, 1).contiguous())
+            s = topk_scores[s_scatter_idx]
+            _, _, ds_scattered = gemm_dgated(
+                dout_fp8,
+                w2_fp8,
+                PreAct=h,  # must stay bf16: gemm_dgated asserts PreAct.element_size() == 2
+                activation=activation_type.value,
+                dx_out=dh,
+                postact_out=a_prime,
+                colvec_scale=s,
+                colvec_reduce=True,
+                cu_seqlens_m=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                dynamic_scheduler=False,
             )
+            ds[s_scatter_idx] = ds_scattered * (dout_sc * w2_sc)
             dh.mul_(dout_sc * w2_sc)
             a_prime_fp8, ap_sc = _to_fp8_e4m3(a_prime)
             gemm(
