@@ -24,12 +24,14 @@ from sonicmoe.functional.distributed import (
     a2a_combine_triton,
     a2a_dispatch_triton,
     all_gather_copy_engine_async,
+    all_gather_multimem_triton,
     all_gather_triton,
     build_rank_dedup_a_idx,
     compute_dispatch_metadata,
     local_combine,
     rank_dedup_combine_triton,
     rank_dedup_dispatch_triton,
+    reduce_scatter_multimem_triton,
     reduce_scatter_triton,
 )
 from tests.test_commons import TestCommons
@@ -226,6 +228,77 @@ def _worker_reduce_scatter(rank, world_size, device):
                 fails.append(
                     f"RS T={T_local} d={d} dt={dtype}: "
                     f"{(tri != ref).sum().item()} differ, "
+                    f"max_diff={diff.max().item():.3e}"
+                )
+            del x, tri, ref, x_all, ref_fp32
+        torch.cuda.empty_cache()
+    return fails
+
+
+# ============================================================================
+# Worker: all_gather (multimem) — bit-exact vs dist.all_gather_into_tensor.
+# multimem.st is a raw bit copy, so it must match exactly. Requires NVLink
+# multicast support (NVLink SHARP / MNNVL); the shape is skipped otherwise.
+# ============================================================================
+
+
+def _worker_all_gather_multimem(rank, world_size, device):
+    fails = []
+    for T_local, d, K, E_local in _SHAPES:
+        for dtype in (torch.bfloat16, torch.float32):
+            x = _alloc_symm((T_local, d), dtype, device)
+            x.normal_()
+            _barrier(x)
+
+            # multimem AG allocates a multicast-backed symm output internally.
+            if _symm_mem.rendezvous(x, group=dist.group.WORLD.group_name).multicast_ptr == 0:
+                del x
+                continue  # no multicast support on this fabric
+
+            tri = all_gather_multimem_triton(x, dist.group.WORLD)
+            ref = torch.empty(world_size * T_local, d, dtype=dtype, device=device)
+            dist.all_gather_into_tensor(ref, x, group=dist.group.WORLD)
+            if not torch.equal(tri, ref):
+                fails.append(f"AG-mm T={T_local} d={d} dt={dtype}: {(tri != ref).sum().item()} differ")
+            del x, tri, ref
+        torch.cuda.empty_cache()
+    return fails
+
+
+# ============================================================================
+# Worker: reduce_scatter (multimem) — multimem.ld_reduce reduces in the
+# buffer dtype (bf16 in bf16, fp32 in fp32) with hardware-defined order, so
+# compare with a tolerance rather than bit-exactly. Requires multicast.
+# ============================================================================
+
+
+def _worker_reduce_scatter_multimem(rank, world_size, device):
+    fails = []
+    for T_local, d, K, E_local in _SHAPES:
+        for dtype in (torch.bfloat16, torch.float32):
+            x = _alloc_symm((world_size * T_local, d), dtype, device)
+            x.normal_()
+            _barrier(x)
+
+            if _symm_mem.rendezvous(x, group=dist.group.WORLD.group_name).multicast_ptr == 0:
+                del x
+                continue  # no multicast support on this fabric
+
+            tri = reduce_scatter_multimem_triton(x, dist.group.WORLD)
+
+            x_all = all_gather_triton(x, dist.group.WORLD).view(world_size, world_size * T_local, d)
+            ref_fp32 = torch.zeros(T_local, d, dtype=torch.float32, device=device)
+            for p in range(world_size):
+                ref_fp32 += x_all[p, rank * T_local : (rank + 1) * T_local].to(torch.float32)
+            ref = ref_fp32.to(dtype)
+
+            # bf16 hardware reduction accumulates in bf16 → looser tol than fp32.
+            atol, rtol = (2e-1, 5e-2) if dtype == torch.bfloat16 else (1e-3, 1e-4)
+            if not torch.allclose(tri, ref, atol=atol, rtol=rtol):
+                diff = (tri.float() - ref.float()).abs()
+                fails.append(
+                    f"RS-mm T={T_local} d={d} dt={dtype}: "
+                    f"{(~torch.isclose(tri, ref, atol=atol, rtol=rtol)).sum().item()} differ, "
                     f"max_diff={diff.max().item():.3e}"
                 )
             del x, tri, ref, x_all, ref_fp32
@@ -701,6 +774,14 @@ class EPCollectivesTest(TestCommons):
 
     def test_reduce_scatter(self) -> None:
         fails = _run_worker_collect_failures(_worker_reduce_scatter)
+        self.assertEqual(fails, [], "\n" + "\n".join(fails))
+
+    def test_all_gather_multimem(self) -> None:
+        fails = _run_worker_collect_failures(_worker_all_gather_multimem)
+        self.assertEqual(fails, [], "\n" + "\n".join(fails))
+
+    def test_reduce_scatter_multimem(self) -> None:
+        fails = _run_worker_collect_failures(_worker_reduce_scatter_multimem)
         self.assertEqual(fails, [], "\n" + "\n".join(fails))
 
     def test_a2a_dispatch(self) -> None:

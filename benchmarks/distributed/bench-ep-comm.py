@@ -61,12 +61,14 @@ from torch.distributed import _symmetric_memory as _symm_mem
 from sonicmoe.functional.distributed import (
     a2a_combine_triton,
     a2a_dispatch_triton,
+    all_gather_multimem_triton,
     all_gather_triton,
     build_rank_dedup_a_idx,
     compute_dispatch_metadata,
     local_combine,
     rank_dedup_combine_triton,
     rank_dedup_dispatch_triton,
+    reduce_scatter_multimem_triton,
     reduce_scatter_triton,
 )
 
@@ -408,21 +410,37 @@ def phase_ag_dispatch(rank, world_size, device, args):
         x.normal_()
         _barrier(x)
         out_ncl = torch.empty(world_size * cfg.T_local, cfg.d, dtype=cfg.dtype, device=device)
+        # Pre-allocate the multimem output once (multicast-backed symm buffer)
+        # so timing excludes allocation. None if the fabric lacks multicast.
+        out_mm = _alloc_symm((world_size * cfg.T_local, cfg.d), cfg.dtype, device)
+        has_mc = _symm_mem.rendezvous(x, group=dist.group.WORLD.group_name).multicast_ptr != 0
         _flush_async_errors()
 
         def tri_call():
             all_gather_triton(x, dist.group.WORLD)
+
+        # fence=False: time the pure multicast transfer, matching unicast AG
+        # and both RS paths (no per-call barrier in the timed body). do_bench's
+        # trailing cuda sync still captures store completion.
+        def mm_call():
+            all_gather_multimem_triton(x, dist.group.WORLD, out=out_mm, fence=False)
 
         def ncl_call():
             dist.all_gather_into_tensor(out_ncl, x, group=dist.group.WORLD)
 
         t_tri = bench_fn(tri_call, warmup=args.warmup, repeat=args.repeat)
         _post_bench_sync()
+        t_mm = bench_fn(mm_call, warmup=args.warmup, repeat=args.repeat) if has_mc else float("nan")
+        _post_bench_sync()
         t_ncl = bench_fn(ncl_call, warmup=args.warmup, repeat=args.repeat)
         _post_bench_sync()
 
         elem = x.element_size()
+        # Delivered bytes: (W-1) chunks received per rank — shared apples-to-apples
+        # numerator across all paths. Effective egress: 1 chunk — multimem's source
+        # only egresses its own chunk (the switch replicates), vs unicast's (W-1)x.
         nv_bytes = (world_size - 1) * cfg.T_local * cfg.d * elem
+        egress_bytes = cfg.T_local * cfg.d * elem
 
         rows.append(
             [
@@ -430,18 +448,22 @@ def phase_ag_dispatch(rank, world_size, device, args):
                 f"{cfg.T_local}",
                 f"{cfg.d}",
                 f"{t_tri*1e3:.1f}",
+                f"{t_mm*1e3:.1f}",
                 f"{t_ncl*1e3:.1f}",
                 f"{_gbps(nv_bytes, t_tri):.0f}",
+                f"{_gbps(nv_bytes, t_mm):.0f}",
                 f"{_gbps(nv_bytes, t_ncl):.0f}",
+                f"{_gbps(egress_bytes, t_mm):.0f}",
             ]
         )
-        del x, out_ncl, tri_call, ncl_call
+        del x, out_ncl, out_mm, tri_call, mm_call, ncl_call
         _iter_cleanup()
 
     _print_table(
         rank,
-        f"AG dispatch: Triton vs NCCL (W={world_size})",
-        ["name", "T_local", "d", "Triton µs", "NCCL µs", "Triton NVLink GB/s", "NCCL NVLink GB/s"],
+        f"AG dispatch: cp.async vs multimem vs NCCL (W={world_size})",
+        ["name", "T_local", "d", "cp.async µs", "multimem µs", "NCCL µs",
+         "cp.async GB/s", "multimem GB/s", "NCCL GB/s", "multimem egress GB/s"],
         rows,
     )
 
@@ -523,8 +545,8 @@ def phase_a2a_dispatch(rank, world_size, device, args):
 
     _print_table(
         rank,
-        f"A2A dispatch: Triton vs NCCL (W={world_size})",
-        ["name", "T_local", "d", "K", "E", "Triton µs", "NCCL µs", "Triton NVLink GB/s", "NCCL NVLink GB/s"],
+        f"A2A dispatch: cp.async vs NCCL (W={world_size})",
+        ["name", "T_local", "d", "K", "E", "cp.async µs", "NCCL µs", "cp.async NVLink GB/s", "NCCL NVLink GB/s"],
         rows,
     )
 
@@ -758,22 +780,33 @@ def phase_reduce_scatter(rank, world_size, device, args):
         _barrier(x)
 
         out_tri = torch.empty(cfg.T_local, cfg.d, dtype=cfg.dtype, device=device)
+        out_mm = torch.empty(cfg.T_local, cfg.d, dtype=cfg.dtype, device=device)
         out_ncl = torch.empty(cfg.T_local, cfg.d, dtype=cfg.dtype, device=device)
+        has_mc = _symm_mem.rendezvous(x, group=dist.group.WORLD.group_name).multicast_ptr != 0
         _flush_async_errors()
 
         def tri_call():
             reduce_scatter_triton(x, dist.group.WORLD, out=out_tri)
+
+        def mm_call():
+            reduce_scatter_multimem_triton(x, dist.group.WORLD, out=out_mm)
 
         def ncl_call():
             dist.reduce_scatter_tensor(out_ncl, x, group=dist.group.WORLD)
 
         t_tri = bench_fn(tri_call, warmup=args.warmup, repeat=args.repeat)
         _post_bench_sync()
+        t_mm = bench_fn(mm_call, warmup=args.warmup, repeat=args.repeat) if has_mc else float("nan")
+        _post_bench_sync()
         t_ncl = bench_fn(ncl_call, warmup=args.warmup, repeat=args.repeat)
         _post_bench_sync()
 
         elem = x.element_size()
+        # Delivered: (W-1) chunks reduced per rank — shared apples-to-apples
+        # numerator. Effective ingress: 1 chunk — multimem's ld_reduce returns
+        # one switch-reduced chunk to the receiver vs unicast reading (W-1)x.
         nv_bytes = (world_size - 1) * cfg.T_local * cfg.d * elem
+        ingress_bytes = cfg.T_local * cfg.d * elem
 
         rows.append(
             [
@@ -781,18 +814,22 @@ def phase_reduce_scatter(rank, world_size, device, args):
                 f"{cfg.T_local}",
                 f"{cfg.d}",
                 f"{t_tri*1e3:.1f}",
+                f"{t_mm*1e3:.1f}",
                 f"{t_ncl*1e3:.1f}",
                 f"{_gbps(nv_bytes, t_tri):.0f}",
+                f"{_gbps(nv_bytes, t_mm):.0f}",
                 f"{_gbps(nv_bytes, t_ncl):.0f}",
+                f"{_gbps(ingress_bytes, t_mm):.0f}",
             ]
         )
-        del x, out_tri, out_ncl, tri_call, ncl_call
+        del x, out_tri, out_mm, out_ncl, tri_call, mm_call, ncl_call
         _iter_cleanup()
 
     _print_table(
         rank,
-        f"RS: Triton vs NCCL (W={world_size})",
-        ["name", "T_local", "d", "Triton µs", "NCCL µs", "Triton NVLink GB/s", "NCCL NVLink GB/s"],
+        f"RS: cp.async vs multimem vs NCCL (W={world_size})",
+        ["name", "T_local", "d", "cp.async µs", "multimem µs", "NCCL µs",
+         "cp.async GB/s", "multimem GB/s", "NCCL GB/s", "multimem ingress GB/s"],
         rows,
     )
 
@@ -904,8 +941,8 @@ def phase_a2a_combine(rank, world_size, device, args):
 
     _print_table(
         rank,
-        f"A2A combine: Triton vs NCCL (W={world_size})",
-        ["name", "T_local", "d", "K", "E", "Triton µs", "NCCL µs", "Triton NVLink GB/s", "NCCL NVLink GB/s"],
+        f"A2A combine: cp.async vs NCCL (W={world_size})",
+        ["name", "T_local", "d", "K", "E", "cp.async µs", "NCCL µs", "cp.async NVLink GB/s", "NCCL NVLink GB/s"],
         rows,
     )
 

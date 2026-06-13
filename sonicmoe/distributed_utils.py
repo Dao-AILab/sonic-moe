@@ -46,6 +46,10 @@ class DispatchMode(str, Enum):
     AG_DISPATCH_TRITON = "AG_DISPATCH_TRITON"
     A2A_DISPATCH_TRITON = "A2A_DISPATCH_TRITON"
     RANK_DEDUP_DISPATCH_TRITON = "RANK_DEDUP_DISPATCH_TRITON"
+    # AG via NVLink multicast (multimem.st). Same all-gather semantics as
+    # AG_DISPATCH_TRITON; the gather rides the multicast fabric instead of
+    # per-peer unicast reads. Requires NVLink SHARP / MNNVL multicast support.
+    AG_DISPATCH_MULTIMEM_TRITON = "AG_DISPATCH_MULTIMEM_TRITON"
 
 
 class CombineMode(str, Enum):
@@ -54,10 +58,20 @@ class CombineMode(str, Enum):
     A2A_COMBINE_TRITON = "A2A_COMBINE_TRITON"
     RS_COMBINE_TRITON = "RS_COMBINE_TRITON"
     RANK_DEDUP_COMBINE_TRITON = "RANK_DEDUP_COMBINE_TRITON"
+    # local_combine producer + reduce-scatter via NVLink multicast
+    # (multimem.ld_reduce). Same combine semantics as RS_COMBINE_TRITON; the
+    # reduce-scatter rides the multicast fabric. Requires multicast support.
+    RS_COMBINE_MULTIMEM_TRITON = "RS_COMBINE_MULTIMEM_TRITON"
 
 
 def _is_ag_dispatch_mode(mode: DispatchMode) -> bool:
-    return mode == DispatchMode.AG_DISPATCH_TRITON
+    # Both AG variants share the same dispatch metadata + gather-GEMM path;
+    # they differ only in which all-gather primitive moves the bytes.
+    return mode in (DispatchMode.AG_DISPATCH_TRITON, DispatchMode.AG_DISPATCH_MULTIMEM_TRITON)
+
+
+def _is_ag_dispatch_multimem_mode(mode: DispatchMode) -> bool:
+    return mode == DispatchMode.AG_DISPATCH_MULTIMEM_TRITON
 
 
 def _is_a2a_dispatch_mode(mode: DispatchMode) -> bool:
@@ -73,7 +87,13 @@ def _is_a2a_combine_mode(mode: CombineMode) -> bool:
 
 
 def _is_rs_combine_mode(mode: CombineMode) -> bool:
-    return mode == CombineMode.RS_COMBINE_TRITON
+    # Both RS variants share the local_combine producer + reduce-scatter
+    # structure; they differ only in the reduce-scatter primitive.
+    return mode in (CombineMode.RS_COMBINE_TRITON, CombineMode.RS_COMBINE_MULTIMEM_TRITON)
+
+
+def _is_rs_combine_multimem_mode(mode: CombineMode) -> bool:
+    return mode == CombineMode.RS_COMBINE_MULTIMEM_TRITON
 
 
 def _is_rank_dedup_combine_mode(mode: CombineMode) -> bool:

@@ -459,3 +459,240 @@ def all_gather_copy_engine_async(x, peer_bufs, my_rank, out=None, num_streams=2)
         )
 
     return CEHandle(out, streams)
+
+
+# Adapted from https://github.com/yifuwang/symm-mem-recipes/tree/main
+
+# ============================================================================
+# multimem AG / RS — NVLink SHARP multicast collectives.
+# ----------------------------------------------------------------------------
+# These mirror all_gather_triton / reduce_scatter_triton but issue the
+# transfer through the symm-mem *multicast* pointer instead of per-peer
+# unicast reads. One multimem.st fans a 128-bit write out to every peer's
+# buffer in a single instruction; one multimem.ld_reduce pulls + sums the
+# same 128-bit slot across every peer in a single instruction (the switch /
+# NVLink-SHARP does the reduction). Both operate on 16-byte (128-bit) packs,
+# so buffers must be 16-byte aligned and their byte size a multiple of 16
+# (always true for the (T_local, d) shapes here).
+#
+# Numerics:
+#   * AG is a pure bit copy → bit-exact vs all_gather_triton / NCCL.
+#   * RS reduces in the multicast unit. bf16 reduces in bf16 (add.v4.bf16x2),
+#     fp32 in fp32 (add.v4.f32); summation order across peers is
+#     hardware-defined, so bf16 RS is NOT bit-exact vs the fp32-accum
+#     reduce_scatter_triton — compare with a tolerance.
+#
+# Reference PTX patterns: github.com/yifuwang/symm-mem-recipes.
+# ============================================================================
+
+# Throughput-only tuning. These kernels are NVLink-bandwidth-bound, so the
+# levers that matter are the ones that keep enough multimem ops in flight to
+# saturate the link: num_warps (issue width / occupancy), BLOCK_SIZE (per-thread
+# ILP) and num_stages (prefetch). Grid size is NOT a throughput lever — a
+# one-pass grid (cdiv(n_packs, BLOCK_SIZE)) already fills every SM — so we do
+# not tune it.
+_MULTIMEM_CONFIGS = [
+    triton.Config({"BLOCK_SIZE": bs}, num_warps=nw, num_stages=ns)
+    for bs in [2048, 4096, 8192]
+    for nw in [4, 8, 16, 32]
+    for ns in [2, 3]
+    if 1 <= bs // (nw * 32) <= 16
+]
+
+
+@triton.jit
+def _multimem_st_v4(mc_ptr, x0, x1, x2, x3, mask):
+    """Store one 128-bit pack {x0,x1,x2,x3} to the multicast address, fanning
+    the write out to every peer's buffer. Raw bit copy (.v4.f32 over b32
+    registers), so dtype-agnostic. No-op where mask == 0."""
+    tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            setp.eq.s32 %p0, $6, 1;
+            @!%p0 bra end;
+            multimem.st.relaxed.sys.global.v4.f32 [$1], {$2, $3, $4, $5};
+            end:
+        }
+        """,
+        "=r,l,r,r,r,r,r",
+        args=[mc_ptr, x0, x1, x2, x3, mask.to(tl.int32)],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _multimem_ld_reduce_v4_bf16(mc_ptr, mask):
+    """Load + bf16 sum-reduce one 128-bit pack (8 bf16) across all peers."""
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            setp.eq.s32 %p0, $5, 1;
+            @!%p0 bra end;
+            multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {$0, $1, $2, $3}, [$4];
+            end:
+        }
+        """,
+        "=r,=r,=r,=r,l,r",
+        args=[mc_ptr, mask.to(tl.int32)],
+        dtype=(tl.uint32, tl.uint32, tl.uint32, tl.uint32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _multimem_ld_reduce_v4_f32(mc_ptr, mask):
+    """Load + fp32 sum-reduce one 128-bit pack (4 fp32) across all peers."""
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            setp.eq.s32 %p0, $5, 1;
+            @!%p0 bra end;
+            multimem.ld_reduce.relaxed.sys.global.add.v4.f32 {$0, $1, $2, $3}, [$4];
+            end:
+        }
+        """,
+        "=r,=r,=r,=r,l,r",
+        args=[mc_ptr, mask.to(tl.int32)],
+        dtype=(tl.uint32, tl.uint32, tl.uint32, tl.uint32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.autotune(configs=_MULTIMEM_CONFIGS, key=["n_packs"])
+@triton.jit
+def _all_gather_multimem_kernel(
+    x_u32_ptr,  # (numel_local // 2 or // 1) uint32 — this rank's local source
+    out_mc_ptr,  # multicast base address (int) of the (W*T_local, d) output
+    n_packs,  # 128-bit packs in this rank's chunk
+    my_rank: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """out_symm[my_rank*chunk : (my_rank+1)*chunk] ← x, fanned out to all peers
+    via multimem.st. One pack per lane, one coalesced 128-bit load of the source."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_packs
+    u32 = offs * 4
+    x0 = tl.load(x_u32_ptr + u32 + 0, mask=mask)
+    x1 = tl.load(x_u32_ptr + u32 + 1, mask=mask)
+    x2 = tl.load(x_u32_ptr + u32 + 2, mask=mask)
+    x3 = tl.load(x_u32_ptr + u32 + 3, mask=mask)
+    dst_pack = my_rank * n_packs + offs
+    mc_u64 = out_mc_ptr.to(tl.pointer_type(tl.uint64))
+    _multimem_st_v4(mc_u64 + dst_pack * 2, x0, x1, x2, x3, mask)
+
+
+@triton.autotune(configs=_MULTIMEM_CONFIGS, key=["n_packs"])
+@triton.jit
+def _reduce_scatter_multimem_kernel(
+    x_mc_ptr,  # multicast base address (int) of the (W*T_local, d) input
+    out_u32_ptr,  # (T_local*d ... ) uint32 — this rank's local output chunk
+    n_packs,  # 128-bit packs in this rank's chunk
+    my_rank: tl.constexpr,
+    IS_BF16: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """out ← Σ_peers x_symm[my_rank*chunk : (my_rank+1)*chunk] via
+    multimem.ld_reduce. One pack per lane, one coalesced 128-bit store of the result."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_packs
+    src_pack = my_rank * n_packs + offs
+    mc = x_mc_ptr.to(tl.pointer_type(tl.uint64)) + src_pack * 2
+    if IS_BF16:
+        x0, x1, x2, x3 = _multimem_ld_reduce_v4_bf16(mc, mask)
+    else:
+        x0, x1, x2, x3 = _multimem_ld_reduce_v4_f32(mc, mask)
+    u32 = offs * 4
+    tl.store(out_u32_ptr + u32 + 0, x0, mask=mask)
+    tl.store(out_u32_ptr + u32 + 1, x1, mask=mask)
+    tl.store(out_u32_ptr + u32 + 2, x2, mask=mask)
+    tl.store(out_u32_ptr + u32 + 3, x3, mask=mask)
+
+
+def _n_packs(numel: int, elem_size: int) -> int:
+    nbytes = numel * elem_size
+    assert nbytes % 16 == 0, f"multimem requires 16-byte-aligned size, got {nbytes} bytes"
+    return nbytes // 16
+
+
+def all_gather_multimem_triton(x_symm, group, out=None, hdl=None, out_hdl=None, fence=True):
+    """All-gather via NVLink multicast (multimem.st). Bit-exact vs
+    all_gather_triton. Output is a symm-mem buffer with multicast support.
+
+    Caller contract: x_symm holds this rank's data. The kernel reads x
+    locally and pushes it to every peer's ``out`` via multicast. AG is a
+    PUSH, so a post-barrier is required before the gathered result is read.
+
+    ``fence`` (default True) issues that post-barrier. Pass fence=False only
+    when the caller fences externally (e.g. a benchmark timing the pure
+    transfer, or a caller batching several pushes before one barrier).
+    """
+    if hdl is None:
+        hdl = rendezvous(x_symm, group)
+    W = hdl.world_size
+    my_rank = hdl.rank
+    T_local = x_symm.shape[0]
+    tail = tuple(x_symm.shape[1:])
+    if out is None:
+        out = symm_mem.empty((W * T_local,) + tail, dtype=x_symm.dtype, device=x_symm.device)
+    if out_hdl is None:
+        out_hdl = rendezvous(out, group)
+    assert out_hdl.multicast_ptr != 0, "multimem AG needs multicast support (NVLink SHARP / MNNVL)"
+
+    n_packs = _n_packs(x_symm.numel(), x_symm.element_size())
+    x_u32 = x_symm.reshape(-1).view(torch.int32)
+    grid = lambda META: (triton.cdiv(n_packs, META["BLOCK_SIZE"]),)
+    _all_gather_multimem_kernel[grid](
+        x_u32,
+        out_hdl.multicast_ptr,
+        n_packs=n_packs,
+        my_rank=my_rank,
+    )
+    # Fence: every peer's multicast write into `out` must land before any
+    # rank reads the gathered result. Skippable when the caller fences itself.
+    if fence:
+        out_hdl.barrier()
+    return out
+
+
+def reduce_scatter_multimem_triton(x_symm, group, out=None, hdl=None, my_rank=None):
+    """Sum-reduce-scatter via NVLink multicast (multimem.ld_reduce). Reduces
+    in the buffer dtype (bf16 in bf16, fp32 in fp32), so bf16 results are not
+    bit-exact vs the fp32-accum reduce_scatter_triton.
+
+    Caller contract: x_symm has been written and a barrier issued before the
+    call (peers' bytes are read via the multicast load).
+    """
+    if hdl is None:
+        hdl = rendezvous(x_symm, group)
+    W = hdl.world_size
+    my_rank = hdl.rank if my_rank is None else my_rank
+    assert hdl.multicast_ptr != 0, "multimem RS needs multicast support (NVLink SHARP / MNNVL)"
+    assert x_symm.shape[0] % W == 0, f"reduce_scatter: x_symm.shape[0]={x_symm.shape[0]} not divisible by W={W}"
+    assert x_symm.dtype in (torch.bfloat16, torch.float32), "multimem RS supports bf16 / fp32 only"
+
+    T_local = x_symm.shape[0] // W
+    out_shape = (T_local,) + tuple(x_symm.shape[1:])
+    if out is None:
+        out = torch.empty(out_shape, dtype=x_symm.dtype, device=x_symm.device)
+
+    chunk_numel = out.numel()  # elements in this rank's chunk
+    n_packs = _n_packs(chunk_numel, x_symm.element_size())
+    out_u32 = out.reshape(-1).view(torch.int32)
+    grid = lambda META: (triton.cdiv(n_packs, META["BLOCK_SIZE"]),)
+    _reduce_scatter_multimem_kernel[grid](
+        hdl.multicast_ptr,
+        out_u32,
+        n_packs=n_packs,
+        my_rank=my_rank,
+        IS_BF16=(x_symm.dtype == torch.bfloat16),
+    )
+    return out
