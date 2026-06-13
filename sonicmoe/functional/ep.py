@@ -262,20 +262,18 @@ class _MoeEPFunction(torch.autograd.Function):
     Forward: dispatch x → up-proj GEMM (gemm_gated) → down-proj GEMM →
     NVLink-gather combine → y_local.
 
-    Backward: dispatch do (configured mode) → start AG-CE x redispatch
-    on a side stream if ``redispatch_x_in_backward`` else reuse saved
-    x_compute → all-gather scores → gemm_dgated (→ dh, ds, a_prime)
-    → dW2 → reduce-scatter ds → up-proj-backward (writes dx_expanded
-    into y_symm) → cross-rank gather to dx_local → join CE → dW1.
+    Backward: dispatch do (configured mode) → reuse saved x_compute →
+    all-gather scores → gemm_dgated (→ dh, ds, a_prime) → dW2 →
+    reduce-scatter ds → up-proj-backward (writes dx_expanded into
+    y_symm) → cross-rank gather to dx_local → dW1.
 
     Caches across the autograd boundary:
       - h: (total_m, H_act), where ``total_m = max_rows_per_rank_runtime``
         (= synced ``valid_rows`` under ``CPU_sync_on_runtime``,
         ``MAX_ROWS_PER_RANK_STATIC`` otherwise). gemm_gated / gemm_dgated
         strict-check ``preact.shape[0] == total_m``.
-      - x_compute: replaced with x_local (T_local, H) under
-        ``redispatch_x_in_backward``; otherwise (W·T_local, H) for AG /
-        RANK_DEDUP and (total_m, H) for A2A.
+      - x_compute: (W·T_local, H) for AG / RANK_DEDUP and (total_m, H)
+        for A2A.
     """
 
     @staticmethod
@@ -292,7 +290,6 @@ class _MoeEPFunction(torch.autograd.Function):
         activation_type: ActivationType,
         is_inference_mode_enabled: bool,
         concat_layout: bool,
-        redispatch_x_in_backward: bool,
         CPU_sync_on_runtime: bool,
         ep_ws,
     ) -> torch.Tensor:
@@ -323,7 +320,6 @@ class _MoeEPFunction(torch.autograd.Function):
         H_act = 2 * I if is_glu_act else I
 
         if is_inference_mode_enabled:
-            redispatch_x_in_backward = False
             CPU_sync_on_runtime = False
 
         # Row count every per-call allocation in this forward uses for
@@ -339,9 +335,8 @@ class _MoeEPFunction(torch.autograd.Function):
         # ====================================================================
         # 1. Dispatch x → x_compute
         # ====================================================================
-        if is_inference_mode_enabled or redispatch_x_in_backward:
-            # x_compute isn't saved-for-backward on these paths
-            # (inference saves nothing; redispatch saves x_local), so
+        if is_inference_mode_enabled:
+            # x_compute isn't saved-for-backward in inference mode, so
             # reuse the workspace recv buffer where available.
             if _is_ag_dispatch_mode(dispatch_mode):
                 ws_buf = ep_ws.ag_compute
@@ -485,10 +480,9 @@ class _MoeEPFunction(torch.autograd.Function):
         # ====================================================================
         if not is_inference_mode_enabled:
             # h, a are alloc'd fresh at the runtime row count (step 2);
-            # cache-path x_compute is alloc'd fresh in step 1; redispatch
-            # path saves x_local instead.
+            # x_compute is alloc'd fresh in step 1.
             ctx.save_for_backward(
-                x_local if redispatch_x_in_backward else x_compute,
+                x_compute,
                 w1,
                 b1,
                 w2,
@@ -500,7 +494,6 @@ class _MoeEPFunction(torch.autograd.Function):
             ctx.meta = meta
             ctx.activation_type = activation_type
             ctx.concat_layout = concat_layout
-            ctx.redispatch_x_in_backward = redispatch_x_in_backward
             ctx.CPU_sync_on_runtime = CPU_sync_on_runtime
             ctx.max_rows_per_rank_runtime = max_rows_per_rank_runtime
             ctx.ep_ws = ep_ws
@@ -516,9 +509,9 @@ class _MoeEPFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout_local: torch.Tensor):
-        # 14 forward inputs → 14 grads (only the first 6 are tensor inputs).
+        # 13 forward inputs → 13 grads (only the first 6 are tensor inputs).
         (
-            x_local_or_compute,
+            x_compute,
             w1,
             b1,
             w2,
@@ -535,7 +528,6 @@ class _MoeEPFunction(torch.autograd.Function):
         TK_global = W * T_local * K
         activation_type = ctx.activation_type
         concat_layout = ctx.concat_layout
-        redispatch = ctx.redispatch_x_in_backward
         cpu_synced = ctx.CPU_sync_on_runtime
         # Metadata tensors (no autograd flow).
         expert_frequency_offset = meta["expert_frequency_offset"]
@@ -544,7 +536,6 @@ class _MoeEPFunction(torch.autograd.Function):
         my_dst_rank = meta["my_dst_rank"]
         recv_pos = meta["recv_pos"]
         dst_rank_flat = meta["dst_rank_flat"]
-        x_gather_idx_ag_for_dw1 = meta["x_gather_idx_ag_for_dw1"]
         pair_present_mask = meta.get("pair_present_mask")
         rank_dedup_recv_pos = meta.get("rank_dedup_recv_pos")
         peer_present_mask = meta.get("peer_present_mask")
@@ -561,11 +552,9 @@ class _MoeEPFunction(torch.autograd.Function):
         # ====================================================================
         # 1. Dispatch do_local → dout_dispatched
         # ====================================================================
-        if redispatch:
-            ep_ws._ensure_do_symm()
-            do_buf, do_hdl, do_peer_bufs = ep_ws.do_symm, ep_ws.do_hdl, ep_ws.do_peer_bufs
-        else:
-            do_buf, do_hdl, do_peer_bufs = ep_ws.x_symm, ep_ws.x_hdl, ep_ws.x_peer_bufs
+        # The forward x dispatch is the last consumer of x_symm, so the
+        # backward freely reuses it to publish dout for the dO dispatch.
+        do_buf, do_hdl, do_peer_bufs = ep_ws.x_symm, ep_ws.x_hdl, ep_ws.x_peer_bufs
         do_buf.copy_(dout_local)
         do_hdl.barrier()
 
@@ -591,27 +580,7 @@ class _MoeEPFunction(torch.autograd.Function):
         )
 
         # ====================================================================
-        # 2. Recover x_compute at the shape dW1 will consume
-        # ====================================================================
-        # Two mutually-exclusive paths, joined right before dW1:
-        #   (a) redispatch=True: AG-CE all-gather of saved x_local on a Copy-Engine stream
-        #   (b) cache otherwise: saved x_compute is already dW1-ready
-        # Started here (right after do dispatch) so (a) overlaps with the rest of the backward.
-        ce_handle = None
-        if redispatch:
-            x_local = x_local_or_compute  # (T_local, H)
-            ce_handle = all_gather_copy_engine_async(
-                x_local,
-                peer_bufs=ep_ws.x_peer_bufs,
-                my_rank=ep_ws.my_rank,
-                out=ep_ws._ag_redispatch_buf,
-            )
-            x_compute = ce_handle.out
-        else:
-            x_compute = x_local_or_compute
-
-        # ====================================================================
-        # 3. All-gather topk scores (or reuse the forward's cached AG)
+        # 2. All-gather topk scores (or reuse the forward's cached AG)
         # ====================================================================
         # Forward step 4's RS- or RANK_DEDUP-combine path already AGs
         # scores; if so it cached the result on ``ctx.scores_global``.
@@ -632,7 +601,7 @@ class _MoeEPFunction(torch.autograd.Function):
             )
 
         # ====================================================================
-        # 4. Down-proj backward act (gemm_dgated): dh, ds, a_prime
+        # 3. Down-proj backward act (gemm_dgated): dh, ds, a_prime
         # ====================================================================
         dh = torch.empty_like(h)
         ds = torch.zeros(TK_global, dtype=topk_scores_global.dtype, device=device)
@@ -686,7 +655,7 @@ class _MoeEPFunction(torch.autograd.Function):
         )
 
         # ====================================================================
-        # 5. dW2 GEMM
+        # 4. dW2 GEMM
         # ====================================================================
         dw2 = torch.empty_like(w2)
         gemm(
@@ -701,7 +670,7 @@ class _MoeEPFunction(torch.autograd.Function):
         del dout_dispatched, dout_for_kernel, a_prime, h, topk_scores_global
 
         # ====================================================================
-        # 6. Reduce-scatter ds → ds_local
+        # 5. Reduce-scatter ds → ds_local
         # ====================================================================
         ds_local = torch.empty(T_local * K, dtype=ds.dtype, device=ds.device)
         dist.reduce_scatter_tensor(
@@ -713,7 +682,7 @@ class _MoeEPFunction(torch.autograd.Function):
         ds_local = ds_local.view(T_local, K)
 
         # ====================================================================
-        # 7. Up-proj backward act: dh → dx_expanded (in y_symm), db1
+        # 6. Up-proj backward act: dh → dx_expanded (in y_symm), db1
         # ====================================================================
         dw1 = torch.empty_like(w1)
         db1 = None if b1 is None else torch.empty_like(b1)
@@ -728,7 +697,7 @@ class _MoeEPFunction(torch.autograd.Function):
         )
 
         # ====================================================================
-        # 8. Cross-rank combine of dx_expanded → dx_local
+        # 7. Cross-rank combine of dx_expanded → dx_local
         # ====================================================================
         dx_local = _do_combine(
             ep_ws,
@@ -745,25 +714,14 @@ class _MoeEPFunction(torch.autograd.Function):
         )
 
         # ====================================================================
-        # 9. Join the x_compute recovery (step 2) before dW1
-        # ====================================================================
-        if ce_handle is not None:
-            ce_handle.wait()
-
-        # ====================================================================
-        # 10. dW1 GEMM
+        # 8. dW1 GEMM
         # ====================================================================
         # K dim is the slot count, bounded to total_m by cu_seqlens_k.
-        # Three-way A_idx selection (analogous to up-proj) when the
-        # cached path is in use; redispatch overrides because AG-CE
-        # produces an AG-shaped x_compute regardless of forward mode.
-        #   redispatch       — AG layout; A_idx=x_gather_idx_ag_for_dw1.
+        # Three-way A_idx selection (analogous to up-proj):
         #   A2A_DISPATCH_TRITON       — expert-grouped layout; A_idx=None.
         #   RANK_DEDUP_DISPATCH_TRITON — packed-by-source layout; A_idx=x_idx_expanded_remap_for_rank_dedup.
         #   AG_DISPATCH_TRITON        — per-token layout; A_idx=x_gather_idx.
-        if redispatch:
-            a_idx_for_dw1 = x_gather_idx_ag_for_dw1[:max_rows_per_rank_runtime]
-        elif _is_a2a_dispatch_mode(dispatch_mode):
+        if _is_a2a_dispatch_mode(dispatch_mode):
             a_idx_for_dw1 = None
         elif _is_rank_dedup_dispatch_mode(dispatch_mode):
             a_idx_for_dw1 = x_idx_expanded_remap_for_rank_dedup[:max_rows_per_rank_runtime]
@@ -791,7 +749,7 @@ class _MoeEPFunction(torch.autograd.Function):
             dw2,
             db2,
             ds_local,
-            *([None] * 8),
+            *([None] * 7),
         )
 
 
@@ -850,11 +808,10 @@ def _moe_ep_forward_inner(
     activation_type: ActivationType,
     is_inference_mode_enabled: bool,
     concat_layout: bool,
-    redispatch_x_in_backward: bool,
     CPU_sync_on_runtime: bool,
 ) -> torch.Tensor:
     W, my_rank = ep_ws.world_size, ep_ws.my_rank
-    T_local, d, K, E_local = ep_ws.T_local, ep_ws.d, ep_ws.K, ep_ws.E_local
+    T_local, K, E_local = ep_ws.T_local, ep_ws.K, ep_ws.E_local
     TK_global = W * T_local * K
     dispatch_mode = cfg.dispatch_mode
     combine_mode = cfg.combine_mode
@@ -886,37 +843,6 @@ def _moe_ep_forward_inner(
     pair_present_mask = meta.get("pair_present_mask") if _is_rank_dedup_dispatch_mode(dispatch_mode) else None
     rank_dedup_recv_pos = meta.get("rank_dedup_recv_pos") if _is_rank_dedup_dispatch_mode(dispatch_mode) else None
 
-    # Backward X redispatch always uses AG-CE (independent of forward mode), so dW1 needs an AG-style x_gather_idx.
-    # In grouped-dispatch modes (A2A_DISPATCH_TRITON or RANK_DEDUP_DISPATCH_TRITON)
-    # we build a separate x_gather_idx using the AG token-id pattern.
-    x_gather_idx_ag_for_dw1: Optional[torch.Tensor] = None
-    if redispatch_x_in_backward:
-        if ep_ws._ag_redispatch_buf is None:
-            ep_ws._ag_redispatch_buf = torch.empty((W * T_local, d), dtype=x_local.dtype, device=x_local.device)
-        if is_grouped_dispatch:
-            # A2A or RANK_DEDUP_DISPATCH_TRITON. The forward built
-            # ``metadata`` from a2a_token_indices (expert-grouped layout
-            # for A2A / packed-by-source for dedup); dW1 needs a separate
-            # x_gather_idx that addresses the full (W·T_local, H) global
-            # x layout produced by the backward's AG-CE redispatch. Build
-            # it here from the global token-id pattern (one entry per
-            # (rank, t, k) slot).
-            if ep_ws.t_global_pattern is None:
-                ep_ws.t_global_pattern = torch.arange(TK_global, device=x_local.device, dtype=torch.int32) // K
-            metadata_global = _build_consumer_metadata(
-                expert_indices=expert_local_padded,
-                token_indices=ep_ws.t_global_pattern,
-                TK=TK_global,
-                E_local=E_local,
-                # Throwaway s_rev — we only need x_gather_idx out of this call.
-                # The configured-mode s_rev in ep_ws.s_rev_symm must stay intact
-                # since A2A_combine reads through peer NVLink mappings.
-                s_reverse_idx_symm=torch.empty_like(ep_ws.s_rev_symm),
-            )
-            x_gather_idx_ag_for_dw1 = metadata_global["x_gather_idx"]
-        else:
-            x_gather_idx_ag_for_dw1 = metadata["x_gather_idx"]
-
     # peer_present_mask is only consumed by the rank-dedup combine
     # gather kernel; pass None for the other combine modes to keep the
     # bundle small.
@@ -941,7 +867,6 @@ def _moe_ep_forward_inner(
         "my_dst_rank": my_dst_rank,
         "recv_pos": recv_pos,
         "dst_rank_flat": dst_rank_flat,
-        "x_gather_idx_ag_for_dw1": x_gather_idx_ag_for_dw1,
         # RANK_DEDUP_DISPATCH_TRITON-only — None elsewhere.
         "pair_present_mask": pair_present_mask,
         "rank_dedup_recv_pos": rank_dedup_recv_pos,
@@ -961,7 +886,6 @@ def _moe_ep_forward_inner(
         activation_type,
         is_inference_mode_enabled,
         concat_layout,
-        redispatch_x_in_backward,
         CPU_sync_on_runtime,
         ep_ws,
     )
@@ -1044,7 +968,6 @@ def moe_ep_TC_softmax_topk_forward(
     norm_topk_probs: bool = False,
     concat_layout: bool = False,
     ep_config: Optional[RuntimeEPConfig] = None,
-    redispatch_x_in_backward: bool = False,
     CPU_sync_on_runtime: bool = False,
 ) -> torch.Tensor:
     """EP forward with TC softmax-topk router.
@@ -1123,7 +1046,6 @@ def moe_ep_TC_softmax_topk_forward(
         activation_type=activation_type,
         is_inference_mode_enabled=is_inference_mode_enabled,
         concat_layout=concat_layout,
-        redispatch_x_in_backward=redispatch_x_in_backward,
         CPU_sync_on_runtime=CPU_sync_on_runtime,
     )
 
@@ -1143,7 +1065,6 @@ def moe_ep_general_routing_forward(
     is_inference_mode_enabled: bool = False,
     concat_layout: bool = False,
     ep_config: Optional[RuntimeEPConfig] = None,
-    redispatch_x_in_backward: bool = False,
     CPU_sync_on_runtime: bool = False,
 ) -> torch.Tensor:
     """EP forward with caller-supplied top-K routing.
@@ -1201,6 +1122,5 @@ def moe_ep_general_routing_forward(
         activation_type=activation_type,
         is_inference_mode_enabled=is_inference_mode_enabled,
         concat_layout=concat_layout,
-        redispatch_x_in_backward=redispatch_x_in_backward,
         CPU_sync_on_runtime=CPU_sync_on_runtime,
     )

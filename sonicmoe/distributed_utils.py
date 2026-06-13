@@ -107,12 +107,10 @@ def _is_rank_dedup_combine_mode(mode: CombineMode) -> bool:
 
 @dataclass
 class _EPWorkspace:
-    # x_symm — (T_local, d) NVLink P2P staging. Forward writes x;
-    # the backward X redispatch reads peers' published x_local from
-    # it. With redispatch on, step 1's do publish goes through
-    # ``do_symm`` instead so x_symm is preserved across the whole
-    # forward→backward sequence; without redispatch, step 1 freely
-    # overwrites x_symm with dout (x_symm has no further consumer).
+    # x_symm — (T_local, d) NVLink P2P staging. Forward writes x and
+    # dispatches it to peers; the forward dispatch is its last consumer,
+    # so the backward freely overwrites it with dout to publish the dO
+    # dispatch.
     x_symm: Optional[torch.Tensor]
     x_hdl: Any
     x_peer_bufs: Tuple[torch.Tensor, ...]
@@ -141,25 +139,6 @@ class _EPWorkspace:
     a2a_recv: Optional[torch.Tensor] = None
     ag_compute: Optional[torch.Tensor] = None
     t_global_pattern: Optional[torch.Tensor] = None
-
-    # do_symm — (T_local, d) NVLink P2P staging for the backward do
-    # dispatch. Allocated *during the backward pass* (runtime) by
-    # :meth:`_ensure_do_symm` on the first call where
-    # ``redispatch_x_in_backward=True``; without redispatch the do
-    # dispatch reuses ``x_symm`` and do_symm stays None. x_symm and
-    # do_symm never need to coexist in the no-redispatch path, so we
-    # save one (T_local, d) symm allocation per workspace for the
-    # common case.
-    do_symm: Optional[torch.Tensor] = None
-    do_hdl: Any = None
-    do_peer_bufs: Tuple[torch.Tensor, ...] = ()
-
-    # Persistent (W*T_local, d) buffer used as the AG-CE destination
-    # for the backward X redispatch. Lazy-allocated on first redispatch
-    # call. Distinct from ``ag_compute`` to avoid aliasing with the dO
-    # dispatch in AG mode (step 1 writes dO into ag_compute, the CE in
-    # step 2 must not clobber it before down-proj-act reads it).
-    _ag_redispatch_buf: Optional[torch.Tensor] = None
 
     # partial_combine_buf — (W*T_local, d) bf16 symm-mem staging for the
     # per-(home_rank, home_t) partial-combine accumulator. Shared by both
@@ -201,27 +180,6 @@ class _EPWorkspace:
     @property
     def d(self) -> int:
         return self._d
-
-    def _ensure_do_symm(self) -> None:
-        """Lazy-allocate do_symm on the first backward call that needs it.
-
-        Called from backward step 1 when ``redispatch_x_in_backward`` is
-        set. The allocation is collective (``_symm_mem.rendezvous``)
-        but symmetric — all ranks enter this backward at the same
-        logical point. First call pays the rendezvous cost; later
-        backwards reuse the buffer.
-        """
-        if self.do_symm is not None:
-            return
-        shape = (self._T_local, self._d)
-        dtype = self.x_symm.dtype
-        device = self.x_symm.device
-        buf = _symm_mem.empty(*shape, dtype=dtype, device=device)
-        hdl = _symm_mem.rendezvous(buf, group=self.ep_group)
-        peer_bufs = tuple(hdl.get_buffer(r, shape, dtype) for r in range(self.world_size))
-        self.do_symm = buf
-        self.do_hdl = hdl
-        self.do_peer_bufs = peer_bufs
 
     def _ensure_partial_combine_buf(self) -> None:
         """Lazy-allocate partial_combine_buf for the RS_COMBINE_TRITON
@@ -266,7 +224,6 @@ class _EPWorkspace:
         false ⇒ ``std::terminate`` ⇒ SIGABRT).
         """
         self.x_peer_bufs = ()
-        self.do_peer_bufs = ()
         self.y_peer_bufs = ()
         self.s_rev_peer_bufs = ()
         self.partial_combine_peer_bufs = ()
@@ -274,13 +231,11 @@ class _EPWorkspace:
         # If it survives past the symm tensor below it would keep an internal AllocationRef
         # alive and we'd hit the same cuMemUnmap("invalid argument") crash one rendezvous later.
         self.x_hdl = None
-        self.do_hdl = None
         self.o_hdl = None
         self.s_rev_hdl = None
         self.partial_combine_hdl = None
         # ↓ now the symm-mem buffers themselves.
         self.x_symm = None
-        self.do_symm = None
         self.y_symm = None
         self.s_rev_symm = None
         self.partial_combine_buf = None
@@ -288,7 +243,6 @@ class _EPWorkspace:
         self.a2a_recv = None
         self.ag_compute = None
         self.t_global_pattern = None
-        self._ag_redispatch_buf = None
         self.x_idx_expanded_remap_for_rank_dedup_buf = None
 
 
@@ -395,8 +349,6 @@ class SymmMemManager:
         dev = self.device
 
         x_symm, x_hdl, x_peer_bufs = self._alloc_symm((T_local, d), dtype)
-        # do_symm is lazy — only the redispatch path needs it (so
-        # x_symm can stay live for the X redispatch in step 2).
         y_symm, o_hdl, y_peer_bufs = self._alloc_symm((MAX_ROWS_PER_RANK, d), dtype)
         s_rev_symm, s_rev_hdl, s_rev_peer_bufs = self._alloc_symm((TK_global,), torch.int32)
 

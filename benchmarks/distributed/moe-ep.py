@@ -241,14 +241,6 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--skip_local_T", action="store_true", default=False)
     parser.add_argument(
-        "--redispatch_x_in_backward",
-        action="store_true",
-        default=False,
-        help="Save x_local (T_local·d) instead of x_compute and re-dispatch x via "
-        "AG-CE (Copy-Engine all-gather) on a side stream in backward — overlaps the "
-        "rest of the backward at the cost of one extra NVLink AG of x.",
-    )
-    parser.add_argument(
         "--CPU_sync_on_runtime",
         action="store_true",
         default=False,
@@ -413,7 +405,6 @@ def _bench_ep_fwd_bwd(
     grad_inputs,
     dout_local,
     fwd_kwargs,
-    redispatch_x_in_backward,
     CPU_sync_on_runtime,
     warmup,
     repeats,
@@ -427,7 +418,6 @@ def _bench_ep_fwd_bwd(
             w2_grad,
             b2_grad,
             is_inference_mode_enabled=False,
-            redispatch_x_in_backward=redispatch_x_in_backward,
             CPU_sync_on_runtime=CPU_sync_on_runtime,
             **fwd_kwargs,
         )
@@ -487,7 +477,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     concat_layout = args.concat_layout
     norm_topk_probs = args.norm_topk_probs
     add_bias = args.add_bias
-    redispatch_x_in_backward = args.redispatch_x_in_backward
     CPU_sync_on_runtime = args.CPU_sync_on_runtime
 
     T, H, I, E, K = args.thiek
@@ -512,7 +501,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             f"E {E} (E_local {E_local}), K {K}, dtype {args.dtype}, "
             f"routing: {routing_mode}, w1 layout: {layout_mode}, "
             f"bias: {add_bias}, "
-            f"redispatch_x_in_backward: {redispatch_x_in_backward}, "
             f"CPU_sync_on_runtime: {CPU_sync_on_runtime}"
         )
 
@@ -646,7 +634,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             w2_t,
             b2_t,
             is_inference_mode_enabled=False,
-            redispatch_x_in_backward=redispatch_x_in_backward,
             CPU_sync_on_runtime=CPU_sync_on_runtime,
             **fwd_kwargs,
         )
@@ -866,7 +853,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             w2_audit,
             b2_audit,
             is_inference_mode_enabled=False,
-            redispatch_x_in_backward=redispatch_x_in_backward,
             CPU_sync_on_runtime=CPU_sync_on_runtime,
             **fwd_kwargs,
         )
@@ -887,8 +873,8 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         x_pick = max(x_pool, key=lambda c: c[2], default=(None, None, 0))
 
         print0(
-            "\n[bold]══ Saved-activation cache audit (training, redispatch_x={}, CPU_sync={}) ══[/bold]".format(
-                redispatch_x_in_backward, CPU_sync_on_runtime
+            "\n[bold]══ Saved-activation cache audit (training, CPU_sync={}) ══[/bold]".format(
+                CPU_sync_on_runtime
             )
         )
         LBL = 18
@@ -920,7 +906,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             w2,
             b2,
             is_inference_mode_enabled=True,
-            redispatch_x_in_backward=redispatch_x_in_backward,
             CPU_sync_on_runtime=CPU_sync_on_runtime,
             **fwd_kwargs,
         )
@@ -948,7 +933,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             w2,
             b2,
             is_inference_mode_enabled=False,
-            redispatch_x_in_backward=redispatch_x_in_backward,
             CPU_sync_on_runtime=CPU_sync_on_runtime,
             **fwd_kwargs,
         )
@@ -997,7 +981,6 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             grad_inputs_bench,
             dout_bench_local,
             fwd_kwargs,
-            redispatch_x_in_backward,
             CPU_sync_on_runtime,
             warmup=warmup,
             repeats=repeats,
