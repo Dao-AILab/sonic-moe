@@ -172,7 +172,13 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from sonicmoe import MoE
-from sonicmoe.distributed_utils import CombineMode, DispatchMode, RuntimeEPConfig  # type: ignore
+from sonicmoe.distributed_utils import (  # type: ignore
+    CombineMode,
+    DispatchMode,
+    RuntimeEPConfig,
+    clear_ep_cache,
+    stash_overflowed,
+)
 from sonicmoe.enums import ActivationType
 from sonicmoe.functional import TC_Softmax_Topk_Router_Function
 from sonicmoe.functional.ep import moe_ep_general_routing_forward, moe_ep_TC_softmax_topk_forward
@@ -441,6 +447,8 @@ def _run_ep_tc_one(
     concat_layout: bool,
     world_size: int,
     rank: int,
+    stash_activations: bool = False,
+    stash_pool_rows: Optional[int] = None,
 ):
     """Run one TC EP fwd+bwd; gather per-rank grads to rank 0. Returns the
     (y_full, dx_full, drouter_w, ep_dw1, ep_dw2, ep_db1, ep_db2) tuple on
@@ -467,6 +475,8 @@ def _run_ep_tc_one(
         norm_topk_probs=norm_topk_probs,
         concat_layout=concat_layout,
         ep_config=cfg,
+        stash_activations=stash_activations,
+        stash_pool_rows=stash_pool_rows,
     )
 
     inputs = [x_t, router_w_t, w1_t, w2_t]
@@ -832,6 +842,208 @@ def _run_one_shape(
     return stats
 
 
+def _run_stash_checks(
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    shape: Shape,
+    dtype: torch.dtype,
+    concat_layout: bool,
+    seed: int,
+) -> ShapeStats:
+    """Validate ``stash_activations`` (bump-stash of the saved up-proj h):
+
+    (1) bit-exact (torch.equal) vs the no-stash path on output + every grad,
+        across all dispatch/combine modes (single layer). stash is a pure copy
+        round-trip, so any diff is a real bug, not rounding.
+    (2) bit-exact across a real MULTI-LAYER autograd stack — this is what
+        actually exercises the FILO pop order the single bump head relies on.
+    (3) a deliberate FILO-order violation (pop an earlier layer before a later
+        one) must RAISE rather than silently corrupt.
+    """
+    T, H, I, E, K = shape.T, shape.H, shape.I, shape.E, shape.K
+    T_local = T // world_size
+    E_local = E // world_size
+    e_slc = slice(rank * E_local, (rank + 1) * E_local)
+    max_rows_static = T_local * world_size * min(K, E_local)
+    stats = ShapeStats(shape.name + "[stash]")
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    moe = (
+        MoE(
+            num_experts=E,
+            num_experts_per_tok=K,
+            hidden_size=H,
+            intermediate_size=I,
+            activation_function=ActivationType.SWIGLU,
+            add_bias=True,
+            std=0.02,
+        )
+        .to(dtype=dtype)
+        .to(device)
+    )
+    torch.nn.init.normal_(moe.c_fc.bias, 0, 0.01)
+    torch.nn.init.normal_(moe.c_proj.bias, 0, 0.01)
+    for p in moe.parameters():
+        dist.broadcast(p.data, src=0)
+    w1_full, w2_full = moe.c_fc.weight, moe.c_proj.weight
+    b1_with, b2_with, router_w = moe.c_fc.bias, moe.c_proj.bias, moe.router.weight
+    w1_local = w1_full[e_slc].permute(1, 2, 0)
+    w2_local = w2_full[e_slc].permute(0, 2, 1).contiguous()
+    b1_local = b1_with[e_slc].contiguous()
+    b2_local = b2_with[e_slc].contiguous()
+
+    if rank == 0:
+        x_global = 0.2 * torch.randn(T, H, device=device, dtype=dtype)
+    else:
+        x_global = torch.empty(T, H, device=device, dtype=dtype)
+    dist.broadcast(x_global, src=0)
+    x_local = x_global[rank * T_local : (rank + 1) * T_local].contiguous()
+    if rank == 0:
+        dout_global = 0.2 * torch.randn(T, H, device=device, dtype=dtype)
+    else:
+        dout_global = torch.empty(T, H, device=device, dtype=dtype)
+    dist.broadcast(dout_global, src=0)
+    dout_local = dout_global[rank * T_local : (rank + 1) * T_local].contiguous()
+
+    def _record(tag: str, ok: bool) -> None:
+        if rank == 0:
+            print(f"[W={world_size} {shape.name} stash] {tag:<68s} {'✓ PASS' if ok else '✗ FAIL'}")
+            if ok:
+                stats.pass_count += 1
+            else:
+                stats.fail_count += 1
+                stats.failures.append(tag)
+        dist.barrier()
+
+    GRAD_NAMES = ["o", "dx", "drouter_w", "dw1", "dw2", "db1", "db2"]
+
+    # ── (1) single-layer exact equivalence across all modes ──────────────────
+    for dispatch_mode in DISPATCH_MODES:
+        for combine_mode in COMBINE_MODES:
+            cfg = RuntimeEPConfig(dispatch_mode=dispatch_mode, W=world_size, K=K, combine_mode=combine_mode)
+            tag = f"equiv[{dispatch_mode.value},{combine_mode.value}]"
+            try:
+                args_common = (
+                    x_local,
+                    router_w,
+                    w1_local,
+                    w2_local,
+                    b1_local,
+                    b2_local,
+                    dout_local,
+                    K,
+                    E,
+                    cfg,
+                    True,
+                    False,
+                    concat_layout,
+                    world_size,
+                    rank,
+                )
+                ref = _run_ep_tc_one(*args_common, stash_activations=False)
+                got = _run_ep_tc_one(*args_common, stash_activations=True, stash_pool_rows=2 * max_rows_static)
+            except Exception as e:  # noqa: BLE001
+                if rank == 0:
+                    print(f"[W={world_size} {shape.name} stash] {tag:<68s} ✗ EXC {type(e).__name__}: {str(e)[:120]}")
+                    stats.fail_count += 1
+                    stats.failures.append(f"{tag} (exc)")
+                clear_ep_cache()
+                dist.barrier()
+                continue
+            ok = True
+            if rank == 0:
+                for name, a, b in zip(GRAD_NAMES, ref, got):
+                    if a is None and b is None:
+                        continue
+                    if not torch.equal(a, b):
+                        ok = False
+                        md = (a - b).abs().max().item()
+                        print(f"   {tag} {name} mismatch under stash (max|Δ|={md:.3e})")
+            _record(tag, ok)
+
+    # ── (2) multi-layer end-to-end FILO (exercises real backward pop order) ──
+    def _two_layer(cfg, stash):
+        xt = x_local.detach().clone().requires_grad_(True)
+        rw = router_w.detach().clone().requires_grad_(True)
+        w1t = _strided_clone(w1_local).requires_grad_(True)
+        w2t = w2_local.detach().clone().requires_grad_(True)
+        b1t = b1_local.detach().clone().requires_grad_(True)
+        b2t = b2_local.detach().clone().requires_grad_(True)
+        kw = dict(
+            K=K,
+            E=E,
+            activation_type=ActivationType.SWIGLU,
+            is_inference_mode_enabled=False,
+            concat_layout=concat_layout,
+            ep_config=cfg,
+            stash_activations=stash,
+            stash_pool_rows=2 * max_rows_static,
+        )
+        y1 = moe_ep_TC_softmax_topk_forward(xt, rw, w1t, b1t, w2t, b2t, **kw)
+        y2 = moe_ep_TC_softmax_topk_forward(y1, rw, w1t, b1t, w2t, b2t, **kw)
+        g = torch.autograd.grad(y2, [xt, rw, w1t, w2t, b1t, b2t], grad_outputs=dout_local)
+        return [y2.detach()] + [t.detach() for t in g]
+
+    for dispatch_mode, combine_mode in [
+        (DispatchMode.AG_DISPATCH_TRITON, CombineMode.RS_COMBINE_TRITON),
+        (DispatchMode.A2A_DISPATCH_TRITON, CombineMode.A2A_COMBINE_TRITON),
+        (DispatchMode.RANK_DEDUP_DISPATCH_TRITON, CombineMode.RANK_DEDUP_COMBINE_TRITON),
+    ]:
+        cfg = RuntimeEPConfig(dispatch_mode=dispatch_mode, W=world_size, K=K, combine_mode=combine_mode)
+        tag = f"multilayer[{dispatch_mode.value},{combine_mode.value}]"
+        local_ok = True
+        try:
+            ref = _two_layer(cfg, False)
+            got = _two_layer(cfg, True)
+            local_ok = all(torch.equal(a, b) for a, b in zip(ref, got))
+        except Exception as e:  # noqa: BLE001
+            local_ok = False
+            if rank == 0:
+                print(f"   {tag} EXC {type(e).__name__}: {str(e)[:120]}")
+        flag = torch.tensor([0 if local_ok else 1], device=device, dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.SUM)  # any rank mismatch -> fail
+        _record(tag, int(flag.item()) == 0)
+
+    # ── (3) a FILO-order violation must raise (not silently corrupt) ─────────
+    cfg = RuntimeEPConfig(
+        dispatch_mode=DispatchMode.AG_DISPATCH_TRITON, W=world_size, K=K, combine_mode=CombineMode.RS_COMBINE_TRITON
+    )
+    xt = x_local.detach().clone().requires_grad_(True)
+    rw = router_w.detach().clone().requires_grad_(True)
+    w1t = _strided_clone(w1_local).requires_grad_(True)
+    w2t = w2_local.detach().clone().requires_grad_(True)
+    b1t = b1_local.detach().clone().requires_grad_(True)
+    b2t = b2_local.detach().clone().requires_grad_(True)
+    kw = dict(
+        K=K,
+        E=E,
+        activation_type=ActivationType.SWIGLU,
+        is_inference_mode_enabled=False,
+        concat_layout=concat_layout,
+        ep_config=cfg,
+        stash_activations=True,
+        stash_pool_rows=2 * max_rows_static,
+    )
+    raised = False
+    try:
+        y1 = moe_ep_TC_softmax_topk_forward(xt, rw, w1t, b1t, w2t, b2t, **kw)  # pushes level 0
+        _y2 = moe_ep_TC_softmax_topk_forward(xt, rw, w1t, b1t, w2t, b2t, **kw)  # pushes level 1 (independent)
+        # Popping level-0's backward while level-1 is on top must trip the guard.
+        torch.autograd.grad(y1.sum(), [xt], retain_graph=True)
+    except RuntimeError:
+        raised = True
+    except Exception:  # noqa: BLE001
+        raised = False
+    clear_ep_cache()  # the bump stack is now corrupt; drop the workspace
+    flag = torch.tensor([1 if raised else 0], device=device, dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)  # require ALL ranks to have raised
+    _record("filo_violation_raises", int(flag.item()) == 1)
+
+    return stats
+
+
 def _print_summary(all_stats: List[ShapeStats]) -> bool:
     total_pass = sum(s.pass_count for s in all_stats)
     total_fail = sum(s.fail_count for s in all_stats)
@@ -856,6 +1068,12 @@ def main() -> int:
         "--concat-layout",
         action="store_true",
         help="Test the concat [g; u] up-proj layout instead of interleaved.",
+    )
+    parser.add_argument(
+        "--stash",
+        action="store_true",
+        help="Also run the stash_activations validation suite (bit-exact vs no-stash "
+        "across all modes, multi-layer FILO, and the FILO-violation-raises check).",
     )
     args = parser.parse_args()
 
@@ -931,6 +1149,27 @@ def main() -> int:
                 stats.failures.append(f"exception: {e}")
             all_stats.append(stats)
             torch.cuda.empty_cache()
+
+            if args.stash:
+                try:
+                    stash_stats = _run_stash_checks(
+                        rank,
+                        world_size,
+                        device,
+                        shape,
+                        dtype=torch.bfloat16,
+                        concat_layout=args.concat_layout,
+                        seed=1111,
+                    )
+                except Exception as e:
+                    if rank == 0:
+                        print(f"[ERR {shape.name}[stash]] {e}")
+                        traceback.print_exc()
+                    stash_stats = ShapeStats(shape.name + "[stash]")
+                    stash_stats.fail_count = 1
+                    stash_stats.failures.append(f"exception: {e}")
+                all_stats.append(stash_stats)
+                torch.cuda.empty_cache()
     finally:
         # Decide pass/fail on rank 0, then broadcast so every rank exits the
         # same way. Without this, rank 0 might exit 1 while peers exit 0 and

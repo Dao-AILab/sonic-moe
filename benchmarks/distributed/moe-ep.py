@@ -248,6 +248,22 @@ def parse_arguments() -> argparse.Namespace:
         "per-call h, a, and the A2A dispatch recv buffer get allocated at the actual populated "
         "row count instead of the structural ceiling. Skipped under inference mode.",
     )
+    parser.add_argument(
+        "--stash_activations",
+        action="store_true",
+        default=False,
+        help="Bump-stash the saved up-proj activation h: compute at the static ceiling (no sync), "
+        "copy the live rows into a shared pool sized for the live layers, free the ceiling buffer, "
+        "and restore in backward. Same persistent memory as --CPU_sync_on_runtime but sync-free / "
+        "CUDA-graph-safe. Mutually exclusive with --CPU_sync_on_runtime.",
+    )
+    parser.add_argument(
+        "--stash_pool_rows",
+        type=int,
+        default=None,
+        help="Row capacity of the bump-stash pool (default: MAX_ROWS_PER_RANK_STATIC, which fits "
+        "ONE layer with no saving). For an L-layer model pass ~ceil(1.3 * L * T_local * K).",
+    )
     parser.add_argument("--skip_bench_bwd", action="store_true", default=False)
     args = parser.parse_args()
     if len(args.thiek) != 5:
@@ -478,6 +494,8 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     norm_topk_probs = args.norm_topk_probs
     add_bias = args.add_bias
     CPU_sync_on_runtime = args.CPU_sync_on_runtime
+    stash_activations = args.stash_activations
+    stash_pool_rows = args.stash_pool_rows
 
     T, H, I, E, K = args.thiek
 
@@ -501,7 +519,8 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             f"E {E} (E_local {E_local}), K {K}, dtype {args.dtype}, "
             f"routing: {routing_mode}, w1 layout: {layout_mode}, "
             f"bias: {add_bias}, "
-            f"CPU_sync_on_runtime: {CPU_sync_on_runtime}"
+            f"CPU_sync_on_runtime: {CPU_sync_on_runtime}, "
+            f"stash_activations: {stash_activations}"
         )
 
     torch.manual_seed(1111)
@@ -605,6 +624,8 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         norm_topk_probs=norm_topk_probs,
         concat_layout=concat_layout,
         ep_config=ep_cfg,
+        stash_activations=stash_activations,
+        stash_pool_rows=stash_pool_rows,
     )
 
     local_kwargs = dict(
@@ -873,17 +894,36 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         x_pick = max(x_pool, key=lambda c: c[2], default=(None, None, 0))
 
         print0(
-            "\n[bold]══ Saved-activation cache audit (training, CPU_sync={}) ══[/bold]".format(
-                CPU_sync_on_runtime
+            "\n[bold]══ Saved-activation cache audit (training, CPU_sync={}, stash={}) ══[/bold]".format(
+                CPU_sync_on_runtime, stash_activations
             )
         )
         LBL = 18
-        total_bytes = x_pick[2] + h_pick[2]
-        print0(
-            f"  {'X cache:':<{LBL}} {x_pick[2]/(1024 ** 3):>8.2f} GiB  shape={x_pick[1]}\n"
-            f"  {'h cache:':<{LBL}} {h_pick[2]/(1024 ** 3):>8.2f} GiB  shape={h_pick[1]}\n"
-            f"  {'Total:':<{LBL}} {total_bytes/(1024 ** 3):>8.2f} GiB"
-        )
+        itemsize = torch.tensor([], dtype=torch_dtype).element_size()
+        max_rows_static = T_local * W * min(K, E_local)
+        static_h_bytes = max_rows_static * h_dim2 * itemsize
+        if stash_activations:
+            # Under stash, h is NOT saved-for-backward — it lives in the shared
+            # bump pool. The PERSISTENT h cache is the pool, sized for the live
+            # layers (here one layer; the saving is multi-layer: pool holds the
+            # SUM of real rows vs L × static-max if each layer saved its own h).
+            pool_rows = stash_pool_rows if stash_pool_rows is not None else max_rows_static
+            pool_bytes = pool_rows * h_dim2 * itemsize
+            total_bytes = x_pick[2] + pool_bytes
+            print0(
+                f"  {'X cache:':<{LBL}} {x_pick[2]/(1024 ** 3):>8.2f} GiB  shape={x_pick[1]}\n"
+                f"  {'h pool (persist):':<{LBL}} {pool_bytes/(1024 ** 3):>8.2f} GiB  shape=({pool_rows}, {h_dim2})\n"
+                f"  {'Total:':<{LBL}} {total_bytes/(1024 ** 3):>8.2f} GiB\n"
+                f"  {'(no-stash h ref):':<{LBL}} {static_h_bytes/(1024 ** 3):>8.2f} GiB  "
+                f"(static-max saved h, per layer)  →  pool/h ratio = {pool_bytes / max(static_h_bytes, 1):.2f}x"
+            )
+        else:
+            total_bytes = x_pick[2] + h_pick[2]
+            print0(
+                f"  {'X cache:':<{LBL}} {x_pick[2]/(1024 ** 3):>8.2f} GiB  shape={x_pick[1]}\n"
+                f"  {'h cache:':<{LBL}} {h_pick[2]/(1024 ** 3):>8.2f} GiB  shape={h_pick[1]}\n"
+                f"  {'Total:':<{LBL}} {total_bytes/(1024 ** 3):>8.2f} GiB"
+            )
 
     del x_audit, router_w_audit, w1_audit, w2_audit, b1_audit, b2_audit, _o_audit
     saved_info.clear()

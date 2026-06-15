@@ -32,6 +32,7 @@ __all__ = [
     "_is_rs_combine_mode",
     "_is_rank_dedup_combine_mode",
     "clear_ep_cache",
+    "stash_overflowed",
 ]
 
 
@@ -169,6 +170,22 @@ class _EPWorkspace:
     # None otherwise.
     x_idx_expanded_remap_for_rank_dedup_buf: Optional[torch.Tensor] = None
 
+    # Bump-allocated activation stash (``stash_activations=True``). Lazy,
+    # plain HBM (NO symm-mem — purely local). ``stash_pool`` is a
+    # (pool_rows, H_act) buffer shared across all stashing layers; forward
+    # bump-packs each layer's live ``h`` rows at ``stash_head`` and backward
+    # bump-unpacks them in reverse (FILO). ``stash_head`` / ``stash_overflow``
+    # are (1,) int32 device scalars mutated on-device (no host sync).
+    # ``stash_depth`` is a HOST-side counter (number of un-popped packs) used
+    # to (a) reset head/overflow at the first pack of each forward pass and
+    # (b) enforce the FILO pop order — see _MoeEPFunction. Pool width depends
+    # on H_act (= the layer's intermediate size); ``_ensure_stash_pool``
+    # asserts a consistent width/dtype if reused across layers.
+    stash_pool: Optional[torch.Tensor] = None
+    stash_head: Optional[torch.Tensor] = None
+    stash_overflow: Optional[torch.Tensor] = None
+    stash_depth: int = 0
+
     @property
     def T_local(self) -> int:
         return self._T_local
@@ -208,6 +225,34 @@ class _EPWorkspace:
         self.partial_combine_hdl = hdl
         self.partial_combine_peer_bufs = peer_bufs
 
+    def _ensure_stash_pool(self, width: int, dtype: torch.dtype, pool_rows: int) -> None:
+        """Lazy-allocate (or grow) the bump-stash pool + head/overflow scalars.
+
+        Plain HBM, no symm-mem rendezvous (the stash is purely local). Called
+        from the first stashing forward. The pool is shared across stashing
+        layers, which must agree on H_act and dtype (asserted). If a LARGER
+        ``pool_rows`` is later requested, the pool is grown — a smaller request
+        keeps the existing capacity. Growing is only valid when no layers are
+        live on the stack (``stash_depth == 0``); otherwise it would discard
+        already-packed activations, so we assert that invariant.
+        """
+        if self.stash_pool is not None:
+            assert (
+                self.stash_pool.shape[1] == width and self.stash_pool.dtype == dtype
+            ), "stash pool already allocated with a different width/dtype (mixed-I layers cannot share a workspace stash)"
+            if self.stash_pool.shape[0] >= pool_rows:
+                return
+            assert self.stash_depth == 0, "cannot grow the stash pool while layers are live on the FILO stack"
+        dev = self.y_symm.device  # any workspace tensor's device
+        self.stash_pool = torch.empty(pool_rows, width, dtype=dtype, device=dev)
+        if self.stash_head is None:
+            self.stash_head = torch.zeros(1, dtype=torch.int32, device=dev)
+            self.stash_overflow = torch.zeros(1, dtype=torch.int32, device=dev)
+        else:
+            self.stash_head.zero_()
+            self.stash_overflow.zero_()
+        self.stash_depth = 0
+
     def release(self) -> None:
         """Drop ALL tensor refs (use when evicting / disposing).
 
@@ -244,6 +289,21 @@ class _EPWorkspace:
         self.ag_compute = None
         self.t_global_pattern = None
         self.x_idx_expanded_remap_for_rank_dedup_buf = None
+        self.stash_pool = None
+        self.stash_head = None
+        self.stash_overflow = None
+        self.stash_depth = 0
+
+
+def stash_overflowed(ep_ws: "_EPWorkspace") -> bool:
+    """True if the bump-stash pool overflowed (pool too small for the live layers).
+
+    Reads the on-device flag with ``.item()`` (a host sync) — call it OFF the
+    hot path (e.g. once per N steps) to check that the pool size is adequate.
+    On overflow the stashed activations are invalid; size ``stash_pool_rows``
+    larger or fall back to ``CPU_sync_on_runtime=False`` (no stash).
+    """
+    return ep_ws.stash_overflow is not None and bool(ep_ws.stash_overflow.item())
 
 
 # ============================================================================

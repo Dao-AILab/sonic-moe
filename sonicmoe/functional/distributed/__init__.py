@@ -1,6 +1,7 @@
 # ********************************************************************************
 # Copyright (c) 2026, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
+from .bump_stash import bump_pack, bump_unpack
 from .collectives import (
     all_gather_copy_engine_async,
     all_gather_multimem_triton,

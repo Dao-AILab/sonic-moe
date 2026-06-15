@@ -66,6 +66,8 @@ from .distributed import (
     all_gather_copy_engine_async,
     all_gather_triton,
     build_rank_dedup_a_idx,
+    bump_pack,
+    bump_unpack,
     compute_dispatch_metadata,
     rank_dedup_combine_triton,
     rank_dedup_dispatch_triton,
@@ -291,6 +293,8 @@ class _MoeEPFunction(torch.autograd.Function):
         is_inference_mode_enabled: bool,
         concat_layout: bool,
         CPU_sync_on_runtime: bool,
+        stash_activations: bool,
+        stash_pool_rows: Optional[int],
         ep_ws,
     ) -> torch.Tensor:
         # x_local: (T_local, H)
@@ -481,15 +485,43 @@ class _MoeEPFunction(torch.autograd.Function):
         if not is_inference_mode_enabled:
             # h, a are alloc'd fresh at the runtime row count (step 2);
             # x_compute is alloc'd fresh in step 1.
-            ctx.save_for_backward(
-                x_compute,
-                w1,
-                b1,
-                w2,
-                b2,
-                h,
-                topk_scores_local,
-            )
+            #
+            # Under ``stash_activations`` we bump-pack h's live rows into the
+            # shared pool (sized for the SUM of live layers, so the persistent
+            # cache shrinks to ~the real row count) and save x_compute WITHOUT
+            # h. ``count`` is the on-device populated-row count — used only as a
+            # kernel loop bound + device head advance, never ``.item()``'d, so
+            # the path stays sync-free (unlike CPU_sync_on_runtime). The FILO
+            # stack is host-tracked (stash_depth/stash_level) to (a) restart the
+            # bump head + clear the overflow flag at the first pack of each
+            # forward pass and (b) enforce reverse-order pops in backward.
+            ctx.h_stashed = bool(stash_activations) and not is_inference_mode_enabled
+            if ctx.h_stashed:
+                rows = stash_pool_rows if stash_pool_rows is not None else MAX_ROWS_PER_RANK_STATIC
+                ep_ws._ensure_stash_pool(H_act, h.dtype, rows)
+                if ep_ws.stash_depth == 0:
+                    # First pack of a new (balanced) forward pass: restart the
+                    # bump allocator and clear any stale overflow flag. On
+                    # CUDA-graph replay this zero_() reruns at the same point,
+                    # so each iteration restarts deterministically.
+                    ep_ws.stash_head.zero_()
+                    ep_ws.stash_overflow.zero_()
+                ctx.stash_level = ep_ws.stash_depth
+                ep_ws.stash_depth += 1
+                count = expert_frequency_offset[E_local : E_local + 1]  # (1,) int32 device = R_real
+                bump_pack(
+                    h,
+                    ep_ws.stash_pool,
+                    ep_ws.stash_head,
+                    count,
+                    ep_ws.stash_overflow,
+                    max_rows=max_rows_per_rank_runtime,
+                )
+                ctx.stash_count = count.clone()
+                ctx.save_for_backward(x_compute, w1, b1, w2, b2, topk_scores_local)  # no h
+                del h  # free the static-max transient now; only the pool persists
+            else:
+                ctx.save_for_backward(x_compute, w1, b1, w2, b2, h, topk_scores_local)
             ctx.cfg = cfg
             ctx.meta = meta
             ctx.activation_type = activation_type
@@ -497,6 +529,13 @@ class _MoeEPFunction(torch.autograd.Function):
             ctx.CPU_sync_on_runtime = CPU_sync_on_runtime
             ctx.max_rows_per_rank_runtime = max_rows_per_rank_runtime
             ctx.ep_ws = ep_ws
+            # ep_ws.s_rev_symm is a SINGLE shared per-workspace buffer that every
+            # forward overwrites. In a multi-layer stack a later layer's forward
+            # clobbers it, but this layer's backward still needs its own reverse-
+            # dispatch index (the backward dO dispatch's recv_pos is a view into
+            # s_rev_symm, and the combine reads peer s_rev over NVLink). Save a
+            # private copy now and re-publish it at the start of backward.
+            ctx.s_rev_saved = ep_ws.s_rev_symm.detach().clone()
             # Cached AG of topk_scores from the RS- or RANK_DEDUP-combine
             # forward path; backward step 3 reuses this when present
             # (avoids a duplicate AG).
@@ -509,16 +548,14 @@ class _MoeEPFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout_local: torch.Tensor):
-        # 13 forward inputs → 13 grads (only the first 6 are tensor inputs).
-        (
-            x_compute,
-            w1,
-            b1,
-            w2,
-            b2,
-            h,
-            topk_scores_local,
-        ) = ctx.saved_tensors
+        # 15 forward inputs → 15 grads (only the first 6 are tensor inputs).
+        # Under stash_activations, h was NOT saved — it is restored from the
+        # bump-stash pool below (once ep_ws is bound).
+        if getattr(ctx, "h_stashed", False):
+            (x_compute, w1, b1, w2, b2, topk_scores_local) = ctx.saved_tensors
+            h = None
+        else:
+            (x_compute, w1, b1, w2, b2, h, topk_scores_local) = ctx.saved_tensors
         cfg: RuntimeEPConfig = ctx.cfg
         meta = ctx.meta
         is_glu_act = cfg.is_glu_act
@@ -548,6 +585,54 @@ class _MoeEPFunction(torch.autograd.Function):
         H = ep_ws.d
         I = w2.shape[1]
         device, dtype = dout_local.device, dout_local.dtype
+
+        # ====================================================================
+        # 0a. Restore THIS layer's reverse-dispatch index (multi-layer safety)
+        # ====================================================================
+        # ep_ws.s_rev_symm is a single shared per-workspace buffer overwritten by
+        # every forward, so in a multi-layer stack a later layer's forward has
+        # clobbered it. Re-publish this layer's saved s_rev BEFORE any backward
+        # op consumes it — the dO dispatch's ``recv_pos`` is a view into
+        # s_rev_symm, and the combine reads peer s_rev over NVLink, so the
+        # barrier makes the restored index visible to peers.
+        ep_ws.s_rev_symm.copy_(ctx.s_rev_saved)
+        ep_ws.s_rev_hdl.barrier()
+
+        # ====================================================================
+        # 0b. Restore the stashed up-proj activation h (FILO pop)
+        # ====================================================================
+        # Host-side depth/level checks enforce the strict reverse-order
+        # invariant the single bump head relies on, and fail loudly on a
+        # violation (gradient checkpointing / branched graphs / double-backward
+        # / unbalanced fwd-bwd). No host sync: the checks are Python ints and
+        # bump_unpack reads the count on-device.
+        if getattr(ctx, "h_stashed", False):
+            if ep_ws.stash_depth <= 0:
+                raise RuntimeError(
+                    "bump-stash: backward popped more activations than forward pushed "
+                    "(double-backward / retain_graph / out-of-order autograd). "
+                    "stash_activations requires exactly one matching backward per forward."
+                )
+            ep_ws.stash_depth -= 1
+            if ctx.stash_level != ep_ws.stash_depth:
+                raise RuntimeError(
+                    f"bump-stash: FILO violation (popping stack level {ep_ws.stash_depth}, but this "
+                    f"layer was pushed at level {ctx.stash_level}). stash_activations requires strict "
+                    "sequential forward/backward order; it is incompatible with gradient checkpointing, "
+                    "branched graphs, and double-backward."
+                )
+            H_act = 2 * I if is_glu_act else I
+            # Transient h at the static-max size; dtype MUST match the pool so
+            # the copy round-trip is bitwise-exact (not dout_local.dtype).
+            h = torch.empty(max_rows_per_rank_runtime, H_act, dtype=ep_ws.stash_pool.dtype, device=device)
+            bump_unpack(
+                ep_ws.stash_pool,
+                h,
+                ep_ws.stash_head,
+                ctx.stash_count,
+                ep_ws.stash_overflow,
+                max_rows=max_rows_per_rank_runtime,
+            )
 
         # ====================================================================
         # 1. Dispatch do_local → dout_dispatched
@@ -749,7 +834,7 @@ class _MoeEPFunction(torch.autograd.Function):
             dw2,
             db2,
             ds_local,
-            *([None] * 7),
+            *([None] * 9),
         )
 
 
@@ -809,6 +894,8 @@ def _moe_ep_forward_inner(
     is_inference_mode_enabled: bool,
     concat_layout: bool,
     CPU_sync_on_runtime: bool,
+    stash_activations: bool = False,
+    stash_pool_rows: Optional[int] = None,
 ) -> torch.Tensor:
     W, my_rank = ep_ws.world_size, ep_ws.my_rank
     T_local, K, E_local = ep_ws.T_local, ep_ws.K, ep_ws.E_local
@@ -850,6 +937,13 @@ def _moe_ep_forward_inner(
     peer_present_mask = meta.get("peer_present_mask") if needs_dedup_combine else None
 
     # RANK_DEDUP_DISPATCH_TRITON: build the up-proj A_idx that gathers expert-grouped rows from the packed dispatch buffer.
+    # ``build_rank_dedup_a_idx`` writes into (and returns) the shared workspace
+    # scratch buffer. We ``.clone()`` it so the per-layer copy saved on ctx.meta
+    # survives a later layer's forward overwriting the scratch — without this,
+    # an L-layer stack feeds layer i's backward the LAST layer's A_idx (the
+    # shared buffer is overwritten by each subsequent forward), corrupting all
+    # but the final layer's gradients. (AG/A2A's x_gather_idx is already a fresh
+    # per-forward tensor, so only the dedup path needed this.)
     x_idx_expanded_remap_for_rank_dedup: Optional[torch.Tensor] = None
     if _is_rank_dedup_dispatch_mode(dispatch_mode):
         x_idx_expanded_remap_for_rank_dedup = build_rank_dedup_a_idx(
@@ -858,7 +952,7 @@ def _moe_ep_forward_inner(
             rank_dedup_recv_pos=meta["rank_dedup_recv_pos"],
             my_rank=my_rank,
             out=ep_ws.x_idx_expanded_remap_for_rank_dedup_buf,
-        )
+        ).clone()
 
     meta_bundle = {
         "expert_frequency_offset": metadata["expert_frequency_offset"],
@@ -887,6 +981,8 @@ def _moe_ep_forward_inner(
         is_inference_mode_enabled,
         concat_layout,
         CPU_sync_on_runtime,
+        stash_activations,
+        stash_pool_rows,
         ep_ws,
     )
 
@@ -969,6 +1065,8 @@ def moe_ep_TC_softmax_topk_forward(
     concat_layout: bool = False,
     ep_config: Optional[RuntimeEPConfig] = None,
     CPU_sync_on_runtime: bool = False,
+    stash_activations: bool = False,
+    stash_pool_rows: Optional[int] = None,
 ) -> torch.Tensor:
     """EP forward with TC softmax-topk router.
 
@@ -987,6 +1085,8 @@ def moe_ep_TC_softmax_topk_forward(
     decision, or a hand-built :class:`RuntimeEPConfig` to force a
     specific pair.
     """
+    if stash_activations and CPU_sync_on_runtime:
+        raise ValueError("stash_activations and CPU_sync_on_runtime are mutually exclusive")
     mgr = SymmMemManager(group, x.device)
     W = mgr.world_size
     if E % W != 0:
@@ -1047,6 +1147,8 @@ def moe_ep_TC_softmax_topk_forward(
         is_inference_mode_enabled=is_inference_mode_enabled,
         concat_layout=concat_layout,
         CPU_sync_on_runtime=CPU_sync_on_runtime,
+        stash_activations=stash_activations,
+        stash_pool_rows=stash_pool_rows,
     )
 
 
@@ -1066,6 +1168,8 @@ def moe_ep_general_routing_forward(
     concat_layout: bool = False,
     ep_config: Optional[RuntimeEPConfig] = None,
     CPU_sync_on_runtime: bool = False,
+    stash_activations: bool = False,
+    stash_pool_rows: Optional[int] = None,
 ) -> torch.Tensor:
     """EP forward with caller-supplied top-K routing.
 
@@ -1074,6 +1178,8 @@ def moe_ep_general_routing_forward(
     :func:`_default_ep_config` from the EP world size and the K inferred
     from ``topk_indices.shape[1]``.
     """
+    if stash_activations and CPU_sync_on_runtime:
+        raise ValueError("stash_activations and CPU_sync_on_runtime are mutually exclusive")
     K = topk_indices.shape[1]
     mgr = SymmMemManager(group, x.device)
     W = mgr.world_size
@@ -1123,4 +1229,6 @@ def moe_ep_general_routing_forward(
         is_inference_mode_enabled=is_inference_mode_enabled,
         concat_layout=concat_layout,
         CPU_sync_on_runtime=CPU_sync_on_runtime,
+        stash_activations=stash_activations,
+        stash_pool_rows=stash_pool_rows,
     )
