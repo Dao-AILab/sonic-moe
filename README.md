@@ -23,10 +23,7 @@ Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 - NVIDIA Hopper GPUs (H100, H200, etc.), Blackwell datacenter GPUs (GB200, B200, B300, etc.), or Blackwell consumer GPUs (e.g. RTX 5090, SM120)
 - CUDA 12.9+ (13.0+ for B300 GPUs)
 - Python 3.12+ recommended
-- PyTorch 2.7+ (2.9.1 recommended)
-
-> **B300 users:** please manually upgrade Triton to 3.6.0 after installing PyTorch.
-
+- PyTorch 2.11+ (2.12 recommended)
 
 ### Install from pip
 ```bash
