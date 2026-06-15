@@ -368,7 +368,6 @@ def moe_TC_softmax_topk_layer(
     if type(activation_type) == str:
         activation_type = ActivationType(activation_type)
 
-    assert not torch.compiler.is_compiling()
     assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
     a, h = _UpProjection.apply(
@@ -466,7 +465,6 @@ def moe_general_routing_inputs(
         num_activated_expert_per_token_offset,
     )
 
-    assert not torch.compiler.is_compiling()
     assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
     a, h = _UpProjection.apply(
