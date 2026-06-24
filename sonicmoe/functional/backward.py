@@ -170,6 +170,62 @@ def db1_kernel(
         tl.store(db1_ptr + db1_offsets, db1_acc, mask=i_mask)
 
 
+def _get_autotune_configs_for_relu_sq_down() -> list[triton.Config]:
+    configs = []
+    for BLOCK_TK in get_powers_of_2(1, 16):
+        configs.append(triton.Config({"BLOCK_TK": BLOCK_TK}, num_warps=4, num_stages=2))
+    return configs
+
+
+@triton.autotune(
+    configs=_get_autotune_configs_for_relu_sq_down(),
+    key=["I"],
+)
+@triton.jit
+def relu_sq_down_bwd_kernel(
+    da_ptr,  # (TK, I), grad wrt postact a (unscaled), grouped layout
+    h_ptr,  # (TK, I), preact, grouped layout
+    topk_scores_ptr,  # (TK,)
+    s_scatter_idx_ptr,  # (TK,), maps grouped -> scatter index
+    dh_ptr,  # (TK, I), out: grad wrt preact h (score-scaled)
+    ds_ptr,  # (TK,), out: grad wrt router score (scatter layout)
+    a_prime_ptr,  # (TK, I), out: score-scaled postact (for the dw2 gemm)
+    TK,
+    I: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+    BLOCK_TK: tl.constexpr,
+):
+    # This is an elementwise + per-row reduction kernel (outputs are TK x I), so
+    # we tile over the grouped tokens for maximum parallelism — grid over the
+    # token dim (NOT over experts, unlike the db1/db2 reduction kernels).
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_TK + tl.arange(0, BLOCK_TK)
+    row_mask = rows < TK
+    i_offsets = tl.arange(0, BLOCK_I)
+    i_mask = i_offsets < I
+
+    # Per-token router score (looked up through the scatter index).
+    scatter_idx = tl.load(s_scatter_idx_ptr + rows, mask=row_mask, other=0).to(tl.int64)
+    s = tl.load(topk_scores_ptr + scatter_idx, mask=row_mask, other=0.0).to(tl.float32)
+
+    # [BLOCK_TK, BLOCK_I] tiles of the preact and the unscaled postact grad.
+    offsets = rows[:, None] * I + i_offsets[None, :]
+    mask = row_mask[:, None] & i_mask[None, :]
+    h = tl.load(h_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    da = tl.load(da_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+
+    # relu_sq(h) = relu(h) * h ; d/dh relu_sq(h) = 2 * relu(h).
+    relu_h = tl.maximum(h, 0.0)
+    a = relu_h * h
+
+    # a_prime = s * relu_sq(h)  — scaled postact consumed by the dw2 gemm.
+    tl.store(a_prime_ptr + offsets, a * s[:, None], mask=mask)
+    # dh = s * da * 2*relu(h)   — grad wrt the pre-activation.
+    tl.store(dh_ptr + offsets, da * (2.0 * relu_h) * s[:, None], mask=mask)
+    # ds = <relu_sq(h), da>     — router-score grad (unscaled), scatter layout.
+    tl.store(ds_ptr + scatter_idx, tl.sum(a * da, axis=1), mask=row_mask)
+
+
 @torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_backward_act", mutates_args={"dx_expanded", "db1"})
 def _up_projection_backward_act(
     w1: torch.Tensor,
@@ -224,6 +280,36 @@ def _down_projection_backward_act(
     s_scatter_idx: torch.Tensor,
     activation_type: str,
 ) -> None:
+    if activation_type == "relu_sq":
+        assert b2 is None and db2 is None, "relu_sq SonicMoE backward does not support down-projection bias"
+        I = w2.size(1)
+        TK = x_gather_idx.size(0)
+        # da = dout (gathered per token) @ w2 — grad wrt the postact, unscaled.
+        da = torch.empty_like(h)
+        gemm(
+            dout,
+            w2.permute(2, 0, 1),
+            cu_seqlens_m=expert_frequency_offset,
+            A_idx=x_gather_idx,
+            dynamic_scheduler=False,
+            out=da,
+        )
+        # Fuse the activation backward, router-score grad and dw2-input scaling.
+        grid = lambda meta: (triton.cdiv(TK, meta["BLOCK_TK"]),)
+        relu_sq_down_bwd_kernel[grid](
+            da,
+            h,
+            topk_scores,
+            s_scatter_idx,
+            dh,
+            ds,
+            a_prime,
+            TK,
+            I,
+            BLOCK_I=triton.next_power_of_2(I),
+        )
+        return
+
     assert activation_type in (
         "swiglu",
         "geglu",

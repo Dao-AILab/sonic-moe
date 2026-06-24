@@ -6,7 +6,7 @@ import os
 
 import torch
 import torch.nn.functional as F
-from quack.gemm_interface import gemm, gemm_dgated, gemm_gated
+from quack.gemm_interface import gemm, gemm_act, gemm_dgated, gemm_gated
 
 from ..enums import ActivationType, is_glu
 from .backward import (
@@ -105,22 +105,34 @@ class _UpProjection(torch.autograd.Function):
             else None
         )
 
-        assert activation_type.value in (
-            "swiglu",
-            "geglu",
-        ), f"QuACK gemm_gated only supports glu activations, got {activation_type.value}"
-        gemm_gated(
-            x,
-            w1.permute(2, 1, 0),
-            activation=activation_type.value,
-            cu_seqlens_m=expert_frequency_offset,
-            A_idx=x_gather_idx,
-            preact_out=h,
-            postact_out=a,
-            store_preact=(not is_inference_mode_enabled),
-            bias=b1,
-            concat_layout=(("B", "bias") if b1 is not None else ("B",)) if concat_layout else None,
-        )
+        if is_glu_activation:
+            gemm_gated(
+                x,
+                w1.permute(2, 1, 0),
+                activation=activation_type.value,
+                cu_seqlens_m=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                preact_out=h,
+                postact_out=a,
+                store_preact=(not is_inference_mode_enabled),
+                bias=b1,
+                concat_layout=(("B", "bias") if b1 is not None else ("B",)) if concat_layout else None,
+            )
+        else:
+            # Non-gated fused activation GEMM (e.g. relu_sq / srelu). preact h and
+            # postact a are both (TK, I); ds is handled separately in the backward
+            # (gemm_dact has no colvec_reduce for non-gated activations).
+            gemm_act(
+                x,
+                w1.permute(2, 1, 0),
+                activation=activation_type.value,
+                cu_seqlens_m=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                preact_out=h,
+                postact_out=a,
+                store_preact=(not is_inference_mode_enabled),
+                bias=b1,
+            )
 
         ctx.T = T
         ctx.TK = TK
@@ -368,7 +380,9 @@ def moe_TC_softmax_topk_layer(
     if type(activation_type) == str:
         activation_type = ActivationType(activation_type)
 
-    assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
+    assert is_glu(activation_type) or activation_type == ActivationType.RELU_SQ, (
+        f"SonicMoE supports GLU activations and relu_sq; got {activation_type}"
+    )
 
     a, h = _UpProjection.apply(
         x,
@@ -465,7 +479,9 @@ def moe_general_routing_inputs(
         num_activated_expert_per_token_offset,
     )
 
-    assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
+    assert is_glu(activation_type) or activation_type == ActivationType.RELU_SQ, (
+        f"SonicMoE supports GLU activations and relu_sq; got {activation_type}"
+    )
 
     a, h = _UpProjection.apply(
         x,
