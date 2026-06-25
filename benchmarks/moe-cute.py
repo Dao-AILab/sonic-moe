@@ -26,6 +26,10 @@ from sonicmoe import MoE
 from sonicmoe.enums import ActivationType, is_glu
 from sonicmoe.functional import moe_TC_softmax_topk_layer
 
+# Silence the AccumulateGrad stream mismatch warning from the retain_graph
+# fwd+bwd benchmark loop (intentional here, not a correctness issue).
+torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+
 
 def _fast_sm100_configs(epilogue=None):
     tile_n_vals = [128, 160, 192, 256]
@@ -495,43 +499,51 @@ def run(
         time.sleep(0.5)
         torch.cuda.synchronize()
 
-        def forward_only_fp8():
+        def fp8_moe(inference):
             return moe_TC_softmax_topk_layer(
                 x, router_w,
                 w1.permute(1, 2, 0), None,
                 w2.permute(1, 2, 0), None,
-                moe.top_k, None, activation, True,
+                moe.top_k, None, activation, inference,
                 is_softmax_over_topk=is_softmax_over_topk,
                 norm_topk_probs=norm_topk_probs,
                 concat_layout=concat_layout,
                 use_fp8=True,
             )
 
-        fwd_fp8_timing = do_bench(forward_only_fp8, warmup=warmup, rep=repeats)
-        tflops = fp8_fwd_flops / (fwd_fp8_timing * 1e9)
-        print0(f"[bold cyan] Mixed fp8 Fwd (inference): {fwd_fp8_timing:.3f} ms, TFLOPS: {tflops:.1f}[/bold cyan]")
+        fwd_fp8_timing = do_bench(lambda: fp8_moe(True), warmup=warmup, rep=repeats)
+        fwd_train_fp8_timing = do_bench(lambda: fp8_moe(False), warmup=warmup, rep=repeats)
 
         time.sleep(0.5)
         torch.cuda.synchronize()
         dout_fp8 = torch.randn_like(x, requires_grad=True)
 
         def forward_backward_fp8():
-            o, _, _ = moe_TC_softmax_topk_layer(
-                x, router_w,
-                w1.permute(1, 2, 0), None,
-                w2.permute(1, 2, 0), None,
-                moe.top_k, None, activation, False,
-                is_softmax_over_topk=is_softmax_over_topk,
-                norm_topk_probs=norm_topk_probs,
-                concat_layout=concat_layout,
-                use_fp8=True,
-            )
-            o.backward(dout_fp8, retain_graph=True)
+            fp8_moe(False)[0].backward(dout_fp8, retain_graph=True)
             x.grad = w1.grad = w2.grad = router_w.grad = None
 
         fp8_e2e_timing = do_bench(forward_backward_fp8, warmup=warmup, rep=repeats)
-        tflops = fp8_e2e_flops / (fp8_e2e_timing * 1e9)
-        print0(f"[bold cyan] Mixed fp8 Fwd+Bwd: {fp8_e2e_timing:.3f} ms, TFLOPS: {tflops:.1f}[/bold cyan]")
+        fp8_bwd_timing = fp8_e2e_timing - fwd_train_fp8_timing
+
+        bwd_flops = fp8_e2e_flops - fp8_fwd_flops
+        rows = [
+            ("Fwd (inf)",    fwd_timing,         fwd_fp8_timing,       fp8_fwd_flops),
+            ("Fwd (train)",  fwd_no_cg_timing,   fwd_train_fp8_timing, fp8_fwd_flops),
+            ("Fwd+Bwd",      e2e_timing,         fp8_e2e_timing,       fp8_e2e_flops),
+            ("Bwd",          bwd_time,           fp8_bwd_timing,       bwd_flops),
+        ]
+        print0(f"[bold cyan]=== Mixed fp8 vs bf16 ===[/bold cyan]")
+        hdr = f"| {'Stage':<12} | {'bf16 ms':>8} | {'bf16 TF':>8} | {'fp8 ms':>8} | {'fp8 TF':>8} | {'speedup':>12} |"
+        print0(hdr)
+        print0(f"|{'-'*14}|{'-'*10}|{'-'*10}|{'-'*10}|{'-'*10}|{'-'*14}|")
+        for name, bms, fms, fl in rows:
+            btf = fl / (bms * 1e9)
+            ftf = fl / (fms * 1e9)
+            msr = bms / fms
+            print0(
+                f"| {name:<12} | {bms:>8.3f} | {btf:>8.0f} | {fms:>8.3f} | {ftf:>8.0f} "
+                f"| {f'{msr:.2f}x +{(msr - 1) * 100:.1f}%':>12} |"
+            )
 
 
 if __name__ == "__main__":

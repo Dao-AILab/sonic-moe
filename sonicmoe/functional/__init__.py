@@ -2,19 +2,12 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
-import os
+import inspect
 
 import torch
 import torch.nn.functional as F
-import cutlass
-from quack.gemm_interface import gemm, gemm_dgated, gemm_gated
-from quack.cute_dsl_utils import torch2cute_dtype_map
-
-# Extend quack's dtype dispatch to cover fp8 — the kernels support it
-# but the Python dispatch layer only maps bf16/fp16/fp32 by default.
-torch2cute_dtype_map[torch.float8_e4m3fn] = cutlass.Float8E4M3FN
-torch2cute_dtype_map[torch.float8_e5m2]   = cutlass.Float8E5M2
-
+from quack.gemm_config import GemmConfig
+from quack.gemm_interface import gemm, gemm_dgated, gemm_gated, gemm_gated_tuned, gemm_tuned
 from ..enums import ActivationType, is_glu
 from .backward import (
     _down_projection_backward_act,
@@ -25,25 +18,126 @@ from .backward import (
 from .forward import _router_forward, _topk_softmax_fwd
 from .triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
 
-_FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+try:
+    from quack.fp8_quant import fp8_quant_e4m3 as _quack_fp8_quant_e4m3
+    from quack.fp8_quant import fp8_quant2_e4m3 as _quack_fp8_quant2_e4m3
+except Exception:
+    _quack_fp8_quant_e4m3 = None
+    _quack_fp8_quant2_e4m3 = None
 
-# Keyed by (data_ptr, perm); invalidated by _version after each optimizer step.
+
+
+def _quack_has_arg(fn, name: str) -> bool:
+    return name in inspect.signature(getattr(fn, "fn", fn)).parameters
+
+
+_HAS_QUACK_FUSED_QUANT_A = _quack_has_arg(gemm, "scale_A")
+_HAS_QUACK_GATED_FUSED_QUANT_A = _quack_has_arg(gemm_gated_tuned, "scale_A")
+_HAS_QUACK_QUANT_A_OUT = _quack_has_arg(gemm_gated_tuned, "quant_A_out")
+_HAS_QUACK_GATED_POSTACT_SCALE = _quack_has_arg(gemm_gated_tuned, "postact_scale")
+_DEFAULT_FP8_DOWN_PREQUANT_MIN = 1048576
+
+
+def _can_use_quack_fused_quant_a(x: torch.Tensor) -> bool:
+    return (
+        (_HAS_QUACK_FUSED_QUANT_A or _HAS_QUACK_GATED_FUSED_QUANT_A)
+        and x.is_cuda
+        and torch.cuda.get_device_capability(x.device)[0] >= 10
+    )
+
+_FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+
 _fp8_weight_cache: dict[tuple, tuple[int, torch.Tensor, torch.Tensor]] = {}
 
+_DEFAULT_FP8_SCALE_UPDATE_INTERVAL = 1024
+_fp8_act_scale: dict[tuple, tuple[torch.Tensor, int]] = {}
+_fp8_prequant: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+# Epilogue emitted MX quant of dh for dw1 (up bwd): (q_dh, sf_dh, cu_pad, meta)
 
-def _to_fp8_e4m3(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    scale = x.abs().amax().clamp(min=1e-12) / _FP8_E4M3_MAX
-    return (x / scale).to(torch.float8_e4m3fn), scale
+
+def _current_fp8_scale_e4m3(x: torch.Tensor) -> torch.Tensor:
+    return x.abs().amax().clamp(min=1e-12).float() / _FP8_E4M3_MAX
+
+
+def _fp8_scale_e4m3(
+    x: torch.Tensor, key: str | None = None, interval: int = _DEFAULT_FP8_SCALE_UPDATE_INTERVAL
+) -> torch.Tensor:
+    if key is None or interval <= 1:
+        return _current_fp8_scale_e4m3(x)
+    cache_key = (key, tuple(x.shape), x.dtype, x.device)
+    cached = _fp8_act_scale.get(cache_key)
+    if cached is None:
+        scale = _current_fp8_scale_e4m3(x)
+        _fp8_act_scale[cache_key] = (scale, 1)
+        return scale
+    scale, count = cached
+    if count >= interval:
+        scale = _current_fp8_scale_e4m3(x)
+        count = 0
+    _fp8_act_scale[cache_key] = (scale, count + 1)
+    return scale
+
+
+def _cached_fp8_scale_e4m3(
+    key: str, shape, dtype, device, interval: int = _DEFAULT_FP8_SCALE_UPDATE_INTERVAL
+) -> torch.Tensor | None:
+    cache_key = (key, tuple(shape), dtype, device)
+    cached = _fp8_act_scale.get(cache_key)
+    if cached is None:
+        return None
+    scale, count = cached
+    if count >= interval:
+        return None
+    _fp8_act_scale[cache_key] = (scale, count + 1)
+    return scale
+
+
+def _fp8_cast_e4m3(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    if (
+        _quack_fp8_quant_e4m3 is not None
+        and x.is_cuda
+        and x.is_contiguous()
+        and x.numel() % 2 == 0
+    ):
+        return _quack_fp8_quant_e4m3(x, scale)
+    fp8_input = (x / scale).clamp(min=-_FP8_E4M3_MAX, max=_FP8_E4M3_MAX)
+    return fp8_input.to(torch.float8_e4m3fn)
+
+
+def _to_fp8_e4m3(
+    x: torch.Tensor, key: str | None = None, interval: int = _DEFAULT_FP8_SCALE_UPDATE_INTERVAL
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scale = _fp8_scale_e4m3(x, key, interval)
+    return _fp8_cast_e4m3(x, scale), scale
 
 
 def _to_fp8_e4m3_weight(x: torch.Tensor, perm: tuple) -> tuple[torch.Tensor, torch.Tensor]:
-    key = (x.data_ptr(), perm)
+    key = (x.data_ptr(), tuple(x.shape), tuple(x.stride()), perm)
     cached = _fp8_weight_cache.get(key)
     if cached is None or cached[0] != x._version:
         fp8, sc = _to_fp8_e4m3(x.permute(*perm).contiguous())
         _fp8_weight_cache[key] = (x._version, fp8, sc)
         return fp8, sc
     return cached[1], cached[2]
+
+
+
+
+def _sm100_cfg(x: torch.Tensor, m: int, n: int, cm: int, cn: int) -> GemmConfig | None:
+    if not x.is_cuda or torch.cuda.get_device_capability(x.device)[0] < 10:
+        return None
+    return GemmConfig(
+        tile_m=m,
+        tile_n=n,
+        cluster_m=cm,
+        cluster_n=cn,
+        pingpong=False,
+        swap_ab=False,
+        max_swizzle_size=8,
+        is_dynamic_persistent=False,
+        use_tma_gather=False,
+        device_capacity=10,
+    )
 
 
 def _apply_glu_act(h: torch.Tensor, activation_type: ActivationType, concat_layout: bool) -> torch.Tensor:
@@ -131,6 +225,10 @@ class _UpProjection(torch.autograd.Function):
         is_inference_mode_enabled: bool,
         concat_layout: bool = False,
         use_fp8: bool = False,
+        fp8_side_out: bool = True,
+        fp8_side_out_min: int = 1048576,
+        fp8_side_out_cfg: tuple[int, int, int, int] = (128, 256, 1, 1),
+        fp8_scale_interval: int = _DEFAULT_FP8_SCALE_UPDATE_INTERVAL,
     ) -> torch.Tensor:
         T, H = x.shape
         I, H, E = w1.shape
@@ -139,12 +237,17 @@ class _UpProjection(torch.autograd.Function):
             I //= 2
         TK = total_expert_freq
 
-        a = torch.empty(TK, I, dtype=x.dtype, device=x.device)
-        h = (
-            torch.empty(TK, (2 * I if is_glu_activation else I), dtype=x.dtype, device=x.device)
-            if (not is_inference_mode_enabled)
+        a_post_sc = (
+            _cached_fp8_scale_e4m3("a", (TK, I), x.dtype, x.device, fp8_scale_interval)
+            if use_fp8
+            and is_inference_mode_enabled
+            and _HAS_QUACK_GATED_POSTACT_SCALE
             else None
         )
+        a_dtype = torch.float8_e4m3fn if a_post_sc is not None else x.dtype
+        a = torch.empty(TK, I, dtype=a_dtype, device=x.device)
+        h_shape = (TK, 2 * I if is_glu_activation else I)
+        h = torch.empty(h_shape, dtype=x.dtype, device=x.device) if not is_inference_mode_enabled else None
 
         assert activation_type.value in (
             "swiglu",
@@ -152,24 +255,47 @@ class _UpProjection(torch.autograd.Function):
         ), f"QuACK gemm_gated only supports glu activations, got {activation_type.value}"
 
         if use_fp8:
-            # Use plain gemm so we can descale before the nonlinear activation.
-            # gemm_gated fuses swiglu, making descaling incorrect: swiglu(x/s) ≠ swiglu(x)/s.
-            x_fp8, x_sc = _to_fp8_e4m3(x)
+            x_sc = _fp8_scale_e4m3(x, key="x", interval=fp8_scale_interval)
             w1_fp8, w1_sc = _to_fp8_e4m3_weight(w1, (2, 1, 0))
-            h_buf = torch.empty(TK, 2 * I if is_glu_activation else I, dtype=x.dtype, device=x.device)
-            gemm(
-                x_fp8, w1_fp8,
-                out=h_buf,
+            h_out = h if not is_inference_mode_enabled else None
+            can_fuse_x = (
+                fp8_side_out
+                and not is_inference_mode_enabled
+                and x.numel() >= fp8_side_out_min
+                and _HAS_QUACK_GATED_FUSED_QUANT_A
+                and _HAS_QUACK_QUANT_A_OUT
+                and _can_use_quack_fused_quant_a(x)
+            )
+            if can_fuse_x:
+                x_arg = x
+                x_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+            else:
+                x_fp8 = _fp8_cast_e4m3(x, x_sc)
+                x_arg = x_fp8
+            gated_kwargs = dict(
+                activation=activation_type.value,
                 cu_seqlens_m=expert_frequency_offset,
                 A_idx=x_gather_idx,
                 dynamic_scheduler=False,
+                concat_layout=(("B",) if concat_layout else None),
+                alpha=x_sc,
+                alpha2=w1_sc,
+                scale_A=x_sc if can_fuse_x else None,
+                quant_A_out=x_fp8 if can_fuse_x else None,
+                quant_A_out_idx=s_scatter_idx if can_fuse_x and K is not None else None,
+                quant_A_out_stride=K if K is not None else 1,
+                postact_scale=a_post_sc,
             )
-            h_buf.mul_(x_sc * w1_sc)
+            if can_fuse_x:
+                gated_kwargs["config"] = _sm100_cfg(x, *fp8_side_out_cfg)
+                gemm_gated_tuned.fn(x_arg, w1_fp8, h_out, a, **gated_kwargs)
+            else:
+                gemm_gated_tuned(x_arg, w1_fp8, h_out, a, **gated_kwargs)
+            if a_post_sc is not None:
+                _fp8_prequant[a.data_ptr()] = (a, a_post_sc)
             if not is_inference_mode_enabled:
-                h.copy_(h_buf)
                 ctx.x_fp8 = x_fp8
                 ctx.x_sc = x_sc
-            a[:] = _apply_glu_act(h_buf, activation_type, concat_layout)
         else:
             gemm_gated(
                 x,
@@ -206,6 +332,7 @@ class _UpProjection(torch.autograd.Function):
         )
 
         ctx.use_fp8 = use_fp8
+        ctx.fp8_scale_interval = fp8_scale_interval
         ctx.mark_non_differentiable(a)
         ctx.set_materialize_grads(False)
 
@@ -238,29 +365,47 @@ class _UpProjection(torch.autograd.Function):
         db1 = None if b1 is None else torch.empty_like(b1)
 
         if ctx.use_fp8:
+            # ===== per tensor (tensor scaled) fp8 up proj backward =====
             assert b1 is None, "fp8 path does not support bias"
+            interval = ctx.fp8_scale_interval
+            # dh from the per tensor dgated is deferred (dh_true / out_sc); the
+            # prequant carries dh_sc * out_sc so this dx/dw1 fold it back in.
+            prequant = _fp8_prequant.pop(dh.data_ptr(), None)
+            dh_fp8, dh_sc = (
+                prequant if prequant is not None else _to_fp8_e4m3(dh, key="dh", interval=interval)
+            )
+            # dx = dh @ w1^T
             w1_fp8, w1_sc = _to_fp8_e4m3_weight(w1, (2, 0, 1))
-            dh_fp8, dh_sc = _to_fp8_e4m3(dh)
-            x_fp8, x_sc = ctx.x_fp8, ctx.x_sc
-            gemm(
+            gemm_tuned.fn(
                 dh_fp8,
                 w1_fp8,
+                dx_expanded,
+                alpha=w1_sc,
+                alpha2=dh_sc,
                 cu_seqlens_m=expert_frequency_offset,
                 dynamic_scheduler=False,
-                out=dx_expanded,
                 concat_layout=(("B",) if concat_layout else None),
+                config=_sm100_cfg(dh, 64, 256, 1, 2),
             )
-            dx_expanded.mul_(w1_sc * dh_sc)
-            gemm(
-                x_fp8.T, dh_fp8,
-                out=dw1.permute(2, 1, 0),
+            # dw1 = x^T @ dh
+            if ctx.x_fp8 is not None:
+                x_fp8, x_sc = ctx.x_fp8, ctx.x_sc
+            else:
+                x_sc = _fp8_scale_e4m3(x, key="x", interval=interval)
+                x_fp8 = _fp8_cast_e4m3(x, x_sc)
+            gemm_tuned.fn(
+                x_fp8.T,
+                dh_fp8,
+                dw1.permute(2, 1, 0),
+                alpha=x_sc,
+                alpha2=dh_sc,
                 cu_seqlens_k=expert_frequency_offset,
                 A_idx=x_gather_idx,
                 batch_idx_permute=None,
                 dynamic_scheduler=False,
                 concat_layout=(("out",) if concat_layout else None),
+                config=_sm100_cfg(dh, 256, 256, 2, 1),
             )
-            dw1.mul_(x_sc * dh_sc)
         else:
             _up_projection_backward_act(
                 w1=w1,
@@ -293,7 +438,7 @@ class _UpProjection(torch.autograd.Function):
             is_varlen_K=is_each_token_has_variable_activated_experts,
         )
 
-        return dx_reduced, dw1, db1, *[None] * 13
+        return dx_reduced, dw1, db1, *[None] * 18
 
 
 class _DownProjection(torch.autograd.Function):
@@ -315,21 +460,49 @@ class _DownProjection(torch.autograd.Function):
         is_varlen_K: bool,
         activation_type: ActivationType,
         use_fp8: bool = False,
+        fp8_scale_interval: int = _DEFAULT_FP8_SCALE_UPDATE_INTERVAL,
+        fp8_down_prequant_min: int = _DEFAULT_FP8_DOWN_PREQUANT_MIN,
     ) -> torch.Tensor:
         TK = a.size(0)
         H, I, E = w2.shape
 
-        y = torch.empty(TK, H, dtype=a.dtype, device=a.device)
+        y_dtype = w2.dtype if use_fp8 else a.dtype
+        y = torch.empty(TK, H, dtype=y_dtype, device=a.device)
 
         if use_fp8:
-            a_fp8, a_sc = _to_fp8_e4m3(a)
             w2_fp8, w2_sc = _to_fp8_e4m3_weight(w2, (2, 1, 0))
-            gemm(a_fp8, w2_fp8, out=y, cu_seqlens_m=expert_frequency_offset)
-            y.mul_(a_sc * w2_sc)
+            if a.dtype == torch.float8_e4m3fn:
+                prequant = _fp8_prequant.pop(a.data_ptr(), None)
+                if prequant is None:
+                    raise RuntimeError("missing fp8 a scale")
+                a_arg, a_sc = prequant
+                scale_A = None
+            else:
+                a_sc = _fp8_scale_e4m3(a, key="a", interval=fp8_scale_interval)
+                prequant_down = a.numel() >= fp8_down_prequant_min
+                if prequant_down:
+                    a_arg = _fp8_cast_e4m3(a, a_sc)
+                    scale_A = None
+                else:
+                    a_arg = a
+                    scale_A = a_sc if _can_use_quack_fused_quant_a(a) else None
+                    if scale_A is None:
+                        a_arg = _fp8_cast_e4m3(a, a_sc)
+            gemm_tuned.fn(
+                a_arg,
+                w2_fp8,
+                y,
+                alpha=a_sc,
+                alpha2=w2_sc,
+                scale_A=scale_A,
+                cu_seqlens_m=expert_frequency_offset,
+                dynamic_scheduler=False,
+                config=_sm100_cfg(a, 128, 256, 1, 1),
+            )
         else:
             gemm(a, w2.permute(2, 1, 0), out=y, cu_seqlens_m=expert_frequency_offset, bias=b2)
 
-        o = torch.empty(T, H, device=a.device, dtype=a.dtype)
+        o = torch.empty(T, H, device=a.device, dtype=y.dtype)
         topk_scores = topk_scores.view(-1)
 
         _router_forward(
@@ -348,6 +521,7 @@ class _DownProjection(torch.autograd.Function):
         ctx.is_varlen_K = is_varlen_K
         ctx.activation_type = activation_type
         ctx.use_fp8 = use_fp8
+        ctx.fp8_scale_interval = fp8_scale_interval
 
         ctx.save_for_backward(
             h,
@@ -389,35 +563,59 @@ class _DownProjection(torch.autograd.Function):
         ds = torch.empty_like(topk_scores)
 
         if ctx.use_fp8:
+            # ===== per tensor (tensor scaled) fp8 down proj backward =====
             assert b2 is None, "fp8 path does not support bias"
-            dout_fp8, dout_sc = _to_fp8_e4m3(dout)
-            w2_fp8, w2_sc = _to_fp8_e4m3_weight(w2, (2, 0, 1))
+            interval = ctx.fp8_scale_interval
+            E = w2.size(2)
             s = topk_scores[s_scatter_idx]
+            dout_sc = _fp8_scale_e4m3(dout, key="dout", interval=interval)
+            dout_fp8 = _fp8_cast_e4m3(dout, dout_sc)
+            w2_fp8, w2_sc = _to_fp8_e4m3_weight(w2, (2, 0, 1))
+            out_sc = dout_sc * w2_sc
             _, _, ds_scattered = gemm_dgated(
                 dout_fp8,
                 w2_fp8,
-                PreAct=h,  # must stay bf16: gemm_dgated asserts PreAct.element_size() == 2
-                activation=activation_type.value,
+                PreAct=h,
                 dx_out=dh,
                 postact_out=a_prime,
                 colvec_scale=s,
+                activation=activation_type.value,
                 colvec_reduce=True,
                 cu_seqlens_m=expert_frequency_offset,
                 A_idx=x_gather_idx,
                 dynamic_scheduler=False,
+                reduce_scale=out_sc,
             )
-            ds[s_scatter_idx] = ds_scattered * (dout_sc * w2_sc)
-            dh.mul_(dout_sc * w2_sc)
-            a_prime_fp8, ap_sc = _to_fp8_e4m3(a_prime)
-            gemm(
-                dout_fp8.T, a_prime_fp8,
-                out=dw2.permute(2, 0, 1),
+            ds[s_scatter_idx] = ds_scattered
+            # dh holds dh_true / out_sc (deferred dequant); dw1 (up bwd) folds
+            # out_sc back in via alpha2. Quantize dh + a_prime for dw2/dw1.
+            if (
+                _quack_fp8_quant2_e4m3 is not None
+                and dh.is_contiguous()
+                and a_prime.is_contiguous()
+                # Fp8Quant2's fused pair indexing overflows int32 on huge tensors
+                and dh.numel() + a_prime.numel() < 2**31
+            ):
+                dh_sc = _fp8_scale_e4m3(dh, key="dh", interval=interval)
+                ap_sc = _fp8_scale_e4m3(a_prime, key="a_prime", interval=interval)
+                dh_fp8, a_prime_fp8 = _quack_fp8_quant2_e4m3(dh, dh_sc, a_prime, ap_sc)
+            else:
+                dh_fp8, dh_sc = _to_fp8_e4m3(dh, key="dh", interval=interval)
+                a_prime_fp8, ap_sc = _to_fp8_e4m3(a_prime, key="a_prime", interval=interval)
+            _fp8_prequant[dh.data_ptr()] = (dh_fp8, dh_sc * out_sc)
+            # dw2 = dout^T @ a_prime per expert (per tensor)
+            gemm_tuned.fn(
+                dout_fp8.T,
+                a_prime_fp8,
+                dw2.permute(2, 0, 1),
+                alpha=dout_sc,
+                alpha2=ap_sc,
                 cu_seqlens_k=expert_frequency_offset,
                 A_idx=x_gather_idx,
                 batch_idx_permute=None,
                 dynamic_scheduler=False,
+                config=_sm100_cfg(dout, 128, 128, 1, 1),
             )
-            dw2.mul_(dout_sc * ap_sc)
         else:
             _down_projection_backward_act(
                 dout=dout,
@@ -447,7 +645,7 @@ class _DownProjection(torch.autograd.Function):
         if not is_varlen_K:
             ds = ds.view(T, K)
 
-        return None, dh, dw2, db2, ds, *[None] * 10
+        return None, dh, dw2, db2, ds, *[None] * 14
 
 
 def moe_TC_softmax_topk_layer(
@@ -465,6 +663,11 @@ def moe_TC_softmax_topk_layer(
     norm_topk_probs: bool = False,
     concat_layout: bool = False,
     use_fp8: bool = False,
+    fp8_side_out: bool = True,
+    fp8_side_out_min: int = 1048576,
+    fp8_side_out_cfg: tuple[int, int, int, int] = (128, 256, 1, 1),
+    fp8_scale_interval: int = _DEFAULT_FP8_SCALE_UPDATE_INTERVAL,
+    fp8_down_prequant_min: int = _DEFAULT_FP8_DOWN_PREQUANT_MIN,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
@@ -511,6 +714,10 @@ def moe_TC_softmax_topk_layer(
         is_inference_mode_enabled,
         concat_layout,
         use_fp8,
+        fp8_side_out,
+        fp8_side_out_min,
+        fp8_side_out_cfg,
+        fp8_scale_interval,
     )
 
     o = _DownProjection.apply(
@@ -529,6 +736,8 @@ def moe_TC_softmax_topk_layer(
         False,  # is_each_token_has_variable_activated_expert
         activation_type,
         use_fp8,
+        fp8_scale_interval,
+        fp8_down_prequant_min,
     )
 
     return o, router_logits, expert_frequency
@@ -560,6 +769,11 @@ def moe_general_routing_inputs(
     is_inference_mode_enabled: bool = False,
     concat_layout: bool = False,
     use_fp8: bool = False,
+    fp8_side_out: bool = True,
+    fp8_side_out_min: int = 1048576,
+    fp8_side_out_cfg: tuple[int, int, int, int] = (128, 256, 1, 1),
+    fp8_scale_interval: int = _DEFAULT_FP8_SCALE_UPDATE_INTERVAL,
+    fp8_down_prequant_min: int = _DEFAULT_FP8_DOWN_PREQUANT_MIN,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
@@ -612,6 +826,10 @@ def moe_general_routing_inputs(
         is_inference_mode_enabled,
         concat_layout,
         use_fp8,
+        fp8_side_out,
+        fp8_side_out_min,
+        fp8_side_out_cfg,
+        fp8_scale_interval,
     )
 
     o = _DownProjection.apply(
@@ -630,6 +848,8 @@ def moe_general_routing_inputs(
         True,  # is_each_token_has_variable_activated_expert
         activation_type,
         use_fp8,
+        fp8_scale_interval,
+        fp8_down_prequant_min,
     )
 
     return o, expert_frequency
