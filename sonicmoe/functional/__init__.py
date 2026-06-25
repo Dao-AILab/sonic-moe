@@ -2,8 +2,6 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
-import inspect
-
 import torch
 import torch.nn.functional as F
 from quack.gemm_config import GemmConfig
@@ -27,23 +25,7 @@ except Exception:
 
 
 
-def _quack_has_arg(fn, name: str) -> bool:
-    return name in inspect.signature(getattr(fn, "fn", fn)).parameters
-
-
-_HAS_QUACK_FUSED_QUANT_A = _quack_has_arg(gemm, "scale_A")
-_HAS_QUACK_GATED_FUSED_QUANT_A = _quack_has_arg(gemm_gated_tuned, "scale_A")
-_HAS_QUACK_QUANT_A_OUT = _quack_has_arg(gemm_gated_tuned, "quant_A_out")
-_HAS_QUACK_GATED_POSTACT_SCALE = _quack_has_arg(gemm_gated_tuned, "postact_scale")
 _DEFAULT_FP8_DOWN_PREQUANT_MIN = 1048576
-
-
-def _can_use_quack_fused_quant_a(x: torch.Tensor) -> bool:
-    return (
-        (_HAS_QUACK_FUSED_QUANT_A or _HAS_QUACK_GATED_FUSED_QUANT_A)
-        and x.is_cuda
-        and torch.cuda.get_device_capability(x.device)[0] >= 10
-    )
 
 _FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
@@ -93,15 +75,9 @@ def _cached_fp8_scale_e4m3(
 
 
 def _fp8_cast_e4m3(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    if (
-        _quack_fp8_quant_e4m3 is not None
-        and x.is_cuda
-        and x.is_contiguous()
-        and x.numel() % 2 == 0
-    ):
+    if _quack_fp8_quant_e4m3 is not None and x.is_contiguous():
         return _quack_fp8_quant_e4m3(x, scale)
-    fp8_input = (x / scale).clamp(min=-_FP8_E4M3_MAX, max=_FP8_E4M3_MAX)
-    return fp8_input.to(torch.float8_e4m3fn)
+    return (x / scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
 
 
 def _to_fp8_e4m3(
@@ -239,9 +215,7 @@ class _UpProjection(torch.autograd.Function):
 
         a_post_sc = (
             _cached_fp8_scale_e4m3("a", (TK, I), x.dtype, x.device, fp8_scale_interval)
-            if use_fp8
-            and is_inference_mode_enabled
-            and _HAS_QUACK_GATED_POSTACT_SCALE
+            if use_fp8 and is_inference_mode_enabled
             else None
         )
         a_dtype = torch.float8_e4m3fn if a_post_sc is not None else x.dtype
@@ -262,9 +236,8 @@ class _UpProjection(torch.autograd.Function):
                 fp8_side_out
                 and not is_inference_mode_enabled
                 and x.numel() >= fp8_side_out_min
-                and _HAS_QUACK_GATED_FUSED_QUANT_A
-                and _HAS_QUACK_QUANT_A_OUT
-                and _can_use_quack_fused_quant_a(x)
+                and x.is_contiguous()
+                and torch.cuda.get_device_capability(x.device)[0] >= 10
             )
             if can_fuse_x:
                 x_arg = x
@@ -485,7 +458,7 @@ class _DownProjection(torch.autograd.Function):
                     scale_A = None
                 else:
                     a_arg = a
-                    scale_A = a_sc if _can_use_quack_fused_quant_a(a) else None
+                    scale_A = a_sc if torch.cuda.get_device_capability(a.device)[0] >= 10 else None
                     if scale_A is None:
                         a_arg = _fp8_cast_e4m3(a, a_sc)
             gemm_tuned.fn(
@@ -590,8 +563,7 @@ class _DownProjection(torch.autograd.Function):
             # dh holds dh_true / out_sc (deferred dequant); dw1 (up bwd) folds
             # out_sc back in via alpha2. Quantize dh + a_prime for dw2/dw1.
             if (
-                _quack_fp8_quant2_e4m3 is not None
-                and dh.is_contiguous()
+                dh.is_contiguous()
                 and a_prime.is_contiguous()
                 # Fp8Quant2's fused pair indexing overflows int32 on huge tensors
                 and dh.numel() + a_prime.numel() < 2**31
