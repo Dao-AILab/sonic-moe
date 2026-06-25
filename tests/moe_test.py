@@ -191,7 +191,7 @@ class Fp8TrainingTest(TestCommons):
             _FP8_SHAPES,
         )
     )
-    def test_mixed_fp8_fwd_bf16_bwd(
+    def test_fp8_forward_backward(
         self,
         device: torch.device,
         problem_shape: tuple[int, int, int, int, int],
