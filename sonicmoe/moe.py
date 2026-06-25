@@ -210,9 +210,6 @@ class MoE(nn.Module):
         kernel_backend_moe: KernelBackendMoE = KernelBackendMoE.sonicmoe,
         is_inference_mode: bool = False,
         use_fp8: bool = False,
-        fp8_side_out: bool = True,
-        fp8_side_out_min: int = 1048576,
-        fp8_side_out_cfg: tuple[int, int, int, int] = (128, 256, 1, 1),
         fp8_scale_interval: int = 1024,
         fp8_down_prequant_min: int = 1048576,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -234,9 +231,6 @@ class MoE(nn.Module):
                 self.activation_function,
                 is_inference_mode or not self.training,
                 use_fp8=use_fp8,
-                fp8_side_out=fp8_side_out,
-                fp8_side_out_min=fp8_side_out_min,
-                fp8_side_out_cfg=fp8_side_out_cfg,
                 fp8_scale_interval=fp8_scale_interval,
                 fp8_down_prequant_min=fp8_down_prequant_min,
             )

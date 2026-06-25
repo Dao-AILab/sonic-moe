@@ -185,9 +185,6 @@ class _UpProjection(torch.autograd.Function):
         is_inference_mode_enabled: bool,
         concat_layout: bool = False,
         use_fp8: bool = False,
-        fp8_side_out: bool = True,
-        fp8_side_out_min: int = 1048576,
-        fp8_side_out_cfg: tuple[int, int, int, int] = (128, 256, 1, 1),
         fp8_scale_interval: int = _DEFAULT_FP8_SCALE_UPDATE_INTERVAL,
     ) -> torch.Tensor:
         T, H = x.shape
@@ -216,42 +213,17 @@ class _UpProjection(torch.autograd.Function):
         if use_fp8:
             x_sc = _fp8_scale_e4m3(x, key="x", interval=fp8_scale_interval)
             w1_fp8, w1_sc = _to_fp8_e4m3_weight(w1, (2, 1, 0))
-            can_fuse_x = (
-                fp8_side_out
-                and not is_inference_mode_enabled
-                and x.numel() >= fp8_side_out_min
-                and x.is_contiguous()
-                and torch.cuda.get_device_capability(x.device)[0] >= 10
+            x_fp8 = _fp8_cast_e4m3(x, x_sc)
+            gemm_gated_tuned(
+                x_fp8, w1_fp8, h, a,
+                activation=activation_type.value,
+                cu_seqlens_m=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                dynamic_scheduler=False,
+                concat_layout=(("B",) if concat_layout else None),
+                alpha=x_sc, alpha2=w1_sc,
+                postact_scale=a_post_sc,
             )
-            if can_fuse_x:
-                # Fused: kernel reads bf16 x and emits fp8 side output (quant_A_out).
-                x_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-                gemm_gated_tuned.fn(
-                    x, w1_fp8, h, a,
-                    activation=activation_type.value,
-                    cu_seqlens_m=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    dynamic_scheduler=False,
-                    concat_layout=(("B",) if concat_layout else None),
-                    alpha=x_sc, alpha2=w1_sc,
-                    scale_A=x_sc, quant_A_out=x_fp8,
-                    quant_A_out_idx=s_scatter_idx if K is not None else None,
-                    quant_A_out_stride=K if K is not None else 1,
-                    postact_scale=a_post_sc,
-                    config=_sm100_cfg(x, *fp8_side_out_cfg),
-                )
-            else:
-                x_fp8 = _fp8_cast_e4m3(x, x_sc)
-                gemm_gated_tuned(
-                    x_fp8, w1_fp8, h, a,
-                    activation=activation_type.value,
-                    cu_seqlens_m=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    dynamic_scheduler=False,
-                    concat_layout=(("B",) if concat_layout else None),
-                    alpha=x_sc, alpha2=w1_sc,
-                    postact_scale=a_post_sc,
-                )
             if a_post_sc is not None:
                 _fp8_prequant[a.data_ptr()] = (a, a_post_sc)
             if not is_inference_mode_enabled:
@@ -394,7 +366,7 @@ class _UpProjection(torch.autograd.Function):
             is_varlen_K=is_each_token_has_variable_activated_experts,
         )
 
-        return dx_reduced, dw1, db1, *[None] * 18
+        return dx_reduced, dw1, db1, *[None] * 13
 
 
 class _DownProjection(torch.autograd.Function):
@@ -617,9 +589,6 @@ def moe_TC_softmax_topk_layer(
     norm_topk_probs: bool = False,
     concat_layout: bool = False,
     use_fp8: bool = False,
-    fp8_side_out: bool = True,
-    fp8_side_out_min: int = 1048576,
-    fp8_side_out_cfg: tuple[int, int, int, int] = (128, 256, 1, 1),
     fp8_scale_interval: int = _DEFAULT_FP8_SCALE_UPDATE_INTERVAL,
     fp8_down_prequant_min: int = _DEFAULT_FP8_DOWN_PREQUANT_MIN,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -668,9 +637,6 @@ def moe_TC_softmax_topk_layer(
         is_inference_mode_enabled,
         concat_layout,
         use_fp8,
-        fp8_side_out,
-        fp8_side_out_min,
-        fp8_side_out_cfg,
         fp8_scale_interval,
     )
 
@@ -723,9 +689,6 @@ def moe_general_routing_inputs(
     is_inference_mode_enabled: bool = False,
     concat_layout: bool = False,
     use_fp8: bool = False,
-    fp8_side_out: bool = True,
-    fp8_side_out_min: int = 1048576,
-    fp8_side_out_cfg: tuple[int, int, int, int] = (128, 256, 1, 1),
     fp8_scale_interval: int = _DEFAULT_FP8_SCALE_UPDATE_INTERVAL,
     fp8_down_prequant_min: int = _DEFAULT_FP8_DOWN_PREQUANT_MIN,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -780,9 +743,6 @@ def moe_general_routing_inputs(
         is_inference_mode_enabled,
         concat_layout,
         use_fp8,
-        fp8_side_out,
-        fp8_side_out_min,
-        fp8_side_out_cfg,
         fp8_scale_interval,
     )
 
