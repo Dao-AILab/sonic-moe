@@ -26,10 +26,6 @@ from sonicmoe import MoE
 from sonicmoe.enums import ActivationType, is_glu
 from sonicmoe.functional import moe_TC_softmax_topk_layer
 
-# Silence the AccumulateGrad stream mismatch warning from the retain_graph
-# fwd+bwd benchmark loop (intentional here, not a correctness issue).
-torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
-
 
 def _fast_sm100_configs(epilogue=None):
     tile_n_vals = [128, 160, 192, 256]
