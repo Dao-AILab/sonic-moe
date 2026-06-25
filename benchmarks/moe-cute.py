@@ -173,7 +173,7 @@ def parse_arguments() -> argparse.Namespace:
         "--fp8",
         action="store_true",
         default=False,
-        help="Use mixed fp8 forward (fp8 expert GEMMs) with bf16 backward (SM90+)",
+        help="Use fp8 expert GEMMs for forward and backward (SM90+)",
     )
     args = parser.parse_args()
 
@@ -508,7 +508,12 @@ def run(
             )
 
         fwd_fp8_timing = do_bench(lambda: fp8_moe(True), warmup=warmup, rep=repeats)
+        tflops = fp8_fwd_flops / (fwd_fp8_timing * 1e9)
+        print0(f" fp8 Fwd (inference) Average time: {fwd_fp8_timing:.3f} ms, TFLOPS: {tflops:.1f}")
+
         fwd_train_fp8_timing = do_bench(lambda: fp8_moe(False), warmup=warmup, rep=repeats)
+        tflops = fp8_fwd_flops / (fwd_train_fp8_timing * 1e9)
+        print0(f" fp8 Fwd (training) Average time: {fwd_train_fp8_timing:.3f} ms, TFLOPS: {tflops:.1f}")
 
         time.sleep(0.5)
         torch.cuda.synchronize()
@@ -519,27 +524,11 @@ def run(
             x.grad = w1.grad = w2.grad = router_w.grad = None
 
         fp8_e2e_timing = do_bench(forward_backward_fp8, warmup=warmup, rep=repeats)
+        tflops = fp8_e2e_flops / (fp8_e2e_timing * 1e9)
+        print0(f"[bold cyan][/bold cyan] fp8 Fwd+Bwd Average time: {fp8_e2e_timing:.3f} ms, TFLOPS: {tflops:.1f}")
         fp8_bwd_timing = fp8_e2e_timing - fwd_train_fp8_timing
-
-        bwd_flops = fp8_e2e_flops - fp8_fwd_flops
-        rows = [
-            ("Fwd (inf)",    fwd_timing,         fwd_fp8_timing,       fp8_fwd_flops),
-            ("Fwd (train)",  fwd_no_cg_timing,   fwd_train_fp8_timing, fp8_fwd_flops),
-            ("Fwd+Bwd",      e2e_timing,         fp8_e2e_timing,       fp8_e2e_flops),
-            ("Bwd",          bwd_time,           fp8_bwd_timing,       bwd_flops),
-        ]
-        print0(f"[bold cyan]=== Mixed fp8 vs bf16 ===[/bold cyan]")
-        hdr = f"| {'Stage':<12} | {'bf16 ms':>8} | {'bf16 TF':>8} | {'fp8 ms':>8} | {'fp8 TF':>8} | {'speedup':>12} |"
-        print0(hdr)
-        print0(f"|{'-'*14}|{'-'*10}|{'-'*10}|{'-'*10}|{'-'*10}|{'-'*14}|")
-        for name, bms, fms, fl in rows:
-            btf = fl / (bms * 1e9)
-            ftf = fl / (fms * 1e9)
-            msr = bms / fms
-            print0(
-                f"| {name:<12} | {bms:>8.3f} | {btf:>8.0f} | {fms:>8.3f} | {ftf:>8.0f} "
-                f"| {f'{msr:.2f}x +{(msr - 1) * 100:.1f}%':>12} |"
-            )
+        tflops = (fp8_e2e_flops - fp8_fwd_flops) / (fp8_bwd_timing * 1e9)
+        print0(f"[bold cyan][/bold cyan] fp8 Bwd Average time: {fp8_bwd_timing:.3f} ms, TFLOPS: {tflops:.1f}")
 
 
 if __name__ == "__main__":
