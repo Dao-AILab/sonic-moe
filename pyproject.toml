@@ -9,7 +9,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "torch>=2.11.0",
-    "quack-kernels>=0.4.0",
+    "quack-kernels>=0.5.0",
 ]
 
 [project.optional-dependencies]
