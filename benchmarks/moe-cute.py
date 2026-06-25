@@ -505,6 +505,7 @@ def run(
                 norm_topk_probs=norm_topk_probs,
                 concat_layout=concat_layout,
                 use_fp8=True,
+                fp8_side_out=False,
             )
 
         fwd_fp8_timing = do_bench(lambda: fp8_moe(True), warmup=warmup, rep=repeats)
