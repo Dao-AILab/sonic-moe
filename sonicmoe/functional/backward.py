@@ -311,7 +311,11 @@ def _down_projection_backward_act(
     assert activation_type in (
         "swiglu",
         "geglu",
-    ), f"QuACK gemm_gated only supports glu activations, got {activation_type}"
+        "relu_sq",
+    ), (
+        "sonic-moe QuACK path supports swiglu/geglu (gated) and relu_sq (non-gated), "
+        f"got {activation_type}"
+    )
 
     s = topk_scores[s_scatter_idx]
     _, _, ds_scattered = gemm_dgated(

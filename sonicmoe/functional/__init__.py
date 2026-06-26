@@ -106,7 +106,13 @@ class _UpProjection(torch.autograd.Function):
         assert activation_type.value in (
             "swiglu",
             "geglu",
-        ), f"QuACK gemm_gated only supports glu activations, got {activation_type.value}"
+            "relu_sq",
+        ), (
+            "sonic-moe QuACK path supports swiglu/geglu (gated) and relu_sq (non-gated), "
+            f"got {activation_type.value}"
+        )
+        # gemm_gated is an alias of quack's gemm_act and dispatches non-gated activations
+        # (e.g. relu_sq) to the non-gated path automatically based on `activation`.
         gemm_gated(
             x,
             w1.permute(2, 1, 0),
@@ -368,7 +374,9 @@ def moe_TC_softmax_topk_layer(
         activation_type = ActivationType(activation_type)
 
     assert not torch.compiler.is_compiling()
-    assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
+    assert is_glu(activation_type) or activation_type == ActivationType.RELU_SQ, (
+        "QuACK GEMM path supports GLU activations (swiglu/geglu) and relu_sq"
+    )
 
     a, h = _UpProjection.apply(
         x,
@@ -466,7 +474,9 @@ def moe_general_routing_inputs(
     )
 
     assert not torch.compiler.is_compiling()
-    assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
+    assert is_glu(activation_type) or activation_type == ActivationType.RELU_SQ, (
+        "QuACK GEMM path supports GLU activations (swiglu/geglu) and relu_sq"
+    )
 
     a, h = _UpProjection.apply(
         x,

@@ -424,7 +424,11 @@ class _MoeEPFunction(torch.autograd.Function):
         assert activation_type.value in (
             "swiglu",
             "geglu",
-        ), f"gemm_gated only supports glu activations, got {activation_type.value}"
+            "relu_sq",
+        ), (
+            "sonic-moe QuACK path supports swiglu/geglu (gated) and relu_sq (non-gated), "
+            f"got {activation_type.value}"
+        )
         gemm_gated(
             x_compute,
             w1.permute(2, 1, 0),
