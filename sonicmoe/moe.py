@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .enums import ActivationType, KernelBackendMoE, is_glu
-from .functional import moe_TC_softmax_topk_layer
+from .functional import moe_TC_softmax_topk_layer, moe_TC_softmax_topk_layer_fp8
 
 
 try:
@@ -215,7 +215,22 @@ class MoE(nn.Module):
         # hidden_states -> (batch_size, query_length, hidden_size)
         hidden_states = hidden_states.view(-1, self.hidden_size)
 
-        if kernel_backend_moe == KernelBackendMoE.sonicmoe and self.num_experts <= 32768:
+        is_fp8 = kernel_backend_moe == KernelBackendMoE.sonicmoe_fp8
+        if is_fp8:
+            # MXFP8 blockscaled path (SM90). Forward/inference-only: no autograd
+            # graph and no aux loss. Weights are quantized inside the call.
+            assert self.c_fc.bias is None and self.c_proj.bias is None, (
+                "sonicmoe_fp8 does not support bias yet"
+            )
+            hidden_states, router_logits, expert_frequency = moe_TC_softmax_topk_layer_fp8(
+                hidden_states,
+                self.router.weight,
+                self.c_fc.weight,
+                self.c_proj.weight,
+                self.top_k,
+                self.activation_function,
+            )
+        elif kernel_backend_moe == KernelBackendMoE.sonicmoe and self.num_experts <= 32768:
             hidden_states, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
                 hidden_states,
                 self.router.weight,
@@ -247,7 +262,7 @@ class MoE(nn.Module):
 
         # hidden_states -> (batch_size, query_length, hidden_size)
 
-        if is_inference_mode:
+        if is_inference_mode or is_fp8:
             aux_loss = None
         else:
             aux_loss = self._compute_switch_loss(

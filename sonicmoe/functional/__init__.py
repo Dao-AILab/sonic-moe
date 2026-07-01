@@ -16,6 +16,7 @@ from .backward import (
     _up_projection_backward_act,
 )
 from .forward import _router_forward, _topk_softmax_fwd
+from .forward_fp8 import moe_TC_softmax_topk_layer_fp8
 from .triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
 
 
