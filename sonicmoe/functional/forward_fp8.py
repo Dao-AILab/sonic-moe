@@ -11,7 +11,7 @@ and re-quantizes the weights each call.
 
 import torch
 import torch.nn.functional as F
-from quack.gemm_blockscaled_interface import (
+from quack.gemm_blockscaled_sm90 import (
     mxfp8_gemm_act_sm90,
     mxfp8_gemm_gated_tuned_sm90,
     quantize_weight_sm90,

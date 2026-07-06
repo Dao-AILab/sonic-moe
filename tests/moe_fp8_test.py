@@ -29,7 +29,7 @@ def _cos_diff(a: torch.Tensor, b: torch.Tensor) -> float:
 
 def _dequant_ref(x, router_w, w1, w2, K, activation):
     """Full MoE in float32 using tensors quantized+dequantized exactly like the kernel."""
-    from quack.gemm_blockscaled_interface import quantize_weight_sm90
+    from quack.gemm_blockscaled_sm90 import quantize_weight_sm90
     from quack.quant import blockwise_quant
 
     T, H = x.shape
