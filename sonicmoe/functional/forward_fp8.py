@@ -3,7 +3,7 @@
 # ********************************************************************************
 """Forward-only MXFP8 blockscaled MoE (SM90 / Hopper).
 
-Activations are quantized with 1x128 K-blocks (`quantize_act_sm90`) and weights
+Activations are quantized with 1x128 K-blocks (`blockwise_quant`) and weights
 with 128x128 blocks (`quantize_weight_sm90`); the grouped GEMMs use QuACK's SM90
 blockscaled kernels. This path is inference-only — it builds no autograd graph
 and re-quantizes the weights each call.
@@ -14,42 +14,16 @@ import torch.nn.functional as F
 from quack.gemm_blockscaled_interface import (
     mxfp8_gemm_act_sm90,
     mxfp8_gemm_gated_tuned_sm90,
-    quantize_act_sm90,
     quantize_weight_sm90,
 )
 from quack.gemm_config import GemmConfig
+from quack.quant import blockwise_quant, dqaccum_total_padded_m
 
 from ..enums import ActivationType, is_glu
 from .forward import _router_forward, _topk_softmax_fwd
-from .triton_kernels import TC_topk_router_metadata_triton
+from .triton_kernels import TC_topk_router_metadata_triton, gather_padded_sfa
 
 _SF = 128  # SM90 K-block / dQaccum row-pad granularity
-
-
-def _grouped_padded_sfa(
-    x_scale: torch.Tensor, x_gather_idx: torch.Tensor, expert_frequency_offset: torch.Tensor
-) -> torch.Tensor:
-    """Gather per-token activation scales into expert-grouped order and dQaccum-pad.
-
-    `x_scale` is (T, sf_k) in token order (from `quantize_act_sm90`). The up-proj
-    gathers activations on the fly via `x_gather_idx` (grouped_pos -> token), so the
-    scales must be pre-arranged to match: grouped[p] = x_scale[x_gather_idx[p]], then
-    each expert's rows padded to start on a 128-row boundary (see
-    quack/AI/varlen_blockscaled_sf_layout.md). Returns (total_padded_m, sf_k),
-    M-innermost (stride-1 M) so the kernel's (BLOCK_M, 1) TMA burst stays contiguous.
-    """
-    grouped = x_scale[x_gather_idx.long()]  # (TK, sf_k), expert-sorted order
-    total_m, sf_k = grouped.shape
-    seqlens_m = (expert_frequency_offset[1:] - expert_frequency_offset[:-1]).cpu().tolist()
-    L = len(seqlens_m)
-    total_padded_m = ((total_m + _SF - 1) // _SF + (L - 1)) * _SF
-    padded = grouped.new_zeros(sf_k, total_padded_m)
-    row = 0
-    for i, m_i in enumerate(seqlens_m):
-        row_padded = (row // _SF + i) * _SF
-        padded[:, row_padded : row_padded + m_i] = grouped[row : row + m_i].mT
-        row += m_i
-    return padded.mT  # (total_padded_m, sf_k), M innermost
 
 
 def moe_TC_softmax_topk_layer_fp8(
@@ -95,6 +69,9 @@ def moe_TC_softmax_topk_layer_fp8(
     expert_frequency = torch.empty(E, dtype=torch.int32, device=device)
     expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
     x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    total_padded_M = dqaccum_total_padded_m(TK, E)
+    padded_gather_idx = torch.empty(total_padded_M, dtype=torch.int32, device=device)
+    padded_grouped_idx = torch.empty(TK, dtype=torch.int32, device=device)
     TC_topk_router_metadata_triton(
         topk_indices,
         E,
@@ -103,20 +80,17 @@ def moe_TC_softmax_topk_layer_fp8(
         x_gather_idx,
         s_scatter_idx,
         s_reverse_scatter_idx,
+        padded_gather_idx,
+        padded_grouped_idx,
     )
 
-    # ── Quantize weights (128x128) ───────────────────────────────────────────
-    # quantize_weight_sm90(w) : w (E, N, K) -> q (E, N, K), scale (E, N/128, K/128).
-    # The kernel wants B as (K, N) K-contig, so pass q.mT / scale.mT (per QuACK convention).
     w1_q, w1_sc = quantize_weight_sm90(w1)  # (E, 2I, H), (E, 2I/128, H/128)
     B1, B1_sc = w1_q.mT, w1_sc.mT  # (E, H, 2I), (E, H/128, 2I/128)
     w2_q, w2_sc = quantize_weight_sm90(w2)  # (E, H, I), (E, H/128, I/128)
     B2, B2_sc = w2_q.mT, w2_sc.mT  # (E, I, H), (E, I/128, H/128)
 
-    # ── Up projection: gated GEMM with on-the-fly gather of x by expert ──────
-    # gather_A needs cluster_n == 1; pin an explicit config for the up-proj.
-    x_q, x_sc = quantize_act_sm90(x)  # (T, H) fp8, (T, H/128) f32 (token order)
-    sfa_up = _grouped_padded_sfa(x_sc, x_gather_idx, expert_frequency_offset)
+    x_q, x_sc = blockwise_quant(x, block_size=_SF, scale_transpose=True)  # (T,H) fp8, (T,H/128) f32
+    sfa_up = gather_padded_sfa(x_sc, padded_gather_idx, total_padded_M)
     a = torch.empty(TK, I, dtype=x.dtype, device=device)  # postact (gated -> N//2 = I)
     gather_config = GemmConfig(
         tile_m=128,
@@ -142,8 +116,13 @@ def moe_TC_softmax_topk_layer_fp8(
         config=gather_config,
     )
 
-    # ── Down projection: grouped GEMM (a already expert-grouped, no gather) ──
-    a_q, sfa_down = quantize_act_sm90(a, cu_seqlens_m=expert_frequency_offset)
+    a_q, sfa_down = blockwise_quant(
+        a,
+        block_size=_SF,
+        scale_transpose=True,
+        scale_row_idx=padded_grouped_idx,
+        scale_rows=total_padded_M,
+    )  # a_q (TK,I) fp8; sfa_down (total_padded_M, I/128) dQaccum-padded
     _, y = mxfp8_gemm_act_sm90(
         a_q,
         B2,

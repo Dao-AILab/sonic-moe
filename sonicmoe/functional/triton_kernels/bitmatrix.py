@@ -65,6 +65,8 @@ def _bitmatrix_metadata_compute_stage2(
     s_scatter_idx_ptr,
     s_reverse_scatter_idx_ptr,
     x_gather_idx_ptr,
+    padded_gather_idx_ptr,
+    padded_grouped_idx_ptr,
     topk_indices_ptr,
     T,
     partial_sum_ptr,
@@ -73,12 +75,15 @@ def _bitmatrix_metadata_compute_stage2(
     K_POW2: tl.constexpr,  # padded K, == BLOCK_SIZE / BLOCK
     K: tl.constexpr,  # actual experts per token
     TOKENS_PER_BLOCK: tl.constexpr,  # tokens per tile
+    HAS_PADDED: tl.constexpr,  # whether to emit padded_gather_idx (dQaccum SFA rows)
 ):
     # One CTA per tile, same tiling as _compute_col_partial_sum_kernel.
     # For each entry (token t, k-slot k) in this tile:
     #   s_reverse_scatter_idx[entry_idx] = output position in expert-sorted order
     #   s_scatter_idx[output_pos]        = entry_idx   (inverse permutation)
     #   x_gather_idx[output_pos]         = token index (= entry_idx // K)
+    #   padded_gather_idx[padded_row]    = token index, at the dQaccum-padded SFA row
+    #   padded_grouped_idx[padded_row]   = grouped position (= output_pos), at the padded row
     #
     # Output position = expert_offs[e]          (global start of expert e)
     #                 + partial_sum[tile, e]     (entries for e in earlier tiles, after stage1)
@@ -125,18 +130,32 @@ def _bitmatrix_metadata_compute_stage2(
     # Output position for this entry in the expert-sorted output array.
     # partial_sum layout after stage1: [n_tiles, E], stride (1, n_tiles).
     # So partial_sum[pid_m, expert] = partial_sum_ptr + pid_m*1 + expert*n_tiles.
+    expert_off = tl.load(expert_offs_ptr + expert, mask=mask)
     s_reverse_scatter_idx = tl.load(partial_sum_ptr + pid_m + expert * n_tiles, mask=mask)
-    s_reverse_scatter_idx += tl.load(expert_offs_ptr + expert, mask=mask)
+    s_reverse_scatter_idx += expert_off
     s_reverse_scatter_idx += within_expert_rank
+
+    # dQaccum-padded destination row for this entry's scale. Expert e's block starts at
+    # (expert_off // 128 + e) * 128 (128-aligned tile boundary), and
+    # (s_reverse_scatter_idx - expert_off) is the global within-expert rank (g - cu[e]).
+    # Matches _dqaccum_row_idx / permute_scale_to_dqaccum in quack.quant.
+    if HAS_PADDED:
+        padded_row = (expert_off // 128 + expert.to(tl.int32)) * 128 + (
+            s_reverse_scatter_idx - expert_off
+        )
 
     if IS_POW2_K:
         # presort_offs == offs_local before sort; entry_idx is the flat index into
         # topk_router_indices.view(-1), i.e. token * K + k_slot.
         presort_offs = kv_pairs & 0xFFFF
         entry_idx = pid_m * BLOCK_SIZE + presort_offs
+        token = entry_idx // K_POW2
         tl.store(s_reverse_scatter_idx_ptr + entry_idx, s_reverse_scatter_idx, mask=mask)
         tl.store(s_scatter_idx_ptr + s_reverse_scatter_idx, entry_idx, mask=mask)
-        tl.store(x_gather_idx_ptr + s_reverse_scatter_idx, entry_idx // K_POW2, mask=mask)
+        tl.store(x_gather_idx_ptr + s_reverse_scatter_idx, token, mask=mask)
+        if HAS_PADDED:
+            tl.store(padded_gather_idx_ptr + padded_row, token, mask=mask)
+            tl.store(padded_grouped_idx_ptr + s_reverse_scatter_idx, padded_row, mask=mask)
     else:
         # presort_offs is in K_POW2-padded space; convert to unpadded entry_idx.
         presort_offs = kv_pairs & 0xFFFF
@@ -145,3 +164,6 @@ def _bitmatrix_metadata_compute_stage2(
         tl.store(s_reverse_scatter_idx_ptr + entry_idx, s_reverse_scatter_idx, mask=mask)
         tl.store(s_scatter_idx_ptr + s_reverse_scatter_idx, entry_idx, mask=mask)
         tl.store(x_gather_idx_ptr + s_reverse_scatter_idx, token_i_global_s, mask=mask)
+        if HAS_PADDED:
+            tl.store(padded_gather_idx_ptr + padded_row, token_i_global_s, mask=mask)
+            tl.store(padded_grouped_idx_ptr + s_reverse_scatter_idx, padded_row, mask=mask)

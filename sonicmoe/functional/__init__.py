@@ -363,7 +363,7 @@ def moe_TC_softmax_topk_layer(
     x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
 
     TC_topk_router_metadata_triton(
-        topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
+        topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx, None, None
     )
 
     if type(activation_type) == str:

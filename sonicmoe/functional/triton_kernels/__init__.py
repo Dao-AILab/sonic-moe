@@ -66,11 +66,13 @@ def _compute_col_partial_sum_kernel(
 
 
 @torch.library.custom_op(
-    f"triton_kernels::TC_topk_router_metadata",
+    "triton_kernels::TC_topk_router_metadata",
     mutates_args={
         "expert_frequency",
         "expert_frequency_offset",
         "x_gather_idx",
+        "padded_gather_idx",
+        "padded_grouped_idx",
         "s_scatter_idx",
         "s_reverse_scatter_idx",
     },
@@ -83,7 +85,16 @@ def TC_topk_router_metadata_triton(
     x_gather_idx: torch.Tensor,
     s_scatter_idx: torch.Tensor,
     s_reverse_scatter_idx: torch.Tensor,
+    padded_gather_idx: torch.Tensor | None,
+    padded_grouped_idx: torch.Tensor | None,
 ) -> None:
+    # padded_gather_idx / padded_grouped_idx (optional): per-dQaccum-padded-SFA-row source
+    # indices so the fp8 GEMMs build their SFA with one gather (see gather_padded_sfa) instead
+    # of permute/grouped_scale_to_dqaccum. padded_gather_idx holds the *token* (for the up-proj,
+    # whose scale source is token-order); padded_grouped_idx holds the *grouped position* (for
+    # the down-proj, whose scale source is expert-grouped). stage2 writes only the real rows;
+    # padding rows are left uninitialized (gather_padded_sfa bounds-filters them and the GEMM
+    # discards padding output), so the caller may allocate these with torch.empty.
     T, K = topk_router_indices.size()
     TK = T * K
     device = topk_router_indices.device
@@ -131,10 +142,15 @@ def TC_topk_router_metadata_triton(
 
     # ── Kernel 3: stage2 ─────────────────────────────────────────────────────
     # For each tile: sort entries by expert, compute output positions, scatter.
+    # When the padded indices aren't requested, pass x_gather_idx as a harmless placeholder
+    # pointer (never written: HAS_PADDED gates the stores).
+    has_padded = padded_gather_idx is not None
     _bitmatrix_metadata_compute_stage2[(n_tiles,)](
         s_scatter_idx,
         s_reverse_scatter_idx,
         x_gather_idx,
+        padded_gather_idx if has_padded else x_gather_idx,
+        padded_grouped_idx if has_padded else x_gather_idx,
         topk_router_indices,
         T,
         col_partial_sum,
@@ -143,6 +159,7 @@ def TC_topk_router_metadata_triton(
         K_POW2=K_POW2,
         TOKENS_PER_BLOCK=TOKENS_PER_BLOCK,
         K=K,
+        HAS_PADDED=has_padded,
     )
 
 
@@ -351,3 +368,66 @@ def general_routing_router_metadata_triton(
         BLOCK_SIZE=TOKEN_BLOCK,
         N_ITERS=N_ITERS,
     )
+
+
+@triton.jit
+def _gather_padded_sfa_kernel(
+    x_sc_ptr,  # (T, SF_K) source block scales, M-contiguous (stride (1, T))
+    idx_ptr,  # (total_padded_M,) padded SFA row -> source row; padding rows hold garbage
+    out_ptr,  # (total_padded_M, SF_K) dQaccum-padded SFA, M-contiguous
+    T,
+    total_padded_M,
+    SF_K: tl.constexpr,
+    SF_K_POW2: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    # One padded-SFA row per output row: copy x_sc[idx[row], :]. The metadata kernel writes a
+    # valid source row for every real row; padding rows are never written, so their idx is
+    # garbage (idx_ptr is torch.empty). We bounds-check 0 <= idx < T so garbage never causes an
+    # OOB read — out-of-range → 0, in-range → a harmless real scale. Either is fine because the
+    # SM90 GEMM discards dQaccum padding output rows (same don't-care as grouped_scale_to_dqaccum).
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = rows < total_padded_M
+    token = tl.load(idx_ptr + rows, mask=row_mask, other=T)
+    valid = row_mask & (token >= 0) & (token < T)
+    k = tl.arange(0, SF_K_POW2)
+    k_mask = k < SF_K
+    src = tl.load(
+        x_sc_ptr + token[:, None] + k[None, :] * T,
+        mask=valid[:, None] & k_mask[None, :],
+        other=0.0,
+    )
+    tl.store(
+        out_ptr + rows[:, None] + k[None, :] * total_padded_M,
+        src,
+        mask=row_mask[:, None] & k_mask[None, :],
+    )
+
+
+def gather_padded_sfa(
+    x_sc: torch.Tensor, idx: torch.Tensor, total_padded_M: int
+) -> torch.Tensor:
+    """Build a dQaccum-padded SFA in one kernel: gather source block scales into
+    expert-grouped padded rows via `idx` (padded row -> source row). Real rows come from
+    the metadata kernel; padding rows (never written, hence garbage in `idx`) are bounds-
+    filtered and land as don't-care values the GEMM discards. Used for both projections:
+    up-proj passes token-order x_sc + padded_gather_idx, down-proj grouped a_sc + padded_grouped_idx.
+
+    Returns (total_padded_M, SF_K) stored M-contiguous (strides (1, total_padded_M)),
+    the SM90 SFA TMA's preferred layout.
+    """
+    T, SF_K = x_sc.shape
+    out = torch.empty(SF_K, total_padded_M, dtype=torch.float32, device=x_sc.device).mT
+    BLOCK_M = 128
+    _gather_padded_sfa_kernel[(triton.cdiv(total_padded_M, BLOCK_M),)](
+        x_sc,
+        idx,
+        out,
+        T,
+        total_padded_M,
+        SF_K=SF_K,
+        SF_K_POW2=triton.next_power_of_2(SF_K),
+        BLOCK_M=BLOCK_M,
+    )
+    return out
