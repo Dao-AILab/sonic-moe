@@ -94,8 +94,8 @@ def moe_TC_softmax_topk_layer_fp8(
     a = torch.empty(TK, I, dtype=x.dtype, device=device)  # postact (gated -> N//2 = I)
     gather_config = GemmConfig(
         tile_m=128,
-        tile_n=128,
-        cluster_m=1,
+        tile_n=256,
+        cluster_m=2,
         cluster_n=1,
         pingpong=False,
         is_dynamic_persistent=False,
