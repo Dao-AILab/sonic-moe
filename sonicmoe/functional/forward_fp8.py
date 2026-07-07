@@ -71,7 +71,7 @@ def moe_TC_softmax_topk_layer_fp8(
     x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
     total_padded_M = dqaccum_total_padded_m(TK, E)
     padded_gather_idx = torch.empty(total_padded_M, dtype=torch.int32, device=device)
-    padded_grouped_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    padded_grouped_idx = torch.empty(total_padded_M, dtype=torch.int32, device=device)
     TC_topk_router_metadata_triton(
         topk_indices,
         E,
@@ -116,13 +116,8 @@ def moe_TC_softmax_topk_layer_fp8(
         config=gather_config,
     )
 
-    a_q, sfa_down = blockwise_quant(
-        a,
-        block_size=_SF,
-        scale_transpose=True,
-        scale_row_idx=padded_grouped_idx,
-        scale_rows=total_padded_M,
-    )  # a_q (TK,I) fp8; sfa_down (total_padded_M, I/128) dQaccum-padded
+    a_q, a_sc = blockwise_quant(a, block_size=_SF, scale_transpose=True)  # (TK,I) fp8, (TK,I/128) f32
+    sfa_down = gather_padded_sfa(a_sc, padded_grouped_idx, total_padded_M)
     _, y = mxfp8_gemm_act_sm90(
         a_q,
         B2,

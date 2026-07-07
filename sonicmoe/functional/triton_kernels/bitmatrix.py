@@ -84,6 +84,7 @@ def _bitmatrix_metadata_compute_stage2(
     #   x_gather_idx[output_pos]         = token index (= entry_idx // K)
     #   padded_gather_idx[padded_row]    = token index, at the dQaccum-padded SFA row
     #   padded_grouped_idx[padded_row]   = grouped position (= output_pos), at the padded row
+    #     (both are gather maps: padded row -> source row, for gather_padded_sfa)
     #
     # Output position = expert_offs[e]          (global start of expert e)
     #                 + partial_sum[tile, e]     (entries for e in earlier tiles, after stage1)
@@ -155,7 +156,7 @@ def _bitmatrix_metadata_compute_stage2(
         tl.store(x_gather_idx_ptr + s_reverse_scatter_idx, token, mask=mask)
         if HAS_PADDED:
             tl.store(padded_gather_idx_ptr + padded_row, token, mask=mask)
-            tl.store(padded_grouped_idx_ptr + s_reverse_scatter_idx, padded_row, mask=mask)
+            tl.store(padded_grouped_idx_ptr + padded_row, s_reverse_scatter_idx, mask=mask)
     else:
         # presort_offs is in K_POW2-padded space; convert to unpadded entry_idx.
         presort_offs = kv_pairs & 0xFFFF
@@ -166,4 +167,4 @@ def _bitmatrix_metadata_compute_stage2(
         tl.store(x_gather_idx_ptr + s_reverse_scatter_idx, token_i_global_s, mask=mask)
         if HAS_PADDED:
             tl.store(padded_gather_idx_ptr + padded_row, token_i_global_s, mask=mask)
-            tl.store(padded_grouped_idx_ptr + s_reverse_scatter_idx, padded_row, mask=mask)
+            tl.store(padded_grouped_idx_ptr + padded_row, s_reverse_scatter_idx, mask=mask)
