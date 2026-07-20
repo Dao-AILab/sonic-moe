@@ -7,9 +7,14 @@ from typing import Callable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from quack import rmsnorm
+from quack.rmsnorm import rmsnorm_fwd
 
 from .enums import ActivationType, KernelBackendMoE, is_glu
-from .functional import moe_TC_softmax_topk_layer, moe_TC_softmax_topk_layer_fp8
+from .functional import FP8BlockwiseTensor, moe_TC_softmax_topk_layer, moe_TC_softmax_topk_layer_fp8
+
+# SM90 K-block / dQaccum row-pad granularity, must match forward_fp8._SF
+_FP8_QUANT_BLOCK_SIZE = 128
 
 
 try:
@@ -151,6 +156,23 @@ class Experts(nn.Module):
 
         return input
 
+    def fp8_weight(self) -> FP8BlockwiseTensor:
+        """Blockwise-FP8 (128x128) view of ``self.weight`` for the pre-quantized MoE path.
+
+        In eval / ``no_grad`` (weights static) the quantized payload is cached and reused,
+        invalidated on any in-place weight update via ``Tensor._version``. In training a
+        fresh straight-through wrapper is built each call so the weight gradient routes
+        back into ``self.weight``.
+        """
+        if torch.is_grad_enabled() and self.weight.requires_grad:
+            return FP8BlockwiseTensor.to_weights(self.weight)
+        version = self.weight._version
+        if getattr(self, "_fp8_weight", None) is None or self._fp8_weight_version != version:
+            with torch.no_grad():
+                self._fp8_weight = FP8BlockwiseTensor.to_weights(self.weight.detach())
+            self._fp8_weight_version = version
+        return self._fp8_weight
+
     def extra_repr(self):
         return "num_experts={}, in_features={}, out_features={}".format(
             self.num_experts, self.in_features, self.out_features
@@ -161,6 +183,32 @@ class Experts(nn.Module):
         nn.init.normal_(self.weight, mean=0, std=self.std)
         if hasattr(self, "bias") and self.bias is not None:
             self.bias.zero_()
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+        self.hidden_size = hidden_size
+
+    def forward(
+        self, input: torch.Tensor, quant: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not quant:
+            return rmsnorm(input, self.weight, eps=self.eps)
+
+        # Inference-only fused kernel: the norm and its blockwise FP8 quant are
+        # computed in one kernel launch (no autograd graph, no extra read/write
+        # pass over the normed activation for a separate blockwise_quant call).
+        output, _, _, output_q, output_sc = rmsnorm_fwd(
+            input, self.weight, eps=self.eps, quant_block_size=_FP8_QUANT_BLOCK_SIZE
+        )
+        return output, output_q, output_sc
+
+    def extra_repr(self) -> str:
+        return "hidden_size={}, eps={}".format(self.hidden_size, self.eps)
 
 
 class MoE(nn.Module):
@@ -209,6 +257,7 @@ class MoE(nn.Module):
         hidden_states: torch.Tensor,
         kernel_backend_moe: KernelBackendMoE = KernelBackendMoE.sonicmoe,
         is_inference_mode: bool = False,
+        prequant_fp8_weights: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         original_shape = hidden_states.shape
 
@@ -217,18 +266,24 @@ class MoE(nn.Module):
 
         is_fp8 = kernel_backend_moe == KernelBackendMoE.sonicmoe_fp8
         if is_fp8:
-            # MXFP8 blockscaled path (SM90). Forward/inference-only: no autograd
-            # graph and no aux loss. Weights are quantized inside the call.
+            # MXFP8 blockscaled path (SM90). `is_inference_mode` skips storing the
+            # up-projection's preact (no backward possible then, but saves
+            # memory/bandwidth in eval mode). With `prequant_fp8_weights`, the expert
+            # weights are handed in already 128x128-quantized (cached across eval calls),
+            # so the kernel skips its internal `quantize_weight_sm90`.
             assert self.c_fc.bias is None and self.c_proj.bias is None, (
                 "sonicmoe_fp8 does not support bias yet"
             )
+            w1 = self.c_fc.fp8_weight() if prequant_fp8_weights else self.c_fc.weight
+            w2 = self.c_proj.fp8_weight() if prequant_fp8_weights else self.c_proj.weight
             hidden_states, router_logits, expert_frequency = moe_TC_softmax_topk_layer_fp8(
                 hidden_states,
                 self.router.weight,
-                self.c_fc.weight,
-                self.c_proj.weight,
+                w1,
+                w2,
                 self.top_k,
                 self.activation_function,
+                is_inference_mode=is_inference_mode or not self.training,
             )
         elif kernel_backend_moe == KernelBackendMoE.sonicmoe and self.num_experts <= 32768:
             hidden_states, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
