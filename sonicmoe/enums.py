@@ -13,6 +13,7 @@ class KernelBackendMoE(Enum):
     scattermoe = "scattermoe"
     torch = "torch"
     sonicmoe = "sonicmoe"
+    sonicmoe_fp8 = "sonicmoe_fp8"
 
 
 class ActivationType(Enum):

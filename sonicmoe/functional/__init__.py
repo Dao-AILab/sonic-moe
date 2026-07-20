@@ -10,66 +10,16 @@ from quack.gemm_interface import gemm, gemm_dgated, gemm_gated
 
 from ..enums import ActivationType, is_glu
 from .backward import (
+    TC_Softmax_Topk_Router_Function,
     _down_projection_backward_act,
     _token_broadcast_backward,
     _topk_softmax_bwd,
     _up_projection_backward_act,
 )
 from .forward import _router_forward, _topk_softmax_fwd
+from .forward_fp8 import moe_TC_softmax_topk_layer_fp8
+from .fp8_tensor import FP8BlockwiseTensor
 from .triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
-
-
-class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx, router_logits: torch.Tensor, E: int, K: int, is_softmax_over_topk: bool, norm_topk_probs: bool
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        T = router_logits.size(0)
-
-        topk_router_score = torch.empty(T, K, dtype=torch.float32, device=router_logits.device)
-        topk_router_indices = torch.empty(T, K, dtype=torch.int32, device=router_logits.device)
-
-        _topk_softmax_fwd(
-            router_logits,
-            topk_router_score,
-            topk_router_indices,
-            E,
-            K,
-            is_softmax_over_topk=is_softmax_over_topk,
-            norm_topk_probs=norm_topk_probs,
-        )
-
-        # Save router_logits for topk(softmax()) backward (recompute full softmax).
-        # For softmax(topk()) it's unused but save unconditionally for simplicity.
-        ctx.save_for_backward(topk_router_score, topk_router_indices, router_logits)
-        ctx.E = E
-        ctx.dtype = router_logits.dtype
-        ctx.is_softmax_over_topk = is_softmax_over_topk
-        ctx.norm_topk_probs = norm_topk_probs
-
-        return topk_router_score, topk_router_indices
-
-    @staticmethod
-    def backward(ctx, dtopk_score: torch.Tensor, _: torch.Tensor):
-        T, K = dtopk_score.size()
-        E = ctx.E
-        topk_router_score, topk_router_indices, router_logits = ctx.saved_tensors
-        dlogits = torch.zeros(T, ctx.E, dtype=ctx.dtype, device=topk_router_score.device)
-
-        _topk_softmax_bwd(
-            router_logits,
-            dlogits,
-            None,
-            dtopk_score,
-            topk_router_score,
-            topk_router_indices,
-            E,
-            K,
-            is_softmax_over_topk=ctx.is_softmax_over_topk,
-            norm_topk_probs=ctx.norm_topk_probs,
-        )
-
-        return dlogits, None, None, None, None
 
 
 class _UpProjection(torch.autograd.Function):
@@ -138,7 +88,6 @@ class _UpProjection(torch.autograd.Function):
             b1,
             expert_frequency_offset,
             x_gather_idx,
-            s_scatter_idx,
             s_reverse_scatter_idx,
             num_activated_expert_per_token_offset,
         )
@@ -165,7 +114,6 @@ class _UpProjection(torch.autograd.Function):
             b1,
             expert_frequency_offset,
             x_gather_idx,
-            s_scatter_idx,
             s_reverse_scatter_idx,
             num_activated_expert_per_token_offset,
         ) = ctx.saved_tensors
@@ -362,10 +310,10 @@ def moe_TC_softmax_topk_layer(
     x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
 
     TC_topk_router_metadata_triton(
-        topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
+        topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx, None, None
     )
 
-    if type(activation_type) == str:
+    if isinstance(activation_type, str):
         activation_type = ActivationType(activation_type)
 
     assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"

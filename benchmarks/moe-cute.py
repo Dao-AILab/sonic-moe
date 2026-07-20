@@ -169,6 +169,12 @@ def parse_arguments() -> argparse.Namespace:
         default=False,
         help="Use concat [gate; up] weight layout instead of interleaved",
     )
+    parser.add_argument(
+        "--fp8",
+        action="store_true",
+        default=False,
+        help="Also benchmark the MXFP8 blockscaled forward (SM90, inference-only)",
+    )
     args = parser.parse_args()
 
     if len(args.thiek) != 5:
@@ -193,6 +199,7 @@ def run(
     is_softmax_over_topk: bool = True,
     norm_topk_probs: bool = False,
     concat_layout: bool = False,
+    fp8: bool = False,
     **kwargs,
 ):
     torch_dtype = {cutlass.BFloat16: torch.bfloat16, cutlass.Float16: torch.float16}[dtype]
@@ -414,6 +421,30 @@ def run(
     tflops = flops / (fwd_timing * 1e9)
     print0(f" Cute-DSL Fwd (inference mode) Average time: {fwd_timing:.3f} ms, TFLOPS: {tflops:.1f}")
 
+    # ── MXFP8 blockscaled, inference-mode forward (SM90) ──
+    if fp8:
+        from sonicmoe import KernelBackendMoE
+
+        if add_bias:
+            print0(" [yellow]FP8 fwd skipped: bias not supported by sonicmoe_fp8[/yellow]")
+        elif (H % 128) or (I % 128):
+            print0(f" [yellow]FP8 fwd skipped: H ({H}) and I ({I}) must be divisible by 128[/yellow]")
+        elif not is_glu(activation):
+            print0(" [yellow]FP8 fwd skipped: GLU activation required[/yellow]")
+        else:
+            def forward_only_fp8():
+                with torch.no_grad():
+                    return moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe_fp8, is_inference_mode=True)[0]
+
+            time.sleep(0.5)
+            torch.cuda.synchronize()
+            fp8_timing = do_bench(forward_only_fp8, warmup=warmup, rep=repeats)
+            tflops = flops / (fp8_timing * 1e9)
+            print0(
+                f" Cute-DSL Fwd FP8 blockscaled (inference mode) Average time: "
+                f"{fp8_timing:.3f} ms, TFLOPS: {tflops:.1f} (vs bf16 {fwd_timing:.3f} ms)"
+            )
+
     # ── Training mode, Forward only ──
     def forward_only_training_mode():
         o, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
@@ -493,5 +524,6 @@ if __name__ == "__main__":
         is_softmax_over_topk=(not args.topk_over_softmax),
         norm_topk_probs=args.norm_topk_probs,
         concat_layout=args.concat_layout,
+        fp8=args.fp8,
     )
     print("PASS")

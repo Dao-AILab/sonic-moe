@@ -13,6 +13,7 @@ from quack.gemm_interface import gemm, gemm_dgated
 
 from ..enums import LIBRARY_NAME
 from ..utils import get_powers_of_2
+from .forward import _topk_softmax_fwd
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 
 
@@ -245,9 +246,7 @@ def _down_projection_backward_act(
     )
     ds[s_scatter_idx] = ds_scattered
 
-    if db2 is None:
-        ds[s_scatter_idx] = ds_scattered
-    else:
+    if db2 is not None:
         H = w2.size(0)
         E = expert_frequency_offset.size(0) - 1
         TK = x_gather_idx.size(0)
@@ -570,3 +569,56 @@ def _topk_bwd(
         K,
         triton.next_power_of_2(K),
     )
+
+
+class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx, router_logits: torch.Tensor, E: int, K: int, is_softmax_over_topk: bool, norm_topk_probs: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        T = router_logits.size(0)
+
+        topk_router_score = torch.empty(T, K, dtype=torch.float32, device=router_logits.device)
+        topk_router_indices = torch.empty(T, K, dtype=torch.int32, device=router_logits.device)
+
+        _topk_softmax_fwd(
+            router_logits,
+            topk_router_score,
+            topk_router_indices,
+            E,
+            K,
+            is_softmax_over_topk=is_softmax_over_topk,
+            norm_topk_probs=norm_topk_probs,
+        )
+
+        # Save router_logits for topk(softmax()) backward (recompute full softmax).
+        # For softmax(topk()) it's unused but save unconditionally for simplicity.
+        ctx.save_for_backward(topk_router_score, topk_router_indices, router_logits)
+        ctx.E = E
+        ctx.dtype = router_logits.dtype
+        ctx.is_softmax_over_topk = is_softmax_over_topk
+        ctx.norm_topk_probs = norm_topk_probs
+
+        return topk_router_score, topk_router_indices
+
+    @staticmethod
+    def backward(ctx, dtopk_score: torch.Tensor, _: torch.Tensor):
+        T, K = dtopk_score.size()
+        E = ctx.E
+        topk_router_score, topk_router_indices, router_logits = ctx.saved_tensors
+        dlogits = torch.zeros(T, ctx.E, dtype=ctx.dtype, device=topk_router_score.device)
+
+        _topk_softmax_bwd(
+            router_logits,
+            dlogits,
+            None,
+            dtopk_score,
+            topk_router_score,
+            topk_router_indices,
+            E,
+            K,
+            is_softmax_over_topk=ctx.is_softmax_over_topk,
+            norm_topk_probs=ctx.norm_topk_probs,
+        )
+
+        return dlogits, None, None, None, None
