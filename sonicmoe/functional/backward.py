@@ -69,10 +69,10 @@ def db2_and_ds_kernel(
         tk_grouped = E_count_start + tk_offsets
 
         # Gather token indices: [BLOCK_TK]
-        token_indices = tl.load(x_gather_idx_ptr + tk_grouped, mask=tk_mask, other=0).to(tl.uint32)
+        token_indices = tl.load(x_gather_idx_ptr + tk_grouped, mask=tk_mask, other=0).to(tl.int64)
 
         # Get scatter indices: [BLOCK_TK]
-        scatter_indices = tl.load(s_scatter_idx_ptr + tk_grouped, mask=tk_mask, other=0).to(tl.uint32)
+        scatter_indices = tl.load(s_scatter_idx_ptr + tk_grouped, mask=tk_mask, other=0).to(tl.int64)
 
         s = tl.load(s_ptr + scatter_indices, mask=tk_mask, other=0.0).to(tl.float32)
 
