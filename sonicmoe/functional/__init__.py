@@ -2,8 +2,6 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
-import os
-
 import torch
 import torch.nn.functional as F
 from quack.gemm_interface import gemm, gemm_dgated, gemm_gated
@@ -16,7 +14,7 @@ from .backward import (
     _up_projection_backward_act,
 )
 from .forward import _router_forward, _topk_softmax_fwd
-from .triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
+from .metadata import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
 
 
 class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
@@ -132,19 +130,20 @@ class _UpProjection(torch.autograd.Function):
         ctx.is_glu_activation = is_glu_activation
         ctx.concat_layout = concat_layout
 
-        ctx.save_for_backward(
-            x,
-            w1,
-            b1,
-            expert_frequency_offset,
-            x_gather_idx,
-            s_scatter_idx,
-            s_reverse_scatter_idx,
-            num_activated_expert_per_token_offset,
-        )
+        if not is_inference_mode_enabled:
+            ctx.save_for_backward(
+                x,
+                w1,
+                b1,
+                expert_frequency_offset,
+                x_gather_idx,
+                s_scatter_idx,
+                s_reverse_scatter_idx,
+                num_activated_expert_per_token_offset,
+            )
 
-        ctx.mark_non_differentiable(a)
-        ctx.set_materialize_grads(False)
+            ctx.mark_non_differentiable(a)
+            ctx.set_materialize_grads(False)
 
         return a, h
 

@@ -6,7 +6,7 @@
 import torch
 from parameterized import parameterized
 
-from sonicmoe.functional.triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
+from sonicmoe.functional.metadata import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
 
 from .test_commons import TestCommons
 

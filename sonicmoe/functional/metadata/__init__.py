@@ -2,6 +2,7 @@
 # Copyright (c) 2026, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 import math
+from typing import Optional
 
 import torch
 import triton
@@ -66,7 +67,7 @@ def _compute_col_partial_sum_kernel(
 
 
 @torch.library.custom_op(
-    f"triton_kernels::TC_topk_router_metadata",
+    f"sonicmoe_metadata::TC_topk_router_metadata",
     mutates_args={
         "expert_frequency",
         "expert_frequency_offset",
@@ -268,7 +269,7 @@ def _token_offset_searchsorted_kernel(
 
 
 @torch.library.custom_op(
-    "triton_kernels::general_routing_router_metadata",
+    "sonicmoe_metadata::general_routing_router_metadata",
     mutates_args={
         "expert_frequency",
         "expert_frequency_offset",
@@ -288,8 +289,17 @@ def general_routing_router_metadata_triton(
     x_gather_idx: torch.Tensor,
     s_scatter_idx: torch.Tensor,
     s_reverse_scatter_idx: torch.Tensor,
-    num_activated_expert_per_token_offset: torch.Tensor,
+    num_activated_expert_per_token_offset: Optional[torch.Tensor],
 ) -> None:
+    """All-Triton routing metadata.
+
+    Pass `num_activated_expert_per_token_offset=None` to skip Kernel 4 (the
+    parallel-searchsorted that produces it). Kernel 4's output is consumed
+    only by `_token_broadcast_backward` in the non-EP path; the EP path
+    aggregates dx via cross-rank gather instead and never reads it, so
+    skipping saves one (TK+1)-int32 allocation and one kernel launch per
+    forward call.
+    """
     TK = selected_E.size(0)
     device = selected_E.device
     E_POW2 = triton.next_power_of_2(E)
@@ -340,14 +350,15 @@ def general_routing_router_metadata_triton(
     # ── Kernel 4: num_activated_expert_per_token_offset via searchsorted ──
     # sorted_selected_T is sorted ascending, so offset[t] = searchsorted_left(sorted_T, t).
     # Parallel binary search: each thread handles one token index, O(log TK) work.
-    N_ITERS = max(1, math.ceil(math.log2(TK + 1)))
-    TOKEN_BLOCK = 1024
-    n_token_blocks = triton.cdiv(T + 1, TOKEN_BLOCK)
-    _token_offset_searchsorted_kernel[(n_token_blocks,)](
-        sorted_selected_T,
-        num_activated_expert_per_token_offset,
-        T,
-        TK,
-        BLOCK_SIZE=TOKEN_BLOCK,
-        N_ITERS=N_ITERS,
-    )
+    if num_activated_expert_per_token_offset is not None:
+        N_ITERS = max(1, math.ceil(math.log2(TK + 1)))
+        TOKEN_BLOCK = 1024
+        n_token_blocks = triton.cdiv(T + 1, TOKEN_BLOCK)
+        _token_offset_searchsorted_kernel[(n_token_blocks,)](
+            sorted_selected_T,
+            num_activated_expert_per_token_offset,
+            T,
+            TK,
+            BLOCK_SIZE=TOKEN_BLOCK,
+            N_ITERS=N_ITERS,
+        )
