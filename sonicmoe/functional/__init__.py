@@ -2,11 +2,17 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
-import os
 
 import torch
 import torch.nn.functional as F
+import cutlass
 from quack.gemm_interface import gemm, gemm_dgated, gemm_gated
+from quack.cute_dsl_utils import torch2cute_dtype_map
+
+# Extend quack's dtype dispatch to cover fp8 — the kernels support it
+# but the Python dispatch layer only maps bf16/fp16/fp32 by default.
+torch2cute_dtype_map[torch.float8_e4m3fn] = cutlass.Float8E4M3FN
+torch2cute_dtype_map[torch.float8_e5m2]   = cutlass.Float8E5M2
 
 from ..enums import ActivationType, is_glu
 from .backward import (
@@ -17,6 +23,39 @@ from .backward import (
 )
 from .forward import _router_forward, _topk_softmax_fwd
 from .triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
+
+_FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+
+# Keyed by (data_ptr, perm); invalidated by _version after each optimizer step.
+_fp8_weight_cache: dict[tuple, tuple[int, torch.Tensor, torch.Tensor]] = {}
+
+
+def _to_fp8_e4m3(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    scale = x.abs().amax().clamp(min=1e-12) / _FP8_E4M3_MAX
+    return (x / scale).to(torch.float8_e4m3fn), scale
+
+
+def _to_fp8_e4m3_weight(x: torch.Tensor, perm: tuple) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (x.data_ptr(), perm)
+    cached = _fp8_weight_cache.get(key)
+    if cached is None or cached[0] != x._version:
+        fp8, sc = _to_fp8_e4m3(x.permute(*perm).contiguous())
+        _fp8_weight_cache[key] = (x._version, fp8, sc)
+        return fp8, sc
+    return cached[1], cached[2]
+
+
+def _apply_glu_act(h: torch.Tensor, activation_type: ActivationType, concat_layout: bool) -> torch.Tensor:
+    if concat_layout:
+        gate, up = h.chunk(2, dim=-1)
+    else:
+        gate, up = h[..., ::2], h[..., 1::2]
+    if activation_type == ActivationType.SWIGLU:
+        return F.silu(gate) * up
+    elif activation_type == ActivationType.GEGLU:
+        return F.gelu(gate.float()).to(gate.dtype) * up
+    else:
+        raise ValueError(f"unsupported activation for fp8 path: {activation_type}")
 
 
 class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
@@ -90,6 +129,7 @@ class _UpProjection(torch.autograd.Function):
         activation_type: ActivationType,
         is_inference_mode_enabled: bool,
         concat_layout: bool = False,
+        use_fp8: bool = False,
     ) -> torch.Tensor:
         T, H = x.shape
         I, H, E = w1.shape
@@ -109,18 +149,39 @@ class _UpProjection(torch.autograd.Function):
             "swiglu",
             "geglu",
         ), f"QuACK gemm_gated only supports glu activations, got {activation_type.value}"
-        gemm_gated(
-            x,
-            w1.permute(2, 1, 0),
-            activation=activation_type.value,
-            cu_seqlens_m=expert_frequency_offset,
-            A_idx=x_gather_idx,
-            preact_out=h,
-            postact_out=a,
-            store_preact=(not is_inference_mode_enabled),
-            bias=b1,
-            concat_layout=(("B", "bias") if b1 is not None else ("B",)) if concat_layout else None,
-        )
+
+        if use_fp8:
+            # Use plain gemm so we can descale before the nonlinear activation.
+            # gemm_gated fuses swiglu, making descaling incorrect: swiglu(x/s) ≠ swiglu(x)/s.
+            x_fp8, x_sc = _to_fp8_e4m3(x)
+            w1_fp8, w1_sc = _to_fp8_e4m3_weight(w1, (2, 1, 0))
+            h_buf = torch.empty(TK, 2 * I if is_glu_activation else I, dtype=x.dtype, device=x.device)
+            gemm(
+                x_fp8, w1_fp8,
+                out=h_buf,
+                cu_seqlens_m=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                dynamic_scheduler=False,
+            )
+            h_buf.mul_(x_sc * w1_sc)
+            if not is_inference_mode_enabled:
+                h.copy_(h_buf)
+                ctx.x_fp8 = x_fp8
+                ctx.x_sc = x_sc
+            a[:] = _apply_glu_act(h_buf, activation_type, concat_layout)
+        else:
+            gemm_gated(
+                x,
+                w1.permute(2, 1, 0),
+                activation=activation_type.value,
+                cu_seqlens_m=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                preact_out=h,
+                postact_out=a,
+                store_preact=(not is_inference_mode_enabled),
+                bias=b1,
+                concat_layout=(("B", "bias") if b1 is not None else ("B",)) if concat_layout else None,
+            )
 
         ctx.T = T
         ctx.TK = TK
@@ -143,6 +204,7 @@ class _UpProjection(torch.autograd.Function):
             num_activated_expert_per_token_offset,
         )
 
+        ctx.use_fp8 = use_fp8
         ctx.mark_non_differentiable(a)
         ctx.set_materialize_grads(False)
 
@@ -174,26 +236,49 @@ class _UpProjection(torch.autograd.Function):
         dw1 = torch.empty_like(w1)
         db1 = None if b1 is None else torch.empty_like(b1)
 
-        _up_projection_backward_act(
-            w1=w1,
-            dx_expanded=dx_expanded,
-            dh=dh,
-            db1=db1,
-            expert_frequency_offset=expert_frequency_offset,
-            is_glu_activation=is_glu_activation,
-            concat_layout=concat_layout,
-        )
-
-        gemm(
-            x.T,
-            dh,
-            out=dw1.permute(2, 1, 0),
-            cu_seqlens_k=expert_frequency_offset,
-            A_idx=x_gather_idx,
-            batch_idx_permute=None,
-            dynamic_scheduler=False,
-            concat_layout=(("out",) if concat_layout else None),
-        )
+        if ctx.use_fp8:
+            assert b1 is None, "fp8 path does not support bias"
+            w1_fp8, w1_sc = _to_fp8_e4m3_weight(w1, (2, 0, 1))
+            dh_fp8, dh_sc = _to_fp8_e4m3(dh)
+            x_fp8, x_sc = ctx.x_fp8, ctx.x_sc
+            gemm(
+                dh_fp8,
+                w1_fp8,
+                cu_seqlens_m=expert_frequency_offset,
+                dynamic_scheduler=False,
+                out=dx_expanded,
+                concat_layout=(("B",) if concat_layout else None),
+            )
+            dx_expanded.mul_(w1_sc * dh_sc)
+            gemm(
+                x_fp8.T, dh_fp8,
+                out=dw1.permute(2, 1, 0),
+                cu_seqlens_k=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                batch_idx_permute=None,
+                dynamic_scheduler=False,
+                concat_layout=(("out",) if concat_layout else None),
+            )
+            dw1.mul_(x_sc * dh_sc)
+        else:
+            _up_projection_backward_act(
+                w1=w1,
+                dx_expanded=dx_expanded,
+                dh=dh,
+                db1=db1,
+                expert_frequency_offset=expert_frequency_offset,
+                is_glu_activation=is_glu_activation,
+                concat_layout=concat_layout,
+            )
+            gemm(
+                x.T, dh,
+                out=dw1.permute(2, 1, 0),
+                cu_seqlens_k=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                batch_idx_permute=None,
+                dynamic_scheduler=False,
+                concat_layout=(("out",) if concat_layout else None),
+            )
 
         dx_reduced = torch.empty(T, H, dtype=dh.dtype, device=dh.device)
 
@@ -228,13 +313,20 @@ class _DownProjection(torch.autograd.Function):
         num_activated_expert_per_token_offset: torch.Tensor,
         is_varlen_K: bool,
         activation_type: ActivationType,
+        use_fp8: bool = False,
     ) -> torch.Tensor:
         TK = a.size(0)
         H, I, E = w2.shape
 
         y = torch.empty(TK, H, dtype=a.dtype, device=a.device)
 
-        gemm(a, w2.permute(2, 1, 0), out=y, cu_seqlens_m=expert_frequency_offset, bias=b2)
+        if use_fp8:
+            a_fp8, a_sc = _to_fp8_e4m3(a)
+            w2_fp8, w2_sc = _to_fp8_e4m3_weight(w2, (2, 1, 0))
+            gemm(a_fp8, w2_fp8, out=y, cu_seqlens_m=expert_frequency_offset)
+            y.mul_(a_sc * w2_sc)
+        else:
+            gemm(a, w2.permute(2, 1, 0), out=y, cu_seqlens_m=expert_frequency_offset, bias=b2)
 
         o = torch.empty(T, H, device=a.device, dtype=a.dtype)
         topk_scores = topk_scores.view(-1)
@@ -254,6 +346,7 @@ class _DownProjection(torch.autograd.Function):
         ctx.K = K
         ctx.is_varlen_K = is_varlen_K
         ctx.activation_type = activation_type
+        ctx.use_fp8 = use_fp8
 
         ctx.save_for_backward(
             h,
@@ -294,31 +387,60 @@ class _DownProjection(torch.autograd.Function):
         a_prime = torch.empty(TK, I, dtype=h.dtype, device=h.device)
         ds = torch.empty_like(topk_scores)
 
-        _down_projection_backward_act(
-            dout=dout,
-            h=h,
-            w2=w2,
-            dh=dh,
-            ds=ds,
-            b2=b2,
-            db2=db2,
-            a_prime=a_prime,
-            topk_scores=topk_scores,
-            expert_frequency_offset=expert_frequency_offset,
-            x_gather_idx=x_gather_idx,
-            s_scatter_idx=s_scatter_idx,
-            activation_type=activation_type.value,
-        )
-
-        gemm(
-            dout.T,
-            a_prime,
-            out=dw2.permute(2, 0, 1),
-            cu_seqlens_k=expert_frequency_offset,
-            A_idx=x_gather_idx,
-            batch_idx_permute=None,
-            dynamic_scheduler=False,
-        )
+        if ctx.use_fp8:
+            assert b2 is None, "fp8 path does not support bias"
+            dout_fp8, dout_sc = _to_fp8_e4m3(dout)
+            w2_fp8, w2_sc = _to_fp8_e4m3_weight(w2, (2, 0, 1))
+            s = topk_scores[s_scatter_idx]
+            _, _, ds_scattered = gemm_dgated(
+                dout_fp8,
+                w2_fp8,
+                PreAct=h,  # must stay bf16: gemm_dgated asserts PreAct.element_size() == 2
+                activation=activation_type.value,
+                dx_out=dh,
+                postact_out=a_prime,
+                colvec_scale=s,
+                colvec_reduce=True,
+                cu_seqlens_m=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                dynamic_scheduler=False,
+            )
+            ds[s_scatter_idx] = ds_scattered * (dout_sc * w2_sc)
+            dh.mul_(dout_sc * w2_sc)
+            a_prime_fp8, ap_sc = _to_fp8_e4m3(a_prime)
+            gemm(
+                dout_fp8.T, a_prime_fp8,
+                out=dw2.permute(2, 0, 1),
+                cu_seqlens_k=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                batch_idx_permute=None,
+                dynamic_scheduler=False,
+            )
+            dw2.mul_(dout_sc * ap_sc)
+        else:
+            _down_projection_backward_act(
+                dout=dout,
+                h=h,
+                w2=w2,
+                dh=dh,
+                ds=ds,
+                b2=b2,
+                db2=db2,
+                a_prime=a_prime,
+                topk_scores=topk_scores,
+                expert_frequency_offset=expert_frequency_offset,
+                x_gather_idx=x_gather_idx,
+                s_scatter_idx=s_scatter_idx,
+                activation_type=activation_type.value,
+            )
+            gemm(
+                dout.T, a_prime,
+                out=dw2.permute(2, 0, 1),
+                cu_seqlens_k=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                batch_idx_permute=None,
+                dynamic_scheduler=False,
+            )
 
         # TC top-K routing
         if not is_varlen_K:
@@ -341,6 +463,7 @@ def moe_TC_softmax_topk_layer(
     is_softmax_over_topk: bool = True,
     norm_topk_probs: bool = False,
     concat_layout: bool = False,
+    use_fp8: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
@@ -385,6 +508,7 @@ def moe_TC_softmax_topk_layer(
         activation_type,
         is_inference_mode_enabled,
         concat_layout,
+        use_fp8,
     )
 
     o = _DownProjection.apply(
@@ -402,6 +526,7 @@ def moe_TC_softmax_topk_layer(
         None,
         False,  # is_each_token_has_variable_activated_expert
         activation_type,
+        use_fp8,
     )
 
     return o, router_logits, expert_frequency
@@ -432,6 +557,7 @@ def moe_general_routing_inputs(
     activation_type: ActivationType,
     is_inference_mode_enabled: bool = False,
     concat_layout: bool = False,
+    use_fp8: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
@@ -482,6 +608,7 @@ def moe_general_routing_inputs(
         activation_type,
         is_inference_mode_enabled,
         concat_layout,
+        use_fp8,
     )
 
     o = _DownProjection.apply(
@@ -499,6 +626,7 @@ def moe_general_routing_inputs(
         num_activated_expert_per_token_offset,
         True,  # is_each_token_has_variable_activated_expert
         activation_type,
+        use_fp8,
     )
 
     return o, expert_frequency
