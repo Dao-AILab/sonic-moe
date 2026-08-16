@@ -3,22 +3,13 @@
 # ********************************************************************************
 
 import argparse
-import itertools
 import random
 import time
-from functools import partial
 from typing import Tuple, Type
 
 import cutlass
-
-# ─────────────── Monkey-patch: reduce SM100 autotuning ───────────────
-# !!!!!!!!!! The following code is to accelerate the autotuning process in QuACK and IS REMOVABLE (does not affect correctness) !!!!!!!!!!
-import quack.gemm_config as _gc
 import torch
 import torch.nn.functional as F
-from quack.autotuner import AutotuneConfig
-from quack.gemm_config import GemmConfig
-from quack.gemm_interface import gemm_dgated_tuned, gemm_gated_tuned, gemm_tuned
 from rich import print as print0
 from triton.testing import do_bench
 
@@ -26,55 +17,6 @@ from sonicmoe import MoE
 from sonicmoe.enums import ActivationType, is_glu
 from sonicmoe.functional import moe_TC_softmax_topk_layer
 
-
-def _fast_sm100_configs(epilogue=None):
-    tile_n_vals = [128, 160, 192, 256]
-    tile_mn_cluster_vals = (
-        [(128, tile_n, (1, 2)) for tile_n in tile_n_vals]
-        + [(128, tile_n, (2, 1)) for tile_n in tile_n_vals]
-        + [(256, tile_n, (2, 1)) for tile_n in tile_n_vals]
-        + [(256, 512, (2, 1))]
-    )
-    swap_ab_vals = [False, True]
-    if epilogue in ["lse", "gated"]:
-        swap_ab_vals = [False]
-    GemmConfigCls = partial(GemmConfig, pingpong=False, device_capacity=10)
-    use_clc_vals = [True, False]
-    use_tma_gather_vals = [True, False]
-    return [
-        GemmConfigCls(
-            tile_m=m,
-            tile_n=n,
-            cluster_m=cm,
-            cluster_n=cn,
-            swap_ab=sab,
-            max_swizzle_size=8,
-            is_dynamic_persistent=use_clc,
-            use_tma_gather=use_tma_gather,
-        )
-        for (m, n, (cm, cn)), sab, use_clc, use_tma_gather in itertools.product(
-            tile_mn_cluster_vals, swap_ab_vals, use_clc_vals, use_tma_gather_vals
-        )
-    ]
-
-
-_gc._get_sm100_configs = _fast_sm100_configs
-
-
-def _patch_autotuner_configs(autotuner_fn):
-    all_new = [AutotuneConfig(config=c) for c in _gc.get_all_configs()]
-    autotuner_fn.configs = all_new
-
-
-# Patch the 3 autotuners used in MoE SwiGLU fwd+bwd
-_patch_autotuner_configs(gemm_tuned)
-_patch_autotuner_configs(gemm_gated_tuned)
-_patch_autotuner_configs(gemm_dgated_tuned)
-
-gemm_gated_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_configs("gated")]
-gemm_dgated_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_configs("gated")]
-
-# ─────────────── Monkey-patch ends ───────────────
 
 
 def swiglu(h: torch.Tensor, concat_layout: bool = False) -> torch.Tensor:

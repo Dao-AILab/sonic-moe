@@ -3,7 +3,7 @@
 # ********************************************************************************
 
 torch>=2.11.0
-quack-kernels>=0.4.0
+quack-kernels>=0.6.4
 pytest
 parameterized
 rich
