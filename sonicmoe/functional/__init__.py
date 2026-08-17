@@ -2,11 +2,16 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
-import os
+import itertools
+from functools import partial
 
+import quack.autotuner
+import quack.gemm_config as _gc
 import torch
 import torch.nn.functional as F
-from quack.gemm_interface import gemm, gemm_act
+from quack.autotuner import AutotuneConfig
+from quack.gemm_config import GemmConfig
+from quack.gemm_interface import gemm, gemm_act, gemm_tuned
 
 from ..enums import ActivationType, is_glu
 from .backward import (
@@ -17,6 +22,153 @@ from .backward import (
 )
 from .forward import _router_forward, _topk_softmax_fwd
 from .triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
+
+
+
+# QuACK autotuning accelerators, applied at import. QuACK sweeps its whole config space
+# per problem key, and MoE keys move every step (M = routed tokens), so we shrink the
+# space and let nearby M share a cache entry. Search only; the math is unchanged.
+
+def _fast_sm90_configs(epilogue: str | None = None, tune_coop: bool = True) -> list[GemmConfig]:
+    """Reduced SM90 (Hopper) config space — drop-in for quack.gemm_config._get_sm90_configs.
+
+    Drops tile_n=208 (gated rejects non-multiples of 32; gather_A rejects it on SM90)
+    and the odd (128, 224) / (192, 128) tiles: 44 -> 28 configs, 18 -> 14 for "gated".
+    """
+    tile_n_vals = [128, 160, 192]
+    tile_mn_vals_coop = [(256, tile_n) for tile_n in tile_n_vals] + [(128, 256)]
+    tile_mn_vals_pingpong = [(128, tile_n) for tile_n in tile_n_vals]
+    if epilogue in ["gated"]:
+        tile_mn_vals_coop = [(m, n) for m, n in tile_mn_vals_coop if n % 32 == 0 and m != 192]
+        tile_mn_vals_pingpong = [(m, n) for m, n in tile_mn_vals_pingpong if n % 32 == 0]
+    tile_mn_vals = []
+    if tune_coop:
+        tile_mn_vals += [(m, n, False) for m, n in tile_mn_vals_coop]
+    tile_mn_vals += [(m, n, True) for m, n in tile_mn_vals_pingpong]
+    cluster = [(1, 2), (2, 1)]
+    swap_ab_vals = [False, True]
+    if epilogue in ["lse", "gated"]:
+        swap_ab_vals = [False]
+    return [
+        GemmConfig(
+            tile_m=tile_m,
+            tile_n=tile_n,
+            pingpong=pingpong,
+            cluster_m=cluster_m,
+            cluster_n=cluster_n,
+            swap_ab=swap_ab,
+            device_capacity=9,
+            is_dynamic_persistent=False,  # SM90 has no CLC-based dynamic persistent scheduler
+            use_tma_gather=False,  # TMA gather not supported on SM90
+        )
+        for (tile_m, tile_n, pingpong), (cluster_m, cluster_n), swap_ab in itertools.product(
+            tile_mn_vals, cluster, swap_ab_vals
+        )
+    ]
+
+
+def _fast_sm100_configs(epilogue: str | None = None) -> list[GemmConfig]:
+    """Reduced SM100 (Blackwell datacenter) config space — a drop-in for
+    quack.gemm_config._get_sm100_configs.
+    """
+    tile_n_vals = [128, 160, 192, 256]
+    tile_mn_cluster_vals = (
+        [(128, tile_n, (1, 2)) for tile_n in tile_n_vals]
+        + [(128, tile_n, (2, 1)) for tile_n in tile_n_vals]
+        + [(256, tile_n, (2, 1)) for tile_n in tile_n_vals]
+        + [(256, 512, (2, 1))]
+    )
+    swap_ab_vals = [False, True]
+    if epilogue in ["lse", "gated"]:
+        swap_ab_vals = [False]
+    GemmConfigCls = partial(GemmConfig, pingpong=False, device_capacity=10)  # no pingpong on SM100
+    use_clc_vals = [True, False]
+    use_tma_gather_vals = [True, False]
+    return [
+        GemmConfigCls(
+            tile_m=m,
+            tile_n=n,
+            cluster_m=cm,
+            cluster_n=cn,
+            swap_ab=sab,
+            max_swizzle_size=8,
+            is_dynamic_persistent=use_clc,
+            use_tma_gather=use_tma_gather,
+        )
+        for (m, n, (cm, cn)), sab, use_clc, use_tma_gather in itertools.product(
+            tile_mn_cluster_vals, swap_ab_vals, use_clc_vals, use_tma_gather_vals
+        )
+    ]
+
+
+# M-range quantization: what picks a config is the order of magnitude of M, not its
+# exact value, so the cache is keyed on a bucket of M — one every 3 powers of two, i.e.
+# each spanning 8x: M<=8, 8<M<=64, 64<M<=512, 512<M<=4096, ...
+def _bucketize_M(m: int) -> int:
+    """Round m up to the top of its log2 bucket."""
+    if m <= 1:
+        return 1 << 3
+    exponent = (m - 1).bit_length()  # ceil(log2(m))
+    level = (exponent - 1) // 3
+    return 1 << (3 * (level + 1))
+
+
+def _make_bucketized_key(self, args, kwargs) -> tuple:
+    """QuACK's autotune cache key, with every tensor's leading dim (M) bucketized.
+
+    Trailing dims stay exact, so structurally different GEMMs cannot alias onto one key,
+    and the stringified entries never collide with QuACK's own exact-shape keys.
+    """
+    all_args = {**dict(zip(self.arg_names, args)), **kwargs}
+    _args = {k: v for k, v in all_args.items() if k in self.arg_names}
+    key = [str(_args[k]) for k in self.keys if k in _args]
+    for arg in _args.values():
+        if isinstance(arg, torch.Tensor):
+            shape = list(arg.shape)
+            if shape:
+                shape[0] = _bucketize_M(shape[0])
+            key.append(str(tuple(shape)))
+            # only the {0, 1, other} classes of a stride matter; same folding QuACK does
+            key.append(str([s if s in {0, 1} else 2 for s in arg.stride()]))
+            key.append(str(arg.dtype))
+    return tuple(key)
+
+
+_orig_autotuner_call = quack.autotuner.Autotuner.__call__
+
+
+@torch.compiler.disable  # the tuner must never be traced
+def _autotuner_call_with_M_buckets(self, *args, **kwargs):
+    if len(self.configs) > 1:
+        bucket_key = _make_bucketized_key(self, args, kwargs)
+        if bucket_key in self.cache:
+            # An earlier M in this bucket was tuned already: reuse its winner, skip the
+            # sweep. Mirrors the cache-hit tail of the original __call__.
+            config = self.cache[bucket_key]
+            self.best_config = config
+            self.nargs = dict(zip(self.arg_names, args))
+            ret = self.fn(*args, **kwargs, **config.all_kwargs())
+            self.nargs = None
+            return ret
+
+    # First M in this bucket: let QuACK tune for real, under its own exact-shape key ...
+    ret = _orig_autotuner_call(self, *args, **kwargs)
+
+    # ... then alias that winner onto the bucket key, for every later M in the bucket.
+    if len(self.configs) > 1 and hasattr(self, "best_config"):
+        self.cache[_make_bucketized_key(self, args, kwargs)] = self.best_config
+
+    return ret
+
+
+quack.autotuner.Autotuner.__call__ = _autotuner_call_with_M_buckets
+_gc._get_sm90_configs = _fast_sm90_configs
+_gc._get_sm100_configs = _fast_sm100_configs
+
+# gemm_tuned (plain GEMMs: down projection, dw1/dw2) captured its config list at
+# decoration time, so it needs an explicit rebuild. The per-epilogue autotuners behind
+# gemm_act / gemm_dact are built on first call and read the patched generators already.
+gemm_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_configs()]
 
 
 class TC_Softmax_Topk_Router_Function(torch.autograd.Function):

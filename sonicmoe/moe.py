@@ -29,11 +29,11 @@ def _swiglu(x: torch.Tensor) -> torch.Tensor:
 def _geglu(x: torch.Tensor) -> torch.Tensor:
     u = x[..., 1::2]
     g = x[..., ::2]
-    return (F.gelu(g.to(dtype=torch.float32)) * u).to(dtype=g.dtype)
+    return (F.gelu(g.to(dtype=torch.float32), approximate="tanh") * u).to(dtype=g.dtype)
 
 
 def _gelu(x: torch.Tensor) -> torch.Tensor:
-    return F.gelu(x.to(dtype=torch.float32)).to(dtype=x.dtype)
+    return F.gelu(x.to(dtype=torch.float32), approximate="tanh").to(dtype=x.dtype)
 
 
 def _reglu(x: torch.Tensor) -> torch.Tensor:
