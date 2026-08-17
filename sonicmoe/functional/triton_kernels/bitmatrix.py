@@ -47,6 +47,9 @@ def _bitmatrix_metadata_compute_stage1(
         # Exclusive prefix sum of per-expert total counts → expert_offs[e].
         # expert_freq_offset[e] = total entries routed to expert e (from A.sum(dim=1)).
         # expert_offs[e] = sum of expert_freq_offset[0..e-1] = global start of expert e.
+        # expert_offs[E] = sum(expert_freq) = total *valid* entries (= TK without EP sentinels).
+        # The valid-only total is what bounds the downstream GEMM; with sentinels, slot range
+        # `[expert_offs[E], TK)` is left unwritten by stage 2 and zero-init'd by the caller.
         curr_sum = 0
         for start in tl.static_range(0, E, BLOCK_N):
             offs = start + tl.arange(0, BLOCK_N)
@@ -54,9 +57,7 @@ def _bitmatrix_metadata_compute_stage1(
             excl_cumsum = tl.cumsum(expert_freq, 0) - expert_freq + curr_sum
             curr_sum += tl.sum(expert_freq, 0)
             tl.store(expert_freq_offs_ptr + offs, excl_cumsum, mask=offs < E)
-    elif pid == E + 1:
-        # expert_freq_off[E] = TK (total number of entries)
-        tl.store(expert_freq_offs_ptr + E, TK)
+        tl.store(expert_freq_offs_ptr + E, curr_sum)
 
 
 # Adapted from https://github.com/triton-lang/triton/blob/434aecbe933af6a8d49595d4197bfc3df7618748/python/triton_kernels/triton_kernels/tensor_details/bitmatrix.py#L44

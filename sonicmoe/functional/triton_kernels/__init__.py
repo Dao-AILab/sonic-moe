@@ -118,7 +118,7 @@ def TC_topk_router_metadata_triton(
     # - For pid == E: write exclusive cumsum of expert_freq_offset into
     #   expert_freq_off[0:E] (= col_offs, a view into expert_freq_off).
 
-    _bitmatrix_metadata_compute_stage1[(E + 2,)](
+    _bitmatrix_metadata_compute_stage1[(E + 1,)](
         expert_frequency,
         expert_frequency_offset,
         E,
@@ -168,11 +168,15 @@ def _general_compute_col_partial_sum_kernel(
             mask=e_offs < E,
         )
 
-    # Load expert ids for this tile (flat indexing into selected_E).
+    # Load expert ids for this tile (flat indexing into selected_E). Out-of-tile lanes
+    # default to `E`, so the `< E` mask below catches them and EP sentinels uniformly.
     offs = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offs < TK
-    expert_ids = tl.load(selected_E_ptr + offs, mask=mask, other=-1)
+    expert_ids = tl.load(selected_E_ptr + offs, mask=offs < TK, other=E)
 
+    # Drop EP sentinels and out-of-tile lanes (both have `expert_ids >= E`). `safe_experts`
+    # remaps masked-off lanes to expert 0 so even the unused address stays inside `partial_sum`
+    # — past-end pointers can trip `cudaErrorInvalidAddressSpace` before the mask gates the op.
+    mask = expert_ids < E
     safe_experts = tl.where(mask, expert_ids, 0)
     tl.atomic_add(
         partial_sum_ptr + safe_experts * n_tiles + tile_id,
@@ -193,6 +197,7 @@ def _general_metadata_compute_stage2(
     partial_sum_ptr,  # [n_tiles, E] with strides (1, n_tiles)
     n_tiles,
     expert_offs_ptr,
+    E: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     tl.static_assert(BLOCK_SIZE <= 32768)
@@ -202,14 +207,19 @@ def _general_metadata_compute_stage2(
     offs_global = pid_m * BLOCK_SIZE + offs_local
     mask = offs_global < TK
 
-    # Load expert id for each entry in this tile.
-    expert = tl.load(selected_E_ptr + offs_global, mask=mask, other=-1).to(tl.uint32)
+    # Load expert id for each entry in this tile. Out-of-tile lanes default to `E`, so they
+    # share the same `< E` mask path as EP sentinels — no extra check needed below.
+    expert = tl.load(selected_E_ptr + offs_global, mask=mask, other=E).to(tl.uint32)
 
     # Pack (expert, local_offset) into uint32 and sort by expert.
     # Upper 16 bits = expert id, lower 16 bits = pre-sort local offset.
     kv_pairs = tl.sort(((expert << 16) | offs_local).to(tl.uint32), 0)
     expert = kv_pairs >> 16
-    mask = expert != 0xFFFF
+    # Drop EP sentinels and out-of-tile slots (both have `expert >= E` after the load default).
+    # `safe_expert` remaps masked-off lanes to expert 0 so the OOB addresses below stay inside
+    # `partial_sum` / `expert_offs` — masked LDG still validates the address on Hopper.
+    mask = expert < E
+    safe_expert = tl.where(mask, expert, 0)
 
     # Segmented scan for within-expert rank.
     scan_input = (kv_pairs & 0xFFFF0000) | 0x00000001
@@ -217,8 +227,8 @@ def _general_metadata_compute_stage2(
     within_expert_rank = (inclusive_run_lengths - 1) & 0xFFFF
 
     # Output position = expert_offs[e] + partial_sum[tile, e] + within_expert_rank.
-    s_reverse_scatter_val = tl.load(partial_sum_ptr + pid_m + expert * n_tiles, mask=mask)
-    s_reverse_scatter_val += tl.load(expert_offs_ptr + expert, mask=mask)
+    s_reverse_scatter_val = tl.load(partial_sum_ptr + pid_m + safe_expert * n_tiles, mask=mask)
+    s_reverse_scatter_val += tl.load(expert_offs_ptr + safe_expert, mask=mask)
     s_reverse_scatter_val += within_expert_rank
 
     # Recover pre-sort entry index and look up the token index.
@@ -226,7 +236,11 @@ def _general_metadata_compute_stage2(
     entry_idx = pid_m * BLOCK_SIZE + presort_offs
     token_idx = tl.load(sorted_selected_T_ptr + entry_idx, mask=mask)
 
-    tl.store(s_reverse_scatter_idx_ptr + entry_idx, s_reverse_scatter_val, mask=mask)
+    # Sentinel lanes get `TK` written into s_reverse_scatter_idx as an out-of-range marker, so the
+    # bwd reduction (`token_gather_sum_kernel`) skips them via the `< M` bound check. The output-
+    # indexed tail [sum_valid, TK) of s_scatter_idx / x_gather_idx is left untouched — caller
+    # zero-inits those so downstream reads (topk_scores[s_scatter_idx], reverse scatter) are 0.
+    tl.store(s_reverse_scatter_idx_ptr + entry_idx, tl.where(mask, s_reverse_scatter_val, TK), mask=entry_idx < TK)
     tl.store(s_scatter_idx_ptr + s_reverse_scatter_val, entry_idx, mask=mask)
     tl.store(x_gather_idx_ptr + s_reverse_scatter_val, token_idx, mask=mask)
 
@@ -312,7 +326,7 @@ def general_routing_router_metadata_triton(
     col_partial_sum = col_partial_sum_trans.T  # [n_tiles, E], strides (1, n_tiles)
 
     # ── Kernel 2: stage1 ─────────────────────────────────────────────────
-    _bitmatrix_metadata_compute_stage1[(E + 2,)](
+    _bitmatrix_metadata_compute_stage1[(E + 1,)](
         expert_frequency,
         expert_frequency_offset,
         E,
@@ -334,6 +348,7 @@ def general_routing_router_metadata_triton(
         col_partial_sum,
         n_tiles,
         expert_frequency_offset[:E],
+        E=E,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
