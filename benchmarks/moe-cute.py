@@ -27,16 +27,17 @@ def swiglu(h: torch.Tensor, concat_layout: bool = False) -> torch.Tensor:
     return u * F.silu(g)
 
 
+# tanh approximation, to match the QuACK epilogues (see sonicmoe.enums)
 def geglu(h: torch.Tensor, concat_layout: bool = False) -> torch.Tensor:
     if concat_layout:
         g, u = torch.chunk(h, 2, dim=-1)
     else:
         u, g = h[..., 1::2], h[..., ::2]
-    return F.gelu(g.float()).to(dtype=g.dtype) * u
+    return F.gelu(g.float(), approximate="tanh").to(dtype=g.dtype) * u
 
 
 def gelu(x: torch.Tensor) -> torch.Tensor:
-    return F.gelu(x.float()).to(dtype=x.dtype)
+    return F.gelu(x.float(), approximate="tanh").to(dtype=x.dtype)
 
 
 def reglu(h: torch.Tensor, concat_layout: bool = False) -> torch.Tensor:
@@ -86,7 +87,9 @@ def parse_arguments() -> argparse.Namespace:
         default=False,
     )
     parser.add_argument(
-        "--activation", choices=["swiglu", "geglu", "reglu", "relu_sq", "relu", "silu", "gelu"], default="swiglu"
+        "--activation",
+        choices=[a.value for a in ActivationType],
+        default="swiglu",
     )
     parser.add_argument(
         "--add_bias",

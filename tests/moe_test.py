@@ -64,7 +64,7 @@ class MoETest(TestCommons):
                 False,
             ],  # is_compiling
             [False, True],  # add_bias
-            [False, True],  # use_quack_gemm
+            [ActivationType.SWIGLU, ActivationType.RELU_SQ],
         )
     )
     def test_moe(
@@ -75,11 +75,8 @@ class MoETest(TestCommons):
         kernel_backend_moe: KernelBackendMoE,
         is_compiling: bool,
         add_bias: bool,
-        use_quack_gemm: bool,
+        activation_type: ActivationType,
     ) -> None:
-        if use_quack_gemm and (is_compiling or add_bias):
-            self.skipTest("unsupported test")
-
         self.set_seed(_SEED)
 
         T, H, I, E, K = problem_shape
@@ -90,7 +87,7 @@ class MoETest(TestCommons):
                 num_experts_per_tok=K,
                 hidden_size=H,
                 intermediate_size=I,
-                activation_function=ActivationType.SWIGLU,
+                activation_function=activation_type,
                 add_bias=add_bias,
                 std=0.02,
             ).to(dtype=dtype)

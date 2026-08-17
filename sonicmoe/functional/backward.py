@@ -9,7 +9,7 @@ import cutlass.cute as cute
 import torch
 import triton
 import triton.language as tl
-from quack.gemm_interface import gemm, gemm_dgated
+from quack.gemm_interface import gemm, gemm_dact
 
 from ..enums import LIBRARY_NAME
 from ..utils import get_powers_of_2
@@ -224,13 +224,8 @@ def _down_projection_backward_act(
     s_scatter_idx: torch.Tensor,
     activation_type: str,
 ) -> None:
-    assert activation_type in (
-        "swiglu",
-        "geglu",
-    ), f"QuACK gemm_gated only supports glu activations, got {activation_type}"
-
     s = topk_scores[s_scatter_idx]
-    _, _, ds_scattered = gemm_dgated(
+    _, _, ds_scattered = gemm_dact(
         dout,
         w2.permute(2, 0, 1),
         PreAct=h,

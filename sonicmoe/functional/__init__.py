@@ -7,12 +7,11 @@ from functools import partial
 
 import quack.autotuner
 import quack.gemm_config as _gc
-import quack.gemm_interface
 import torch
 import torch.nn.functional as F
 from quack.autotuner import AutotuneConfig
 from quack.gemm_config import GemmConfig
-from quack.gemm_interface import gemm, gemm_dgated, gemm_gated, gemm_tuned
+from quack.gemm_interface import gemm, gemm_act, gemm_tuned
 
 from ..enums import ActivationType, is_glu
 from .backward import (
@@ -166,13 +165,10 @@ quack.autotuner.Autotuner.__call__ = _autotuner_call_with_M_buckets
 _gc._get_sm90_configs = _fast_sm90_configs
 _gc._get_sm100_configs = _fast_sm100_configs
 
+# gemm_tuned (plain GEMMs: down projection, dw1/dw2) captured its config list at
+# decoration time, so it needs an explicit rebuild. The per-epilogue autotuners behind
+# gemm_act / gemm_dact are built on first call and read the patched generators already.
 gemm_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_configs()]
-
-# Older QuACK has dedicated gated-GEMM autotuners; newer routes them through gemm_tuned.
-for _name in ("gemm_gated_tuned", "gemm_dgated_tuned"):
-    _gated_tuned = getattr(quack.gemm_interface, _name, None)
-    if _gated_tuned is not None:
-        _gated_tuned.configs = [AutotuneConfig(config=c) for c in _gc.get_all_configs("gated")]
 
 
 class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
@@ -261,11 +257,7 @@ class _UpProjection(torch.autograd.Function):
             else None
         )
 
-        assert activation_type.value in (
-            "swiglu",
-            "geglu",
-        ), f"QuACK gemm_gated only supports glu activations, got {activation_type.value}"
-        gemm_gated(
+        gemm_act(
             x,
             w1.permute(2, 1, 0),
             activation=activation_type.value,
@@ -275,7 +267,11 @@ class _UpProjection(torch.autograd.Function):
             postact_out=a,
             store_preact=(not is_inference_mode_enabled),
             bias=b1,
-            concat_layout=(("B", "bias") if b1 is not None else ("B",)) if concat_layout else None,
+            concat_layout=(
+                (("B", "bias") if b1 is not None else ("B",))
+                if concat_layout and is_glu_activation
+                else None
+            ),
         )
 
         ctx.T = T
@@ -286,7 +282,7 @@ class _UpProjection(torch.autograd.Function):
         ctx.I = I
         ctx.is_each_token_has_variable_activated_experts = is_each_token_has_variable_activated_experts
         ctx.is_glu_activation = is_glu_activation
-        ctx.concat_layout = concat_layout
+        ctx.concat_layout = concat_layout and is_glu_activation
 
         ctx.save_for_backward(
             x,
@@ -524,8 +520,6 @@ def moe_TC_softmax_topk_layer(
     if type(activation_type) == str:
         activation_type = ActivationType(activation_type)
 
-    assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
-
     a, h = _UpProjection.apply(
         x,
         w1,
@@ -620,8 +614,6 @@ def moe_general_routing_inputs(
         s_reverse_scatter_idx,
         num_activated_expert_per_token_offset,
     )
-
-    assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
     a, h = _UpProjection.apply(
         x,
