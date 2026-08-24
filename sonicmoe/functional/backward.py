@@ -195,13 +195,17 @@ def _up_projection_backward_act(
 
     # db1 computation
     if db1 is not None:
-        db1_kernel[(E,)](
+        deterministic = torch.are_deterministic_algorithms_enabled()
+        kernel = db1_kernel.fn if deterministic else db1_kernel
+        tile = dict(BLOCK_TK=16, BLOCK_I=1024, num_warps=8, num_stages=4) if deterministic else {}
+        kernel[(E,)](
             dh,
             db1,
             expert_frequency_offset,
             (2 * I if is_glu_activation else I),
             E,
             CONCAT_LAYOUT=concat_layout and is_glu_activation,
+            **tile,
         )
 
 
@@ -254,7 +258,10 @@ def _down_projection_backward_act(
         NUM_H_BLOCKS = triton.cdiv(H, BLOCK_H)
         new_ds_partial = torch.empty(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
 
-        db2_and_ds_kernel[(E, NUM_H_BLOCKS)](
+        deterministic = torch.are_deterministic_algorithms_enabled()
+        kernel = db2_and_ds_kernel.fn if deterministic else db2_and_ds_kernel
+        tile = dict(BLOCK_TK=16, num_warps=8, num_stages=4) if deterministic else {}
+        kernel[(E, NUM_H_BLOCKS)](
             dout,
             topk_scores,
             new_ds_partial,
@@ -269,6 +276,7 @@ def _down_projection_backward_act(
             1,  # OLD_DS_PARTIAL_N = 1
             BLOCK_H=BLOCK_H,
             BLOCK_OLD_DS_PARTIAL_N=1,
+            **tile,
         )
 
         if NUM_H_BLOCKS == 1:
