@@ -143,7 +143,10 @@ def token_gather_and_sum_varlen_K_triton(
     """
 
     # 1D grid over T only
-    token_gather_sum_kernel[(T,)](
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    kernel = token_gather_sum_kernel.fn if deterministic else token_gather_sum_kernel
+    tile = dict(BLOCK_H=1024, BLOCK_K=1, num_warps=8, num_stages=4) if deterministic else {}
+    kernel[(T,)](
         x,
         w,
         M_perm,
@@ -158,4 +161,5 @@ def token_gather_and_sum_varlen_K_triton(
         stride_outH=out.stride(1),
         w_is_None=(w is None),
         is_varlen_K=is_varlen_K,
+        **tile,
     )
