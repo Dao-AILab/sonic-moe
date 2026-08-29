@@ -1,49 +1,11 @@
 # ********************************************************************************
 # Copyright (c) 2026, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 #
-# Triton + symm-mem collectives shared by the dispatch and combine
-# primitives in sibling submodules. Provides the AG / RS primitives, copy-
-# engine fast path, autotune helpers, and symm-mem rendezvous wrappers.
-#
-# Stateless: no global caches, no autograd. Every function takes tensors in,
-# launches kernels, returns tensors out. The caller owns all buffer
-# allocation and barrier placement.
-#
-# Autotuning notes:
-#   - All non-trivial kernels are autotuned over BLOCK_SIZE / num_warps /
-#     num_stages. Configs that would produce grid_y > 65535 for the given
-#     problem size are pruned at autotune time via prune_configs_by.
-#   - EVEN_K is computed via @triton.heuristics, so problem sizes that happen
-#     to be block-aligned automatically take the unmasked fast path. We do
-#     NOT pad source buffers up to a block multiple — that would require
-#     out-of-bounds loads from peer symm-mem buffers, which is unsafe.
-#
-# Naming convention used throughout:
-#   T_local     tokens per rank
-#   K           top-K experts per token
-#   TK_local    T_local * K
-#   W           EP world size
-#   TK_global   W * TK_local
-#   E_local     experts per rank
-#
-# Dispatch / combine primitives provided here:
-#   AG dispatch              all_gather_triton, all_gather_copy_engine_async
-#   A2A dispatch             a2a_dispatch_triton
-#   RANK_DEDUP dispatch       rank_dedup_dispatch_triton
-#                            (provably minimum row count: one row per
-#                            (token, peer) pair that has ≥ 1 routed expert)
-#   A2A combine              a2a_combine_triton
-#   RS combine               local_combine + reduce_scatter_triton
-#   RANK_DEDUP combine    rank_dedup_combine_triton
-#                            (local_combine local pre-sum + sparse
-#                            per-token gather guided by peer_present_mask;
-#                            same minimum row count as RANK_DEDUP dispatch
-#                            in expectation)
+# Triton + symm-mem AG/RS collectives for dispatch/combine. Stateless: caller owns buffer
+# allocation and barriers. Naming: T_local=tokens/rank, TK_local=T_local*K, W=world size, TK_global=W*TK_local.
 # ********************************************************************************
 
 from __future__ import annotations
-
-from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -55,11 +17,8 @@ from torch.distributed import _symmetric_memory as symm_mem
 
 _CUDA_MAX_GRID_Y = 65535
 
-# AG and RS use different best warp choices, so keep their autotune
-# spaces separate instead of sharing one _IO_BLOCK_CONFIGS list.
-#
-# AG is mostly peer memcpy: 4/8 warps are often enough, with 16 kept only
-# as a large-tile fallback.
+# Separate autotune spaces: AG/RS want different best warp counts.
+# AG is peer-memcpy-bound, so 4-8 warps suffice; 16 is a large-tile fallback.
 _AG_BLOCK_CONFIGS = [
     triton.Config({"BLOCK_SIZE": 2048}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_SIZE": 4096}, num_warps=4, num_stages=3),
@@ -71,14 +30,8 @@ _AG_BLOCK_CONFIGS = [
 
 
 def _prune_by_grid_y(numel_key: str):
-    """Return a dict suitable for triton.autotune's `prune_configs_by` arg.
-    Drops configs whose grid_y along the tile axis would exceed CUDA's 65535
-    limit for the given problem size.
-
-    Note: Triton's autotuner passes positional kernel args via `named_args`
-    (a dict mapping arg name → value) and keyword kernel args via `**kwargs`.
-    Wrappers in this file pass `numel_per_rank=...` etc. as kwargs, so the
-    callback must consult both."""
+    """Drops configs whose grid_y would exceed CUDA's 65535 limit; checks both
+    named_args and kwargs since Triton's autotuner splits kernel args across both."""
 
     def _prune(configs, named_args, **kwargs):
         if numel_key in kwargs:
@@ -153,18 +106,8 @@ def _all_gather_kernel(
                 tl.store(output_ptr + i * numel_per_rank + offs, data, mask=mask)
 
 
-# ============================================================================
-# Reduce-scatter (sum) — symmetric to all_gather. Each rank reads peers'
-# my_rank-th chunk via NVLink and accumulates locally. fp32 accumulation,
-# implicit cast on store. No NCCL.
-#
-# Shape contract: x_symm is (W*T_local, ...) — i.e. the same total-size
-# input that NCCL's reduce_scatter_tensor expects. Output is (T_local, ...).
-#
-# Determinism: summation order is rank 0 → W-1, fixed at compile time via
-# tl.static_range. Bitwise reproducible across runs for the same inputs;
-# NCCL ring RS is not, because the algorithm reorders depending on topology.
-# ============================================================================
+# Reduce-scatter via NVLink reads + fp32 accum (no NCCL); shape matches
+# reduce_scatter_tensor. Deterministic (static_range order), unlike NCCL ring RS.
 
 _RS_BLOCK_CONFIGS = [
     triton.Config({"BLOCK_SIZE": 2048}, num_warps=4, num_stages=3),
@@ -192,12 +135,8 @@ def _reduce_scatter_kernel(
     BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
 ):
-    """output[0:N] ← Σ_{r in 0..W} buf_tuple[r][my_rank*N : (my_rank+1)*N]
-
-    AG fans out: 1 program reads 1 peer chunk, writes 1 output chunk.
-    RS fans in:  1 program reads W peer chunks, writes 1 local chunk.
-    fp32 accumulation; tl.store implicitly casts to output dtype.
-    """
+    """RS fans in (1 program reads W peer chunks -> 1 local chunk), unlike AG's fan-out.
+    fp32 accumulation; tl.store casts to output dtype."""
     pid_tile = tl.program_id(0)
     offs = pid_tile * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     base = my_rank * numel_per_rank
@@ -216,15 +155,8 @@ def _reduce_scatter_kernel(
 
 
 def reduce_scatter_triton(x_symm, group, out=None, hdl=None, peer_bufs=None, my_rank=None):
-    """Sum-reduce-scatter via Triton + symm-mem (no NCCL).
-
-    Equivalent to:
-        dist.reduce_scatter_tensor(out, x_symm, op=ReduceOp.SUM, group=group)
-    up to fp32-accumulation order. Output dtype matches x_symm.
-
-    Caller contract: x_symm has been written and a barrier has been issued
-    before the call (peers read this rank's bytes via NVLink).
-    """
+    """Equivalent to dist.reduce_scatter_tensor(SUM), up to accumulation order.
+    Caller must barrier after writing x_symm before calling (NVLink peer reads)."""
     if peer_bufs is None:
         if hdl is None:
             hdl = rendezvous(x_symm, group)
@@ -253,18 +185,8 @@ def reduce_scatter_triton(x_symm, group, out=None, hdl=None, peer_bufs=None, my_
     return out
 
 
-# ============================================================================
-# Utilities
-# ============================================================================
-
-
 def rendezvous(tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
     return symm_mem.rendezvous(tensor, group=group)
-
-
-# ============================================================================
-# Python wrappers
-# ============================================================================
 
 
 def all_gather_triton(x_symm, group, out=None, hdl=None, peer_bufs=None):
@@ -292,20 +214,8 @@ def all_gather_triton(x_symm, group, out=None, hdl=None, peer_bufs=None):
     return out
 
 
-# ============================================================================
-# AllGather via Copy Engine (cuMemcpyAsync direct).
-# ----------------------------------------------------------------------------
-# Routes peer copies through the GPU's Copy Engines instead of a SM-side
-# copy kernel. The driver dispatches intra-device P2P cuMemcpyAsync to a
-# CE; torch.Tensor.copy_ falls through to a SM kernel even on P2P-mapped
-# tensors, which is why the prior implementation of this function failed
-# to actually use the CE despite the name. We bypass torch.copy_ by issuing
-# the copies through cuda-python driver bindings directly.
-#
-# Caller contract: x_symm has been written AND a barrier (NCCL or symm-mem)
-# has been issued before the call, so peer reads observe valid data.
-# Same contract as all_gather_triton.
-# ============================================================================
+# torch.Tensor.copy_ uses a SM kernel even on P2P tensors, not the Copy Engine —
+# bypass via raw cuMemcpyAsync driver calls instead. Caller must barrier before calling.
 
 
 def _check(result):
@@ -357,58 +267,8 @@ def _get_ce_streams(device, n):
 
 
 def all_gather_copy_engine_async(x, peer_bufs, my_rank, out=None, num_streams=2):
-    """All-gather routed through the Copy Engines via cuMemcpyAsync.
-
-    For each remote rank r, issues
-        cuMemcpyAsync(out[r], peer_bufs[r], ...)
-    on a dedicated CUDA stream. The local chunk is filled via cuMemcpyAsync
-    on the torch stream from this rank's ``x`` (intra-device, no NVLink).
-    Going through the driver bindings rather than torch.Tensor.copy_
-    ensures the driver picks the Copy Engine path; torch.copy_ launches
-    a SM copy kernel even on P2P-mapped tensors. To verify CE usage in
-    practice:
-        ncu --metrics lts__t_sectors_srcunit_l1ces_op_read.sum,\\
-                     lts__t_sectors_srcunit_tex_op_read.sum
-    The L1ces counter should account for the (W-1) cross-rank chunks;
-    tex should be near-zero for those copies.
-
-    Caller contract:
-        ``x`` is this rank's data — any tensor with a valid CUDA pointer.
-        ``peer_bufs[r]`` is any tensor that points at peer ``r``'s data
-        in a way the CE can read through (P2P-enabled, IPC-mapped,
-        symm-mem rendezvous'd — all are fine; the function does not
-        care which mechanism produced the mapping).
-
-        The caller is responsible for fencing peer-visible writes
-        before this call (NCCL barrier, symm-mem barrier, etc.) so
-        that peer reads observe valid data. The CE streams take a
-        ``wait_stream`` dependency on the torch stream, so anything
-        enqueued on the main stream (e.g. the caller's barrier)
-        serializes correctly.
-
-    Args:
-        x:           this rank's tensor, shape (T_local, ...). Must be
-                     contiguous.
-        peer_bufs:   tuple of W tensors — one per rank — each pointing
-                     at that peer's published data. Length determines W.
-        my_rank:     index in ``peer_bufs`` corresponding to this rank.
-        out:         optional pre-allocated output (W*T_local, ...) with
-                     matching dtype/device. Allocated here if None.
-        num_streams: number of CE streams. Default 2. More streams =
-                     more concurrent peer copies; past 4 the host
-                     overhead usually outweighs the parallelism on a
-                     single NVLink island.
-
-    Returns:
-        CEHandle. Use .wait() to sync, then access .out (or call() it).
-
-    Example:
-        h = all_gather_copy_engine_async(
-            x_local, peer_bufs=peer_bufs, my_rank=rank,
-        )
-        y = some_gemm(...)              # overlaps with CE copies
-        x_global = h.wait()
-    """
+    """peer_bufs may be any P2P/IPC/symm-mem-mapped tensor; caller must fence writes before calling.
+    num_streams>4 rarely helps — host overhead outweighs parallelism on one NVLink island."""
     W = len(peer_bufs)
 
     if out is None:
@@ -424,15 +284,13 @@ def all_gather_copy_engine_async(x, peer_bufs, my_rank, out=None, num_streams=2)
     bytes_per_chunk = x.numel() * x.element_size()
 
     main = torch.cuda.current_stream()
-    # CE streams wait on whatever was last enqueued on the torch stream
-    # (typically the caller's barrier on peer_bufs), so peer reads
-    # observe valid data.
+    # CE streams wait on the torch stream's last op (typically the caller's
+    # barrier), so peer reads observe valid data.
     for s in streams:
         s.wait_stream(main)
 
-    # Self-copy on the torch stream — intra-device, no NVLink. Reads
-    # straight from raw x (no symm-mem hop). The cross-stream
-    # parallelism is enough that this isn't on the critical path.
+    # Self-copy on the torch stream (intra-device, no NVLink) — reads raw x
+    # directly; cross-stream parallelism keeps this off the critical path.
     _check(
         driver.cuMemcpyAsync(
             chunks[my_rank].data_ptr(),
@@ -442,10 +300,8 @@ def all_gather_copy_engine_async(x, peer_bufs, my_rank, out=None, num_streams=2)
         )
     )
 
-    # Cross-rank pulls via cuMemcpyAsync on dedicated CE streams. Round-
-    # robin across the pool. Self-skipped (handled above). Iteration
-    # order starts at (rank+1) to spread the initial requests across
-    # peers — at large W this avoids transient hot-spotting on rank 0.
+    # Round-robin across CE streams; iteration starts at rank+1 (not 0) to
+    # avoid transient hot-spotting on rank 0 at large W.
     peers = [(my_rank + i) % W for i in range(1, W)]
     for idx, r in enumerate(peers):
         s = streams[idx % num_streams]
@@ -463,34 +319,11 @@ def all_gather_copy_engine_async(x, peer_bufs, my_rank, out=None, num_streams=2)
 
 # Adapted from https://github.com/yifuwang/symm-mem-recipes/tree/main
 
-# ============================================================================
-# multimem AG / RS — NVLink SHARP multicast collectives.
-# ----------------------------------------------------------------------------
-# These mirror all_gather_triton / reduce_scatter_triton but issue the
-# transfer through the symm-mem *multicast* pointer instead of per-peer
-# unicast reads. One multimem.st fans a 128-bit write out to every peer's
-# buffer in a single instruction; one multimem.ld_reduce pulls + sums the
-# same 128-bit slot across every peer in a single instruction (the switch /
-# NVLink-SHARP does the reduction). Both operate on 16-byte (128-bit) packs,
-# so buffers must be 16-byte aligned and their byte size a multiple of 16
-# (always true for the (T_local, d) shapes here).
-#
-# Numerics:
-#   * AG is a pure bit copy → bit-exact vs all_gather_triton / NCCL.
-#   * RS reduces in the multicast unit. bf16 reduces in bf16 (add.v4.bf16x2),
-#     fp32 in fp32 (add.v4.f32); summation order across peers is
-#     hardware-defined, so bf16 RS is NOT bit-exact vs the fp32-accum
-#     reduce_scatter_triton — compare with a tolerance.
-#
-# Reference PTX patterns: github.com/yifuwang/symm-mem-recipes.
-# ============================================================================
+# NVLink-SHARP multicast: multimem.st fans out / ld_reduce sums in one instruction (switch does the
+# reduce). 16-byte-aligned packs only. AG is bit-exact; bf16 RS is NOT (HW-defined summation order) — compare with tolerance.
 
-# Throughput-only tuning. These kernels are NVLink-bandwidth-bound, so the
-# levers that matter are the ones that keep enough multimem ops in flight to
-# saturate the link: num_warps (issue width / occupancy), BLOCK_SIZE (per-thread
-# ILP) and num_stages (prefetch). Grid size is NOT a throughput lever — a
-# one-pass grid (cdiv(n_packs, BLOCK_SIZE)) already fills every SM — so we do
-# not tune it.
+# NVLink-BW-bound: only num_warps/BLOCK_SIZE/num_stages matter for keeping ops in flight.
+# Grid size isn't tuned — a one-pass grid already fills every SM.
 _MULTIMEM_CONFIGS = [
     triton.Config({"BLOCK_SIZE": bs}, num_warps=nw, num_stages=ns)
     for bs in [2048, 4096, 8192]
@@ -502,9 +335,8 @@ _MULTIMEM_CONFIGS = [
 
 @triton.jit
 def _multimem_st_v4(mc_ptr, x0, x1, x2, x3, mask):
-    """Store one 128-bit pack {x0,x1,x2,x3} to the multicast address, fanning
-    the write out to every peer's buffer. Raw bit copy (.v4.f32 over b32
-    registers), so dtype-agnostic. No-op where mask == 0."""
+    """Broadcasts one 128-bit pack to every peer via the multicast address.
+    Raw bit copy (dtype-agnostic); no-op where mask == 0."""
     tl.inline_asm_elementwise(
         """
         {
@@ -624,17 +456,8 @@ def _n_packs(numel: int, elem_size: int) -> int:
 
 
 def all_gather_multimem_triton(x_symm, group, out=None, hdl=None, out_hdl=None, fence=True):
-    """All-gather via NVLink multicast (multimem.st). Bit-exact vs
-    all_gather_triton. Output is a symm-mem buffer with multicast support.
-
-    Caller contract: x_symm holds this rank's data. The kernel reads x
-    locally and pushes it to every peer's ``out`` via multicast. AG is a
-    PUSH, so a post-barrier is required before the gathered result is read.
-
-    ``fence`` (default True) issues that post-barrier. Pass fence=False only
-    when the caller fences externally (e.g. a benchmark timing the pure
-    transfer, or a caller batching several pushes before one barrier).
-    """
+    """AG is a PUSH — needs a post-barrier after the write (opposite of the pull-based
+    all_gather_triton's pre-barrier). fence=False lets the caller barrier externally."""
     if hdl is None:
         hdl = rendezvous(x_symm, group)
     W = hdl.world_size
@@ -664,13 +487,8 @@ def all_gather_multimem_triton(x_symm, group, out=None, hdl=None, out_hdl=None, 
 
 
 def reduce_scatter_multimem_triton(x_symm, group, out=None, hdl=None, my_rank=None):
-    """Sum-reduce-scatter via NVLink multicast (multimem.ld_reduce). Reduces
-    in the buffer dtype (bf16 in bf16, fp32 in fp32), so bf16 results are not
-    bit-exact vs the fp32-accum reduce_scatter_triton.
-
-    Caller contract: x_symm has been written and a barrier issued before the
-    call (peers' bytes are read via the multicast load).
-    """
+    """Reduces in buffer dtype (bf16!=fp32-exact vs reduce_scatter_triton).
+    Caller must barrier BEFORE calling (pull-based multicast load)."""
     if hdl is None:
         hdl = rendezvous(x_symm, group)
     W = hdl.world_size

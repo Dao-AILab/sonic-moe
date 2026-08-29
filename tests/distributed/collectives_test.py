@@ -1,14 +1,7 @@
 # ********************************************************************************
 # Copyright (c) 2026, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
-# Run with torchrun:
-#
-#   torchrun --nproc_per_node=8 --standalone --local-ranks-filter 0 -m pytest tests/distributed/collectives_test.py -s
-#
-# Single test:
-#
-#   torchrun --nproc_per_node=8 --standalone --local-ranks-filter 0 \
-#       -m pytest tests/distributed/collectives_test.py::EPCollectivesTest::test_all_gather -s
+# Run: torchrun --nproc_per_node=8 --standalone --local-ranks-filter 0 -m pytest tests/distributed/collectives_test.py -s
 # ********************************************************************************
 
 import atexit
@@ -26,6 +19,7 @@ from sonicmoe.functional.distributed import (
     all_gather_copy_engine_async,
     all_gather_multimem_triton,
     all_gather_triton,
+    build_a2a_peer_base,
     build_rank_dedup_a_idx,
     compute_dispatch_metadata,
     local_combine,
@@ -36,26 +30,17 @@ from sonicmoe.functional.distributed import (
 )
 from tests.test_commons import TestCommons
 
+# Hierarchical inter-node EP compute kernels — validated here on real GPUs over NVLink; the cross-node
+# GIN/RDMA transport that feeds them is exercised separately by the hier_ep_*_gin tests.
+from sonicmoe.functional.distributed.ep_dispatch import expand_dispatch_triton, hier_gather_rt_triton
+from sonicmoe.functional.distributed.ep_combine import (
+    hier_combine_gateway_reduce_triton,
+    hier_combine_origin_reduce_triton,
+)
 
-# ============================================================================
-# CRITICAL: Hard-exit during Python shutdown to bypass C++ destructors.
-# ----------------------------------------------------------------------------
-# Symm-mem tensors allocated by the test workers (and held by internal
-# `torch.distributed._symmetric_memory` module-level state past the
-# workers' explicit `del`s) would otherwise have their refcounts dropped
-# during interpreter shutdown, triggering ~CUDASymmetricMemory() →
-# cuMemUnmap() from a C++ destructor while the CUDA context is being
-# torn down concurrently → c10::Error → destructors can't throw →
-# std::terminate() → SIGABRT.
-#
-# atexit handlers fire DURING Python shutdown but BEFORE module
-# destruction (where the C++ destructors run). Registering os._exit
-# here means: pytest's terminal_summary (run from pytest_sessionfinish,
-# which executes BEFORE atexit) still prints test pass/fail normally;
-# we just bypass the destructor chain that follows. The exit code is
-# forced to 0 — acceptable because the alternative is a SIGABRT that
-# also obscures the real test outcome.
-# ============================================================================
+
+# CRITICAL: symm-mem tensors freed during interpreter shutdown trigger cuMemUnmap() from a C++
+# destructor while the CUDA context tears down -> std::terminate()/SIGABRT; os._exit bypasses that.
 atexit.register(os._exit, 0)
 
 
@@ -122,12 +107,8 @@ def _gen_routing(T_local, K, E, my_rank, world_size, device, *, pattern, seed):
     return full
 
 
-# ============================================================================
-# Run a worker on this rank and aggregate failure strings across all ranks.
-# Replaces the old mp.spawn-based _spawn_and_run; under torchrun every rank is
-# already executing this code path, so we just call the worker locally and use
-# all_gather_object to collect each rank's findings.
-# ============================================================================
+# Run a worker on this rank and aggregate failures across ranks via all_gather_object; replaces the
+# old mp.spawn-based _spawn_and_run now that torchrun already runs this code path on every rank.
 
 
 def _run_worker_collect_failures(worker_fn) -> list[str]:
@@ -180,9 +161,8 @@ def _worker_all_gather(rank, world_size, device):
         for dtype in (torch.bfloat16, torch.float32):
             x = _alloc_symm((T_local, d), dtype, device)
             x.normal_()
-            # GPU-side fence: peers will read x via NVLink in the AG calls
-            # below. hdl.barrier() ensures this rank's .normal_() has
-            # landed before any peer reads its bytes.
+            # GPU-side fence: peers read x via NVLink in the AG calls below, so hdl.barrier() must
+            # ensure this rank's .normal_() has landed before any peer reads its bytes.
             _barrier(x)
 
             ce_peer_bufs = tuple(
@@ -235,10 +215,14 @@ def _worker_reduce_scatter(rank, world_size, device):
     return fails
 
 
+# Freeing a multicast-bound symm buffer mid-test aborts the process in the symm-mem destructor
+# (driver multicast-unbind failure); production never frees these mid-run, so we keep them alive too.
+_MULTIMEM_KEEPALIVE: list = []
+
+
 # ============================================================================
-# Worker: all_gather (multimem) — bit-exact vs dist.all_gather_into_tensor.
-# multimem.st is a raw bit copy, so it must match exactly. Requires NVLink
-# multicast support (NVLink SHARP / MNNVL); the shape is skipped otherwise.
+# Worker: all_gather (multimem) — multimem.st is a raw bit copy so it must match dist.all_gather
+# exactly; requires NVLink multicast (SHARP/MNNVL), skipped otherwise.
 # ============================================================================
 
 
@@ -252,7 +236,7 @@ def _worker_all_gather_multimem(rank, world_size, device):
 
             # multimem AG allocates a multicast-backed symm output internally.
             if _symm_mem.rendezvous(x, group=dist.group.WORLD.group_name).multicast_ptr == 0:
-                del x
+                _MULTIMEM_KEEPALIVE.append(x)  # never freed mid-loop
                 continue  # no multicast support on this fabric
 
             tri = all_gather_multimem_triton(x, dist.group.WORLD)
@@ -260,15 +244,15 @@ def _worker_all_gather_multimem(rank, world_size, device):
             dist.all_gather_into_tensor(ref, x, group=dist.group.WORLD)
             if not torch.equal(tri, ref):
                 fails.append(f"AG-mm T={T_local} d={d} dt={dtype}: {(tri != ref).sum().item()} differ")
-            del x, tri, ref
-        torch.cuda.empty_cache()
+            # x and tri are multicast symm buffers — keep alive, do not free.
+            _MULTIMEM_KEEPALIVE.extend((x, tri))
+            del ref
     return fails
 
 
 # ============================================================================
-# Worker: reduce_scatter (multimem) — multimem.ld_reduce reduces in the
-# buffer dtype (bf16 in bf16, fp32 in fp32) with hardware-defined order, so
-# compare with a tolerance rather than bit-exactly. Requires multicast.
+# Worker: reduce_scatter (multimem) — ld_reduce reduces in the buffer dtype with hardware-defined
+# order, so compare with a tolerance (not bit-exact). Requires NVLink multicast.
 # ============================================================================
 
 
@@ -281,12 +265,16 @@ def _worker_reduce_scatter_multimem(rank, world_size, device):
             _barrier(x)
 
             if _symm_mem.rendezvous(x, group=dist.group.WORLD.group_name).multicast_ptr == 0:
-                del x
+                _MULTIMEM_KEEPALIVE.append(x)  # never freed mid-loop
                 continue  # no multicast support on this fabric
 
             tri = reduce_scatter_multimem_triton(x, dist.group.WORLD)
 
-            x_all = all_gather_triton(x, dist.group.WORLD).view(world_size, world_size * T_local, d)
+            # Reference via NCCL all-gather into a REGULAR tensor (no symm alloc,
+            # no extra unicast peer-mapping of the multicast x), then fp32 reduce.
+            x_all = torch.empty(world_size * world_size * T_local, d, dtype=dtype, device=device)
+            dist.all_gather_into_tensor(x_all, x.contiguous(), group=dist.group.WORLD)
+            x_all = x_all.view(world_size, world_size * T_local, d)
             ref_fp32 = torch.zeros(T_local, d, dtype=torch.float32, device=device)
             for p in range(world_size):
                 ref_fp32 += x_all[p, rank * T_local : (rank + 1) * T_local].to(torch.float32)
@@ -301,8 +289,10 @@ def _worker_reduce_scatter_multimem(rank, world_size, device):
                     f"{(~torch.isclose(tri, ref, atol=atol, rtol=rtol)).sum().item()} differ, "
                     f"max_diff={diff.max().item():.3e}"
                 )
-            del x, tri, ref, x_all, ref_fp32
-        torch.cuda.empty_cache()
+            # x is a multicast symm buffer — keep alive, do not free. x_all/tri/ref
+            # are regular tensors and are safe to drop.
+            _MULTIMEM_KEEPALIVE.append(x)
+            del tri, ref, x_all, ref_fp32
     return fails
 
 
@@ -358,7 +348,7 @@ def _worker_a2a_dispatch(rank, world_size, device):
 
 # ============================================================================
 # Worker: rank_dedup_dispatch — bit-exact agreement with a2a_dispatch
-# on the expert-grouped layout (Phase 2 acceptance from the task spec).
+# on the expert-grouped layout.
 # ============================================================================
 
 
@@ -377,10 +367,8 @@ def _worker_rank_dedup_dispatch(rank, world_size, device):
             topk = _gen_routing(T_local, K, E, rank, world_size, device, pattern=pat, seed=400)
             meta = compute_dispatch_metadata(topk, my_rank=rank, E_local=E_local)
 
-            # Build s_reverse_local via the existing per-expert metadata
-            # path so dedup-fanout writes line up with what a non-dedup
-            # A2A dispatch would have produced. Mirrors what ep.py does
-            # in _build_consumer_metadata.
+            # Build s_reverse_local via the existing per-expert metadata path (mirrors what ep.py's
+            # _build_consumer_metadata does) so dedup-expand writes line up with a non-dedup A2A dispatch.
             from sonicmoe.functional.metadata import general_routing_router_metadata_triton
 
             E_total = E_local + 1
@@ -444,10 +432,8 @@ def _worker_rank_dedup_dispatch(rank, world_size, device):
                 group=dist.group.WORLD,
             )
 
-            # Restrict the A_idx-driven check to expert-grouped rows that
-            # are actually populated by routing to my_rank — matches what
-            # the GEMM consumes (cu_seqlens_m bounds the GEMM at
-            # expert_frequency_offset[E_local] ≤ MAX_ROWS_PER_RANK).
+            # Restrict the A_idx-driven check to expert-grouped rows actually populated by routing to
+            # my_rank — matches what the GEMM consumes (bounded by expert_frequency_offset[E_local]).
             n_routed = int(expert_freq_off[E_local].item())
             if n_routed > 0:
                 gathered = recv_packed[x_idx_expanded_remap_for_rank_dedup[:n_routed].long()]
@@ -459,11 +445,8 @@ def _worker_rank_dedup_dispatch(rank, world_size, device):
                         f"{n_diff} rows differ vs A2A dispatch"
                     )
 
-            # Reference 2 — packed buffer structural contract:
-            # for each (src=p, t) with at least one slot routing to my_rank,
-            # there must be exactly ONE row at recv_packed[rank_dedup_recv_pos[f]]
-            # equal to peer p's x[t]. Touched-row count must equal
-            # sum_p pair_count[p, my_rank].
+            # Reference 2 — structural contract: each (src,t) routing to my_rank has exactly ONE row at
+            # recv_packed[rank_dedup_recv_pos[f]]; touched-row count must equal sum_p pair_count[p, my_rank].
             x_all = all_gather_triton(x, dist.group.WORLD).view(world_size, T_local, d)
             n_touched_expected = int(meta["pair_count"][:, rank].sum().item())
             sentinel_rows = (recv_packed == SENTINEL_PACKED).all(dim=-1)
@@ -552,9 +535,8 @@ def _worker_local_combine(rank, world_size, device):
                     group=dist.group.WORLD,
                 )
 
-                # Reference: same K-order accumulation as the kernel. The
-                # kernel masks non-mine slots with other=0.0, so contribution
-                # is `w * 0 = 0`; mirror with torch.where on gathered rows.
+                # Reference: same K-order accumulation as the kernel, which masks non-mine slots with
+                # other=0.0 (contribution w*0=0); mirror that with torch.where on gathered rows.
                 ref = torch.zeros_like(rs)
                 ht = torch.arange(world_size * T_local, device=device, dtype=torch.int64)
                 for k in range(K):
@@ -612,15 +594,19 @@ def _worker_A2A_combine(rank, world_size, device):
                 torch.randn(T_local, K, device=device, dtype=torch.float32, generator=g), dim=-1
             ).to(torch.bfloat16)
 
-            # Single fence after both symm writes — group-level, covers
-            # both y and sr because hdl.barrier() fences all preceding
-            # GPU work on this rank's stream before peers read either.
+            # Single fence after both symm writes: group-level hdl.barrier() fences all preceding
+            # GPU work on this rank's stream, so it covers both y and sr before peers read either.
             _barrier(y)
             y_all = all_gather_triton(y, dist.group.WORLD)
             s_all = all_gather_triton(sr, dist.group.WORLD)
 
+            # Runtime-peer-addressing A2A peer-base tensors (constant addresses;
+            # built once per shape/pattern, scores-independent).
+            peer_y_base, peer_s_base, a2a_rank = build_a2a_peer_base(y, sr, group=dist.group.WORLD)
+
             for use_scores in (True, False):
                 scores_arg = scores_local if use_scores else None
+                label = "scored" if use_scores else "score-less"
                 out = torch.empty(T_local, d, dtype=torch.bfloat16, device=device)
 
                 a2a_combine_triton(
@@ -631,6 +617,9 @@ def _worker_A2A_combine(rank, world_size, device):
                     out,
                     K=K,
                     group=dist.group.WORLD,
+                    peer_y_base=peer_y_base,
+                    peer_s_base=peer_s_base,
+                    my_rank=a2a_rank,
                 )
 
                 ref_acc = torch.zeros(T_local, d, dtype=torch.float32, device=device)
@@ -647,11 +636,10 @@ def _worker_A2A_combine(rank, world_size, device):
 
                 if not torch.allclose(out, ref, atol=1e-2, rtol=1e-2):
                     max_abs = (out.float() - ref.float()).abs().max().item()
-                    label = "scored" if use_scores else "score-less"
                     fails.append(f"Gather T={T_local} d={d} K={K} {pat} {label}: max_abs={max_abs:.3e}")
                 del out
 
-            del y, sr, y_all, s_all
+            del y, sr, y_all, s_all, peer_y_base, peer_s_base
         torch.cuda.empty_cache()
     return fails
 
@@ -696,11 +684,20 @@ def _worker_rank_dedup_combine(rank, world_size, device):
             # reduce + gather path read peers' versions through NVLink.
             _barrier(y)
 
+            # Cached peer-buf tuples for the gather's single-contributor reads (matches production).
+            # Resolving them per-call and dropping mid-flight is a use-after-free over NVLink.
+            y_peer_bufs = tuple(
+                _symm_mem.rendezvous(y, group=dist.group.WORLD.group_name).get_buffer(r, (TK_global, d), torch.bfloat16)
+                for r in range(world_size)
+            )
+            s_reverse_peer_bufs = tuple(
+                _symm_mem.rendezvous(sr, group=dist.group.WORLD.group_name).get_buffer(r, (TK_global,), torch.int32)
+                for r in range(world_size)
+            )
+
             for use_scores in (True, False):
-                # Reference path: existing a2a_combine_triton with
-                # the same inputs. Both reduce in fp32, both cast at store
-                # to bf16 — peer-read order differs (per-(t, k) vs.
-                # local-pre-summed), so allclose absorbs the ULP.
+                # Reference: a2a_combine_triton on the same inputs. Both reduce in fp32 and cast to bf16
+                # at store, but peer-read order differs (per-(t,k) vs. pre-summed), so allclose absorbs the ULP.
                 ref_out = torch.empty(T_local, d, dtype=torch.bfloat16, device=device)
                 a2a_combine_triton(
                     y,
@@ -712,38 +709,269 @@ def _worker_rank_dedup_combine(rank, world_size, device):
                     group=dist.group.WORLD,
                 )
 
-                # Local-reduce + gather: producer (local_combine) +
-                # barrier + sparse gather (consumer reads partial_combine_buf at
-                # rows where peer_present_mask is set).
-                partial_combine_buf.zero_()
-                got_out = torch.empty(T_local, d, dtype=torch.bfloat16, device=device)
-                rank_dedup_combine_triton(
-                    y,
-                    sr,
-                    meta["dst_rank_flat"],
-                    scores_global if use_scores else None,
-                    meta["peer_present_mask"],
-                    partial_combine_buf,
-                    got_out,
-                    K=K,
-                    T_local=T_local,
-                    group=dist.group.WORLD,
+                # Selective-dedup gather: single_row must equal peer q's s_reverse at that slot. Since
+                # this test uses RANDOM sr (not real routing), derive single_row from sr, not _build_single_row.
+                sr_all = torch.empty(world_size * TK_global, dtype=torch.int32, device=device)
+                dist.all_gather_into_tensor(sr_all, sr, group=dist.group.WORLD)
+                sr_all = sr_all.view(world_size, TK_global)
+                _csk = meta["combine_single_k"].to(torch.int64)  # (W, T_local)
+                _t = torch.arange(T_local, device=device, dtype=torch.int64)
+                _pos = rank * TK_local + _t[None, :] * K + _csk.clamp(min=0)  # (W, T_local)
+                _q = torch.arange(world_size, device=device, dtype=torch.int64)[:, None]
+                single_row = torch.where(_csk >= 0, sr_all[_q, _pos], torch.zeros_like(_pos)).to(torch.int32)
+                rank_dedup_kw = dict(
+                    mine_slot_idx=meta["mine_slot_idx"],
+                    mine_count=meta["mine_count"],
+                    combine_contrib_C=meta["combine_contrib_C"],
+                    combine_work_list=meta["combine_work_list_multi"],
+                    combine_work_count=meta["combine_work_count_multi"],
+                    combine_single_k=meta["combine_single_k"],
+                    single_row=single_row,
+                    y_peer_bufs=y_peer_bufs,
+                    s_reverse_peer_bufs=s_reverse_peer_bufs,
                 )
-
-                if not torch.allclose(got_out, ref_out, atol=1.5e-1, rtol=3e-2):
-                    diff = (got_out.float() - ref_out.float()).abs()
-                    label = "scored" if use_scores else "score-less"
-                    fails.append(
-                        f"local-reduce-gather T={T_local} d={d} K={K} {pat} {label}: "
-                        f"max_abs={diff.max().item():.3e}"
+                modes = [("rank_dedup", rank_dedup_kw)]
+                for prod, mode_kw in modes:
+                    partial_combine_buf.zero_()
+                    _barrier(partial_combine_buf)
+                    got_out = torch.empty(T_local, d, dtype=torch.bfloat16, device=device)
+                    rank_dedup_combine_triton(
+                        y,
+                        sr,
+                        scores_global if use_scores else None,
+                        meta["peer_present_mask"],
+                        partial_combine_buf,
+                        got_out,
+                        K=K,
+                        T_local=T_local,
+                        group=dist.group.WORLD,
+                        **mode_kw,
                     )
 
-                # Sync peers between iterations — partial_combine_buf gets reused.
-                _barrier(partial_combine_buf)
+                    if not torch.allclose(got_out, ref_out, atol=1.5e-1, rtol=3e-2):
+                        diff = (got_out.float() - ref_out.float()).abs()
+                        label = "scored" if use_scores else "score-less"
+                        fails.append(
+                            f"local-reduce-gather[{prod}] T={T_local} d={d} K={K} {pat} {label}: "
+                            f"max_abs={diff.max().item():.3e}"
+                        )
+
+                    # Sync peers between iterations — partial_combine_buf reused.
+                    _barrier(partial_combine_buf)
 
                 del ref_out, got_out
 
+            # Peer-buf aliases first, then the symm tensors they alias — reversing this teardown order
+            # cuMemUnmaps pages a peer alias still references (~AllocationRef "invalid peer access").
+            del y_peer_bufs, s_reverse_peer_bufs
             del y, sr, partial_combine_buf, scores_local, scores_global
+        torch.cuda.empty_cache()
+    return fails
+
+
+# ============================================================================
+# Hierarchical inter-node EP COMPUTE, isolated from GIN/RDMA transport: the buffers a cross-node GIN
+# put would land are filled locally over NVLink instead, so this tests the receiver/reduce kernels alone.
+# ============================================================================
+def _hier_global_routing(W, num_nodes, node_size, T_local, K, E_local, seed):
+    """Deterministic global routing (identical on every rank), biased remote so cross-node slots exist."""
+    g = torch.Generator().manual_seed(seed)
+    E = W * E_local
+    out = torch.empty(W, T_local, K, dtype=torch.int64)
+    for r in range(W):
+        my_node = r // node_size
+        remote_ranks = [rk for rk in range(W) if rk // node_size != my_node]
+        for t in range(T_local):
+            picks = set()
+            n_remote = K // 2 if num_nodes > 1 else 0
+            while len(picks) < n_remote and remote_ranks:
+                rk = remote_ranks[int(torch.randint(0, len(remote_ranks), (1,), generator=g))]
+                picks.add(int(torch.randint(rk * E_local, (rk + 1) * E_local, (1,), generator=g)))
+            while len(picks) < K:
+                picks.add(int(torch.randint(0, E, (1,), generator=g)))
+            out[r, t] = torch.tensor(sorted(picks)[:K], dtype=torch.int64)
+    return out
+
+
+def _hier_node_sizes(world_size):
+    """node_size choices that divide the world into >= 2 simulated nodes (so remote slots exist)."""
+    return [ns for ns in (1, 2, 4) if world_size % ns == 0 and world_size // ns >= 2]
+
+
+def _worker_hier_dispatch_compute(rank, world_size, device):
+    """HIER dispatch RECEIVER COMPUTE vs the oracle: dst_node_buffer is filled locally (standing in for
+    the GIN put), exercising both receivers — the two-kernel pull+expand and the unified RT gather."""
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from hier_ep_reference import compute_hier_dispatch_reference, recv_gpu
+
+    fails = []
+    T_local, K, E_local, d = 6, 4, 2, 128
+    if world_size * T_local >= 256:
+        T_local = max(1, 255 // world_size)  # keep the token id (rank*T_local+t) bf16-exact
+    for node_size in _hier_node_sizes(world_size):
+        num_nodes = world_size // node_size
+        my_node, my_local = rank // node_size, rank % node_size
+        topk = _hier_global_routing(world_size, num_nodes, node_size, T_local, K, E_local, seed=400)
+        ref = compute_hier_dispatch_reference(topk, num_nodes, node_size, E_local)
+        meta = compute_dispatch_metadata(topk.to(torch.int32).to(device), my_rank=rank, E_local=E_local,
+                                         emit_combine=False, emit_hier=True, node_size=node_size)
+        total = int(ref.recv_rows_per_rank[rank])
+
+        # my x window: token id = rank*T_local + t, broadcast over d
+        x = _alloc_symm((T_local, d), torch.bfloat16, device)
+        for t in range(T_local):
+            x[t].fill_(float(rank * T_local + t))
+        # my dst_node_buffer: fill the rows the oracle says land at me (stands in for the GIN put), -1 else
+        ROWS = max(ref.DST_NODE_BUF_ROWS, 1)
+        dnb = _alloc_symm((ROWS, d), torch.bfloat16, device)
+        dnb.fill_(-1.0)
+        np_m = ref.node_present_mask.view(world_size, T_local, K)
+        dn_m = ref.dst_node_flat.view(world_size, T_local, K)
+        ds_m = ref.dst_slot.view(world_size, T_local, K)
+        for src in range(world_size):
+            for t in range(T_local):
+                for k in range(K):
+                    if int(np_m[src, t, k]) and recv_gpu(src, int(dn_m[src, t, k]), node_size) == rank:
+                        dnb[int(ds_m[src, t, k])].fill_(float(src * T_local + t))
+        _barrier(x)
+        _barrier(dnb)
+
+        hdl_x = _symm_mem.rendezvous(x, group=dist.group.WORLD.group_name)
+        hdl_d = _symm_mem.rendezvous(dnb, group=dist.group.WORLD.group_name)
+        x_peers = tuple(hdl_x.get_buffer(r, (T_local, d), torch.bfloat16) for r in range(world_size))
+        dnb_peers = tuple(hdl_d.get_buffer(r, (ROWS, d), torch.bfloat16) for r in range(world_size))
+
+        # oracle golden: each canonical slot routed to me -> its token id at recv_pos
+        pp = ref.pair_present_mask.view(world_size, T_local, K)
+        dr = ref.dst_rank_flat.view(world_size, T_local, K)
+        pos = ref.rank_dedup_recv_pos.view(world_size, T_local, K)
+        golden = torch.full((max(total, 1), d), -3.0, device=device, dtype=torch.bfloat16)
+        for src in range(world_size):
+            for t in range(T_local):
+                for k in range(K):
+                    if int(pp[src, t, k]) and int(dr[src, t, k]) == rank:
+                        golden[int(pos[src, t, k])].fill_(float(src * T_local + t))
+
+        if total > 0:
+            # receiver 1: two-kernel same-node pull + remote expand
+            recv1 = torch.full((total, d), -2.0, device=device, dtype=torch.bfloat16)
+            rank_dedup_dispatch_triton(
+                x, meta["dst_rank_flat"], meta["pair_present_mask"], meta["rank_dedup_recv_pos"],
+                recv1, K=K, group=None, peer_bufs=x_peers, my_rank=rank, node_size=node_size)
+            expand_dispatch_triton(
+                dnb_peers, meta["pair_present_mask"], meta["is_local_slot"], meta["dst_rank_flat"],
+                meta["dst_slot"], meta["rank_dedup_recv_pos"], recv1, K, my_rank=rank, node_size=node_size)
+            torch.cuda.synchronize()
+            if not torch.equal(recv1.cpu(), golden.cpu()):
+                fails.append(f"hier dispatch pull+expand node_size={node_size} num_nodes={num_nodes}: "
+                             "recv_packed mismatch vs oracle")
+
+            # receiver 2: unified runtime-peer-addressed gather (same-node x + remote dst_node_buffer via LSA)
+            x_lsa = torch.tensor([x_peers[my_node * node_size + l].data_ptr() for l in range(node_size)],
+                                 dtype=torch.int64, device=device)
+            dnb_lsa = torch.tensor([dnb_peers[my_node * node_size + l].data_ptr() for l in range(node_size)],
+                                   dtype=torch.int64, device=device)
+            recv2 = torch.full((total, d), -2.0, device=device, dtype=torch.bfloat16)
+            hier_gather_rt_triton(
+                x_lsa, dnb_lsa, meta["pair_present_mask"], meta["is_local_slot"], meta["dst_rank_flat"],
+                meta["dst_slot"], meta["rank_dedup_recv_pos"], recv2, K, rank, world_size, node_size)
+            torch.cuda.synchronize()
+            if not torch.equal(recv2.cpu(), golden.cpu()):
+                fails.append(f"hier dispatch unified-gather node_size={node_size} num_nodes={num_nodes}: "
+                             "recv_packed mismatch vs oracle")
+
+        _barrier(x)  # all peers done reading before teardown
+        del x_peers, dnb_peers, hdl_x, hdl_d, x, dnb
+        torch.cuda.empty_cache()
+    return fails
+
+
+def _worker_hier_combine_compute(rank, world_size, device):
+    """HIER combine COMPUTE vs the oracle: gateway NVLink-reduce -> (GIN stripe-put stand-in) -> origin
+    NVLink-reduce. Present peer q contributes 2^q (decodable bitmask); out[t] must equal the oracle sum."""
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from hier_ep_reference import compute_hier_combine_reference, rank_of
+
+    fails = []
+    if world_size > 8:
+        return fails  # 2^q fill needs q < W with 2^q bf16-exact (<= 256 => W <= 8)
+    T_local, K, E_local, d = 6, 4, 2, 64
+    POISON = -100.0
+    for node_size in _hier_node_sizes(world_size):
+        num_nodes = world_size // node_size
+        my_node, my_local = rank // node_size, rank % node_size
+        topk = _hier_global_routing(world_size, num_nodes, node_size, T_local, K, E_local, seed=500)
+        cref = compute_hier_combine_reference(topk, num_nodes, node_size, E_local)
+        present_all = cref.peer_present_mask.to(device)        # (R, q, t) int8 — read by both reduces
+        contrib = cref.contrib_node_mask.to(device)            # (W, num_nodes) int8 — origin contrib gate
+        present = cref.peer_present_mask                       # cpu copy for fill + golden
+        RECV_ROWS = max(T_local * (num_nodes - 1), 1)
+
+        # golden out[t] = Σ_q present[my_rank][q][t] * 2^q
+        golden = torch.zeros(T_local, dtype=torch.float32)
+        for q in range(world_size):
+            for t in range(T_local):
+                if int(present[rank, q, t]):
+                    golden[t] += float(2 ** q)
+
+        # my partial: row (R*T_local+t) = 2^my_rank when present[R][my_rank][t] else POISON
+        partial = _alloc_symm((world_size * T_local, d), torch.bfloat16, device)
+        partial.fill_(POISON)
+        pv = float(2 ** rank)
+        for R in range(world_size):
+            for t in range(T_local):
+                if int(present[R, rank, t]):
+                    partial[R * T_local + t].fill_(pv)
+        send_buf = _alloc_symm((RECV_ROWS, d), torch.bfloat16, device)
+        send_buf.fill_(0.0)
+        _barrier(partial)
+        _barrier(send_buf)
+
+        hdl_p = _symm_mem.rendezvous(partial, group=dist.group.WORLD.group_name)
+        hdl_s = _symm_mem.rendezvous(send_buf, group=dist.group.WORLD.group_name)
+        partial_peers = tuple(hdl_p.get_buffer(r, (world_size * T_local, d), torch.bfloat16)
+                              for r in range(world_size))
+        send_peers = tuple(hdl_s.get_buffer(r, (RECV_ROWS, d), torch.bfloat16) for r in range(world_size))
+        node_partials = tuple(partial_peers[my_node * node_size + j] for j in range(node_size))
+
+        # 1) gateway reduce: my node-local peers' partials -> my send_buf
+        hier_combine_gateway_reduce_triton(
+            node_partials, present_all, send_buf, T_local=T_local, node_size=node_size,
+            num_nodes=num_nodes, W=world_size, my_rank=rank, d=d)
+        torch.cuda.synchronize()
+        _barrier(send_buf)
+
+        # 2) stand in for the GIN stripe-put: recv stripes <- serving gateways' send stripes (NVLink).
+        #    Gateway for source-node g is rank_of(g, my_local); s_send/s_recv are the closed-form stripe indices.
+        recv_buf = torch.zeros(RECV_ROWS, d, device=device, dtype=torch.bfloat16)
+        for g in range(num_nodes):
+            if g == my_node or not int(contrib[rank, g]):
+                continue
+            C = rank_of(g, my_local, node_size)
+            s_send = my_node if my_node < g else my_node - 1
+            s_recv = g if g < my_node else g - 1
+            recv_buf[s_recv * T_local:(s_recv + 1) * T_local].copy_(
+                send_peers[C][s_send * T_local:(s_send + 1) * T_local])
+        torch.cuda.synchronize()
+
+        # 3) origin reduce: node-local peers (present-gated) + remote stripes (contrib-gated) -> out
+        out = torch.full((T_local, d), -1.0, device=device, dtype=torch.bfloat16)
+        hier_combine_origin_reduce_triton(
+            node_partials, present_all, contrib, recv_buf, out, T_local=T_local, node_size=node_size,
+            num_nodes=num_nodes, W=world_size, my_rank=rank, d=d)
+        torch.cuda.synchronize()
+
+        want = golden[:, None].expand(T_local, d)
+        got = out.to(torch.float32).cpu()
+        if not torch.equal(got, want):
+            n_bad = int((got != want).any(dim=1).sum())
+            fails.append(f"hier combine node_size={node_size} num_nodes={num_nodes}: "
+                         f"{n_bad}/{T_local} tokens mismatch vs oracle")
+
+        _barrier(partial)
+        del partial_peers, send_peers, node_partials, hdl_p, hdl_s, partial, send_buf
         torch.cuda.empty_cache()
     return fails
 
@@ -762,10 +990,8 @@ class EPCollectivesTest(TestCommons):
             super().tearDownClass()
 
     def setUp(self):
-        # Coarse cross-rank sync at the start of each test so a slow rank
-        # doesn't collide with the previous test's tail traffic. This is
-        # a process-level rendez-vous (not tied to any specific symm
-        # tensor), so dist.barrier() is the right tool here.
+        # Coarse cross-rank sync so a slow rank doesn't collide with the previous test's tail traffic;
+        # this is a process-level rendezvous (not tied to any symm tensor), so dist.barrier() is right here.
         dist.barrier()
 
     def test_all_gather(self) -> None:
@@ -802,4 +1028,12 @@ class EPCollectivesTest(TestCommons):
 
     def test_rank_dedup_combine(self) -> None:
         fails = _run_worker_collect_failures(_worker_rank_dedup_combine)
+        self.assertEqual(fails, [], "\n" + "\n".join(fails))
+
+    def test_hier_dispatch_compute(self) -> None:
+        fails = _run_worker_collect_failures(_worker_hier_dispatch_compute)
+        self.assertEqual(fails, [], "\n" + "\n".join(fails))
+
+    def test_hier_combine_compute(self) -> None:
+        fails = _run_worker_collect_failures(_worker_hier_combine_compute)
         self.assertEqual(fails, [], "\n" + "\n".join(fails))

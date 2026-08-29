@@ -1,25 +1,8 @@
 # ********************************************************************************
 # Copyright (c) 2026, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
-#
-# Multi-rank correctness test for the EP forward + backward.
-#
-# Each rank constructs the same MoE (seeded), shards weights along the leading
-# E axis, runs the EP forward AND backward on its slice of the global x,
-# all-gathers the per-rank outputs and gradients, and compares against a
-# single-rank PyTorch autograd reference computed on rank 0.
-#
-# Sweep: bias × routing-variant × {3 dispatch modes × 3 combine modes}
-#        × {TC_softmax_topk (fwd + bwd), general_routing (fwd only)}
-# General routing's fwd+bwd combination currently trips a QuACK DSL
-# compile-time ICE in epi_ops.cute.copy on the test's smaller shapes —
-# tracked in QuACK, not in EP. TC covers the backward sweep.
-#
-# Usage (torchrun-launched):
-#
-#   torchrun --nproc_per_node=4 --standalone --local-ranks-filter 0 \
-#            tests/moe_ep_test.py
-#   torchrun --nproc_per_node=8 --standalone --local-ranks-filter 0 \
-#            tests/moe_ep_test.py --concat-layout
+# ********************************************************************************
+# Multi-rank EP forward+backward correctness test vs a single-rank autograd reference (torchrun-launched).
+# general_routing skips fwd+bwd: it trips a QuACK DSL compile-time ICE on these shapes (tracked in QuACK, not EP).
 # ********************************************************************************
 
 from __future__ import annotations
@@ -41,11 +24,8 @@ import torch
 os.environ["QUACK_COMPILE_WORKERS"] = "1"
 
 
-# ─────────────── Monkey-patch: similar M shapes map to the same cached config during QuACK autotuning ───────────────
-# Mirrors ``benchmarks/distributed/moe-ep.py``; without these patches the
-# QuACK autotuner picks tiles for ``gemm_dgated`` at the test's smaller
-# shapes that hit a bf16 alignment ICE in epi_ops. Same restricted
-# config set the bench uses keeps both files consistent.
+# Monkey-patch: pins similar M shapes to the same cached QuACK autotune config — without it, this
+# test's smaller shapes hit a bf16 alignment ICE in epi_ops (mirrors benchmarks/distributed/moe-ep.py).
 
 M_QUANT = 1024
 
@@ -195,6 +175,19 @@ SHAPES: List[Shape] = [
 ]
 
 
+# MoE model-config sweep (name, d, E, K), mirrors bench-ep-nvlink.py _MODELS; used by --model-sweep to
+# validate the HIER inter-node EP path. Replicated not imported since a hyphenated filename isn't importable.
+MODEL_CONFIGS: List[Tuple[str, int, int, int]] = [
+    ("mixtral", 6144, 8, 2),
+    ("olmoe", 2048, 64, 8),
+    ("d2880_e64k4", 2880, 64, 4),
+    ("d2304_e256k8", 2304, 256, 8),
+    ("e512_k10", 2048, 512, 10),
+    ("d4096_e128k8", 4096, 128, 8),
+    ("dsv3", 7168, 256, 8),
+]
+
+
 ROUTING_VARIANTS: List[Tuple[str, bool, bool]] = [
     # (name, is_softmax_over_topk, norm_topk_probs)
     ("topk_then_softmax_norm", False, True),
@@ -246,11 +239,8 @@ def _gather_to_rank0(t_local: torch.Tensor, world_size: int, rank: int) -> Optio
 
 
 def _strided_clone(t: torch.Tensor) -> torch.Tensor:
-    """Preserve the non-contiguous strided layout that quack's grouped GEMM
-    requires for ``w1`` (``(2I, H, E_local)`` view of the original contiguous
-    ``(E_local, 2I, H)`` backing). A plain ``.clone()`` would reset strides to
-    the contiguous layout for the new shape and trip the kernel's stride
-    check."""
+    """Preserve the non-contiguous strided layout quack's grouped GEMM requires for w1 (a (2I,H,E_local)
+    view of contiguous (E_local,2I,H)) — a plain .clone() resets strides and trips the kernel's stride check."""
     out = torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device)
     return out.copy_(t)
 
@@ -281,13 +271,8 @@ def _per_expert_reference_tc(
     Optional[torch.Tensor],
     Optional[torch.Tensor],
 ]:
-    """TC reference: per-expert MoE forward + autograd backward in fp32.
-
-    Uses ``topk_idx_global`` from the EP path so EP and the reference agree
-    on which experts each token routes to (TC's topk tie-breaking is its
-    own kernel — driving the reference off PyTorch's ``logits.topk`` would
-    diverge under ties and produce incomparable backward grads).
-    """
+    """TC reference: per-expert MoE forward + autograd backward in fp32, driven by topk_idx_global from
+    the EP path (not PyTorch's own logits.topk, which would diverge from TC's tie-breaking under ties)."""
     ref_x = x_global.detach().to(torch.float32).requires_grad_(True)
     ref_router_w = router_w.detach().to(torch.float32).requires_grad_(True)
     ref_w1 = w1_full.detach().to(torch.float32).requires_grad_(True)
@@ -442,9 +427,8 @@ def _run_ep_tc_one(
     world_size: int,
     rank: int,
 ):
-    """Run one TC EP fwd+bwd; gather per-rank grads to rank 0. Returns the
-    (y_full, dx_full, drouter_w, ep_dw1, ep_dw2, ep_db1, ep_db2) tuple on
-    rank 0; returns ``None`` on other ranks."""
+    """Run one TC EP fwd+bwd; gather per-rank grads to rank 0. Returns the (y_full, dx_full, drouter_w,
+    ep_dw1, ep_dw2, ep_db1, ep_db2) tuple on rank 0, None on other ranks."""
     x_t = x_local.detach().clone().requires_grad_(True)
     router_w_t = router_w.detach().clone().requires_grad_(True)
     w1_t = _strided_clone(w1_local).requires_grad_(True)
@@ -486,9 +470,8 @@ def _run_ep_tc_one(
     db2_list = _gather_to_rank0(db2_local, world_size, rank) if db2_local is not None else None
 
     if rank == 0:
-        # dw1 per rank is (2I, H, E_local) — concat along E_local axis (dim 2)
-        # to reconstruct (2I, H, E). dw2 per rank is (E_local, I, H) — concat
-        # along dim 0 to reconstruct (E, I, H).
+        # dw1 per rank is (2I, H, E_local) — concat along dim 2 to reconstruct (2I, H, E).
+        # dw2 per rank is (E_local, I, H) — concat along dim 0 to reconstruct (E, I, H).
         ep_dw1 = torch.cat(dw1_list, dim=2)
         ep_dw2 = torch.cat(dw2_list, dim=0)
         ep_db1 = torch.cat(db1_list, dim=0) if db1_list is not None else None
@@ -511,13 +494,8 @@ def _run_ep_general_one_fwd(
     world_size: int,
     rank: int,
 ):
-    """Run general-routing EP forward in inference mode and return y_full
-    on rank 0. Inference mode is used because training-mode + general
-    routing currently trips a QuACK DSL ICE in ``epi_ops.cute.copy``
-    (bf16 column-vector alignment) when ``gemm_dgated`` autotunes for
-    the test's smaller shapes. Forward-only is enough to exercise the
-    3×3 dispatch×combine matrix on the general entry point; TC covers
-    the backward sweep."""
+    """General-routing EP forward in inference mode (training-mode general routing trips a QuACK DSL
+    ICE in epi_ops.cute.copy at these shapes); forward-only still exercises the 3x3 mode matrix, TC covers backward."""
     w1_no_grad = _strided_clone(w1_local)
     y_local = moe_ep_general_routing_forward(
         x_local,
@@ -564,9 +542,8 @@ def _ep_topk_indices_global(
     T: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Run the TC topk on each rank's local logits, all-gather, return the
-    flat (T, K) int64 indices. Used to seed the reference so it picks the
-    same experts that EP's TC topk did (deterministic tie-breaking match)."""
+    """Run the TC topk on each rank's local logits, all-gather, return the flat (T, K) int64 indices —
+    seeds the reference so it picks the same experts EP's TC topk did (deterministic tie-break match)."""
     with torch.no_grad():
         logits = F.linear(x_local, router_w)
         _, topk_idx_local = TC_Softmax_Topk_Router_Function.apply(
@@ -595,6 +572,7 @@ def _run_one_shape(
     atol: float,
     rtol: float,
     seed: int,
+    hier_node_size: int = 0,
 ) -> ShapeStats:
     T, H, I, E, K = shape.T, shape.H, shape.I, shape.E, shape.K
     assert T % world_size == 0, f"T ({T}) must be divisible by world_size ({world_size})."
@@ -634,13 +612,8 @@ def _run_one_shape(
     b2_with = moe.c_proj.bias  # (E, H)
     router_w = moe.router.weight  # (E, H)
 
-    # EP-sharded weights (per-rank expert slice). Layout matches the benchmark
-    # in benchmarks/distributed/moe-ep.py:
-    #   w1: (E_local, 2I, H) → permute(1, 2, 0) → (2I, H, E_local) view,
-    #       strides (H, 1, 2I·H). Non-contiguous on purpose; the GEMM kernel
-    #       requires the middle dim to have stride 1.
-    #   w2: (E_local, H, I)  → permute(0, 2, 1).contiguous() → (E_local, I, H)
-    #       contig.
+    # EP-sharded weights (matches benchmarks/distributed/moe-ep.py): w1 permute(1,2,0) is
+    # non-contiguous on purpose (the GEMM kernel requires the middle dim stride 1); w2 is made contiguous.
     w1_local = w1_full[e_slc].permute(1, 2, 0)
     w2_local = w2_full[e_slc].permute(0, 2, 1).contiguous()
     b1_local_with = b1_with[e_slc].contiguous()
@@ -718,15 +691,27 @@ def _run_one_shape(
                 )
                 ref_o, ref_dx, ref_drouter_w, ref_dw1, ref_dw2, ref_db1, ref_db2 = ref
 
-            for dispatch_mode in DISPATCH_MODES:
-                for combine_mode in COMBINE_MODES:
-                    cfg = RuntimeEPConfig(
-                        dispatch_mode=dispatch_mode,
-                        W=world_size,
-                        K=K,
-                        combine_mode=combine_mode,
-                    )
-                    tag = f"TC[{variant_name},dispatch={dispatch_mode.value},combine={combine_mode.value}]"
+            # Flat: the 3x3 dispatch x combine product. --hier-node-size instead restricts to the single
+            # HIER inter-node pair (use_gin=True), reusing the exact same fp32 reference + grad checks.
+            if hier_node_size:
+                tc_pairs = [(DispatchMode.HIER_NODE_DEDUP_DISPATCH_GIN, CombineMode.HIER_NODE_DEDUP_COMBINE_GIN)]
+            else:
+                tc_pairs = [(dm, cm) for dm in DISPATCH_MODES for cm in COMBINE_MODES]
+            for dispatch_mode, combine_mode in tc_pairs:
+                    if hier_node_size:
+                        cfg = RuntimeEPConfig(
+                            dispatch_mode=dispatch_mode, W=world_size, K=K, combine_mode=combine_mode,
+                            num_nodes=world_size // hier_node_size, node_size=hier_node_size, use_gin=True,
+                        )
+                        tag = f"TC[{variant_name},HIER node_size={hier_node_size} num_nodes={world_size // hier_node_size}]"
+                    else:
+                        cfg = RuntimeEPConfig(
+                            dispatch_mode=dispatch_mode,
+                            W=world_size,
+                            K=K,
+                            combine_mode=combine_mode,
+                        )
+                        tag = f"TC[{variant_name},dispatch={dispatch_mode.value},combine={combine_mode.value}]"
                     try:
                         result = _run_ep_tc_one(
                             x_local,
@@ -748,6 +733,10 @@ def _run_one_shape(
                     except Exception as e:
                         if rank == 0:
                             print(f"{log_prefix}{tag:<88s} ✗ EXC   {type(e).__name__}: {str(e)[:160]}")
+                            if os.environ.get("SMOE_DUMP_EXC") == "1":
+                                print(f"FULL_EXC_BEGIN {tag}", flush=True)
+                                traceback.print_exc()
+                                print("FULL_EXC_END", flush=True)
                             stats.fail_count += 1
                             stats.failures.append(f"{tag} (exception)")
                         dist.barrier()
@@ -773,6 +762,10 @@ def _run_one_shape(
                             stats.failures.append(tag)
                     dist.barrier()
 
+        # entry point #2 is fwd-only (inference path); the HIER validation focuses on the TC fwd+bwd
+        # path, so skip the general sweep when running the HIER pair.
+        if hier_node_size:
+            continue
         # ────────── entry point #2: general_routing_forward (fwd-only) ──────────
         if rank == 0:
             ref_o_g = _per_expert_reference_general_fwd(
@@ -813,6 +806,10 @@ def _run_one_shape(
                 except Exception as e:
                     if rank == 0:
                         print(f"{log_prefix}{tag:<88s} ✗ EXC   {type(e).__name__}: {str(e)[:160]}")
+                        if os.environ.get("SMOE_DUMP_EXC") == "1":
+                            print(f"FULL_EXC_BEGIN {tag}", flush=True)
+                            traceback.print_exc()
+                            print("FULL_EXC_END", flush=True)
                         stats.fail_count += 1
                         stats.failures.append(f"{tag} (exception)")
                     dist.barrier()
@@ -857,6 +854,28 @@ def main() -> int:
         action="store_true",
         help="Test the concat [g; u] up-proj layout instead of interleaved.",
     )
+    parser.add_argument(
+        "--hier-node-size",
+        type=int,
+        default=0,
+        help="If >0, run the HIER inter-node dispatch+combine pair (use_gin) with this node_size "
+        "in place of the flat 3×3 TC sweep, against the same fp32 reference. Requires the NCCL-GIN env "
+        "(NCCL_GIN_TYPE=3 + libnccl LD_PRELOAD) and W = num_nodes·node_size with num_nodes>1.",
+    )
+    parser.add_argument(
+        "--hier-shapes",
+        action="store_true",
+        help="With --hier-node-size, replace the default shapes with ones whose T and E are divisible by the "
+        "world size — needed for non-pow2 / large W (e.g. W=12 num_nodes=3, W=16 num_nodes=4). Sizes scale with W.",
+    )
+    parser.add_argument(
+        "--model-sweep",
+        action="store_true",
+        help="With --hier-node-size, replace the shapes with the real MoE model configs (MODEL_CONFIGS: "
+        "mixtral/olmoe/.../dsv3) to validate the HIER inter-node EP path per model. H=d, E, K from the "
+        "config; I=1024 fixed; T=8*W (T_local=8) to keep the fp32 reference tractable. Configs whose E is not "
+        "divisible by W are skipped. Takes precedence over --hier-shapes. Intended for W=8/16.",
+    )
     args = parser.parse_args()
 
     if not _under_torchrun():
@@ -882,9 +901,8 @@ def main() -> int:
         )
         return 2
 
-    # Match the benchmark's numerics: disable TF32 so the fp32 reference path
-    # (F.linear in the references) is genuinely fp32 and not silently downcast
-    # on Ampere+.
+    # Match the benchmark's numerics: disable TF32 so the fp32 reference path (F.linear) is genuinely
+    # fp32, not silently downcast on Ampere+.
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
 
@@ -907,9 +925,41 @@ def main() -> int:
             f"comparing fwd + bwd grads against an fp32 PyTorch autograd reference.\n"
         )
 
+    # For non-pow2 / large W the default shapes (T=4096, E=32/64) may not divide W; build W-divisible
+    # shapes so T%W==0 and E%W==0 (E_local = E//W stays = 2 or 4). Sizes scale with W; kept modest for speed.
+    shapes = SHAPES
+    if args.model_sweep:
+        # MoE model-config sweep: one Shape per MODEL_CONFIGS entry (H=d,E,K from the config; I=1024
+        # fixed, T=8*W). Skip configs where E isn't divisible by W; MODEL_FILTER restricts the set.
+        filt_raw = os.environ.get("MODEL_FILTER", "").strip()
+        filt = {n.strip() for n in filt_raw.split(",") if n.strip()} if filt_raw else None
+        shapes = []
+        for name, d, E, K in MODEL_CONFIGS:
+            if filt is not None and name not in filt:
+                continue
+            if E % world_size != 0:
+                if rank == 0:
+                    print(f"[skip] {name}: E={E} not divisible by W={world_size}", flush=True)
+                continue
+            shapes.append(Shape(name, T=8 * world_size, H=d, I=1024, E=E, K=K))
+        if rank == 0:
+            print(
+                f"[model-sweep] W={world_size}"
+                + (f" MODEL_FILTER={sorted(filt)}" if filt else " (all configs)")
+                + f": {[(s.name, s.T, s.H, s.E, s.K) for s in shapes]}",
+                flush=True,
+            )
+    elif args.hier_shapes:
+        shapes = [
+            Shape(f"hierW{world_size}_k2", T=world_size * 256, H=2048, I=1024, E=world_size * 2, K=2),
+            Shape(f"hierW{world_size}_k4", T=world_size * 256, H=1024, I=512, E=world_size * 4, K=4),
+        ]
+        if rank == 0:
+            print(f"[hier-shapes] W={world_size}: {[(s.name, s.T, s.E, s.K) for s in shapes]}", flush=True)
+
     all_stats: List[ShapeStats] = []
     try:
-        for shape in SHAPES:
+        for shape in shapes:
             try:
                 stats = _run_one_shape(
                     rank,
@@ -921,6 +971,7 @@ def main() -> int:
                     atol=5e-2,
                     rtol=5e-2,
                     seed=1111,
+                    hier_node_size=args.hier_node_size,
                 )
             except Exception as e:
                 if rank == 0:
@@ -932,9 +983,8 @@ def main() -> int:
             all_stats.append(stats)
             torch.cuda.empty_cache()
     finally:
-        # Decide pass/fail on rank 0, then broadcast so every rank exits the
-        # same way. Without this, rank 0 might exit 1 while peers exit 0 and
-        # torchrun's exit code becomes ambiguous.
+        # Decide pass/fail on rank 0, then broadcast so every rank exits the same way — without this,
+        # rank 0 might exit 1 while peers exit 0 and torchrun's exit code becomes ambiguous.
         if rank == 0:
             success = _print_summary(all_stats)
             success_t = torch.tensor([1 if success else 0], device=device, dtype=torch.int32)
@@ -953,12 +1003,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    # Hard-exit via os._exit to bypass the Python destructor chain on
-    # paths where ``clear_ep_cache``'s atexit hook may not get to run
-    # ahead of ``~CUDASymmetricMemory → cuMemUnmap`` (e.g. a test
-    # exception that propagates past atexit ordering). Same pattern as
-    # ``benchmarks/distributed/moe-ep.py`` and ``tests/distributed/
-    # collectives_test.py``.
+    # Hard-exit via os._exit to bypass the Python destructor chain when clear_ep_cache's atexit hook
+    # may not run ahead of ~CUDASymmetricMemory -> cuMemUnmap (same pattern as moe-ep.py / collectives_test.py).
     rc = main()
     sys.stdout.flush()
     sys.stderr.flush()

@@ -172,7 +172,7 @@ torchrun --nproc_per_node=8 --standalone benchmarks/distributed/moe-ep.py --thie
 Intra-node EP communication primitives (Triton vs NCCL baselines on the same byte volume):
 
 ```bash
-torchrun --nproc_per_node=8 --standalone benchmarks/distributed/bench-ep-comm.py
+torchrun --nproc_per_node=8 --standalone benchmarks/distributed/bench-ep-nvlink.py
 ```
 
 ### Example usage

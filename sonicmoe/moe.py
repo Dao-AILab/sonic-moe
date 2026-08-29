@@ -336,13 +336,13 @@ class MoE(nn.Module):
             )
         elif kernel_backend_moe == KernelBackendMoE.torch:
             # sort and group input tokens according to expert assignment
-            fan_in_index = sorted_scattered_idxs // self.top_k
+            unexpand_index = sorted_scattered_idxs // self.top_k
 
             # gather the gate values for grouped input tokens
             router_weights = router_weights.flatten()
             batch_gates = router_weights[sorted_scattered_idxs]
 
-            hidden_states = hidden_states[fan_in_index]
+            hidden_states = hidden_states[unexpand_index]
 
             hidden_states = self.c_fc.torch_forward(
                 input=hidden_states, expert_frequency=expert_frequency, return_list=True
@@ -353,7 +353,7 @@ class MoE(nn.Module):
 
             hidden_states = hidden_states * batch_gates.unsqueeze(-1)
             zeros = torch.zeros((T, self.hidden_size), dtype=torch.float32, device=hidden_states.device)
-            hidden_states = zeros.index_add(0, fan_in_index, hidden_states)
+            hidden_states = zeros.index_add(0, unexpand_index, hidden_states)
         else:
             raise ValueError(f"unexpected kernel_backend_moe ({kernel_backend_moe})")
 

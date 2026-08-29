@@ -1,18 +1,8 @@
 # ********************************************************************************
 # Copyright (c) 2026, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
-# E2E benchmark for the EP forward + backward (moe_ep_TC_softmax_topk_forward)
-# with local (non-EP) baselines for exposed network latency estimation.
-#
-# T in --thiek is the GLOBAL token count; each rank processes T // W tokens.
-#
-# Mode selection: the bench profiles with ``NetworkProfiler`` to pick both
-# the dispatch mode and the combine mode at runtime.
-#
-# Launch with torchrun:
-#
-#   torchrun --nproc-per-node=8 --standalone \
-#       benchmarks/distributed/moe-ep.py --thiek 131072,4096,1536,128,8
+# E2E EP forward+backward benchmark vs local (non-EP) baselines, for exposed network latency estimation.
+# Run: torchrun --nproc-per-node=8 --standalone moe-ep.py --thiek 131072,4096,1536,128,8 (T is the GLOBAL token count).
 # ********************************************************************************
 
 import argparse
@@ -433,11 +423,8 @@ def run(args: argparse.Namespace) -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
-    # The symm-mem workspace is owned by the process-wide cache in
-    # ``sonicmoe.distributed_utils`` and freed via its atexit hook. We
-    # still hard-exit through os._exit below so that an unexpected
-    # exception (e.g. quack autotuner BrokenPipeError) can't race the
-    # symm-mem dealloc against CUDA-context teardown in the unwind path.
+    # The symm-mem workspace is owned by distributed_utils's process-wide cache (freed via its atexit
+    # hook); we still hard-exit via os._exit so an unexpected exception can't race dealloc against CUDA teardown.
     try:
         _run_impl(args, rank, local_rank, world_size)
         rc = 0
@@ -554,9 +541,8 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
     dist.broadcast(x_global, src=0)
     x = x_global[rank * T_local : (rank + 1) * T_local].contiguous()
 
-    # Skip the NetworkProfiler entirely when both modes are user-overridden —
-    # its only outputs (dispatch winner + combine winner + per-mode timings)
-    # are unused in that case.
+    # Skip NetworkProfiler entirely when both modes are user-overridden — its only outputs (dispatch
+    # winner, combine winner, per-mode timings) would be unused.
     both_overridden = dispatch_mode_override is not None and combine_mode_override is not None
     if both_overridden:
         profiler = None
@@ -663,8 +649,7 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
             db2_gathered = _gather_to_rank0(db2_local, world_size, rank)
 
         # ============================================================
-        # CAPTURE EP's topk_idx_l. We use it as the test reference's
-        # routing so test and EP agree on the slot ordering.
+        # CAPTURE EP's topk_idx_l — used as the test reference's routing so test and EP agree on slot order.
         # ============================================================
         with torch.no_grad():
             ep_router_logits = F.linear(x, router_w)
@@ -831,9 +816,8 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
         return t
 
     def _strided_clone(t: torch.Tensor) -> torch.Tensor:
-        # quack's gemm requires the (E_local, K, N) strided layout from
-        # empty_strided + permute; a plain .clone() reverts to default
-        # contiguous strides and trips the gemm's stride check.
+        # quack's gemm requires the (E_local, K, N) strided layout from empty_strided + permute; a
+        # plain .clone() reverts to default contiguous strides and trips the gemm's stride check.
         out = torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device)
         return out.copy_(t).requires_grad_(True)
 
@@ -1061,9 +1045,8 @@ def _run_impl(args: argparse.Namespace, rank: int, local_rank: int, world_size: 
                 f" {f'Per-rank Bwd (T={T_local}, E={E}, K={K})':<48} Average time: {local_bwd_Tl_ms:<8.2f} ms, TFLOPS: {bwd_tflops:<5.0f}"
             )
 
-    # ── Per-rank baseline with E=E_local: matches the expert count each EP rank
-    # actually owns after dispatch, so it isolates compute scaling from the
-    # router/expert-fanout effect that the E=E baseline above conflates with comm.
+    # Per-rank baseline with E=E_local matches the expert count each EP rank actually owns after
+    # dispatch, isolating compute scaling from the router/expert-expansion effect the E=E baseline conflates with comm.
     local_fwd_train_Tl_Elocal_ms = None
     local_bwd_Tl_E_local_ms = None
     if E_local >= K:

@@ -82,6 +82,14 @@ target/
 profile_default/
 ipython_config.py
 
+# claude
+docs/
+.claude
+experiments/
+scripts/
+*.out
+*.ptx
+*.sh
 # pyenv
 #   For a library or package, you might want to ignore these files since the code is
 #   intended to run in multiple environments; otherwise, check them in:

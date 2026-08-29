@@ -208,27 +208,8 @@ def _up_projection_backward_act(
 _up_projection_backward_act.compile_cache = {}
 
 
-# ============================================================================
-# Fused scatter-with-mask for `ds`.
-# ----------------------------------------------------------------------------
-# In the EP path, gemm_dgated's colvec_reduce_partial is allocated with
-# torch.empty inside quack and is only written for the cu_seqlens_m-bounded
-# range [0, real_total) — entries [real_total, TK_global) are uninitialized
-# garbage. The naive `ds[s_scatter_idx] = ds_scattered` would scatter that
-# garbage into ds at sentinel slot positions (those routed to peers,
-# dst_rank_flat != my_rank), which then corrupt the cross-rank
-# reduce-scatter on ds_global.
-#
-# This kernel folds the scatter and the sentinel-zeroing into a single
-# pass: read `ds_scattered[g]`, look up the destination slot via
-# `s_scatter_idx[g]`, look up `dst_rank_flat[slot]`, and write the value
-# only if that slot is locally owned (dst == my_rank). `ds` is assumed
-# zero-initialized so sentinel positions remain 0 — no separate
-# masked_fill is needed.
-#
-# Pass `dst_rank_flat=None` to fall back to an unconditional scatter
-# (non-EP path: every slot is valid, no sentinels).
-# ============================================================================
+# gemm_dgated's colvec_reduce_partial is uninitialized past cu_seqlens_m's real_total; an unconditional
+# ds[s_scatter_idx]=ds_scattered would leak that garbage into peer-routed (sentinel) slots pre reduce-scatter.
 @triton.jit
 def _scatter_ds_kernel(
     ds_scattered_ptr,  # (TK,) float
@@ -302,12 +283,8 @@ def _down_projection_backward_act(
     dst_rank_flat: Optional[torch.Tensor] = None,
     my_rank: int = 0,
 ) -> None:
-    """Down-projection backward activation step.
-
-    EP callers pass `dst_rank_flat` and `my_rank` so the ds scatter can be
-    fused with the sentinel mask in one Triton kernel; non-EP callers
-    leave both at their defaults (no sentinels — unconditional scatter).
-    """
+    """Down-projection backward activation step. EP callers pass dst_rank_flat/my_rank so the ds scatter
+    fuses with the sentinel mask; non-EP callers leave both default (unconditional scatter, no sentinels)."""
     assert activation_type in (
         "swiglu",
         "geglu",
@@ -329,18 +306,14 @@ def _down_projection_backward_act(
     )
 
     if db2 is None:
-        # Fused scatter + (optional) sentinel mask. `ds` is zero-initialized
-        # by the caller; entries whose slot routes to a peer (EP sentinels)
-        # are skipped and remain 0.
+        # Fused scatter + optional sentinel mask; ds is zero-initialized by the caller so skipped
+        # (peer-routed) sentinel slots remain 0.
         _scatter_ds(ds_scattered, s_scatter_idx, dst_rank_flat, ds, my_rank)
     else:
         H = w2.size(0)
         E = expert_frequency_offset.size(0) - 1
-        # x_gather_idx==None signals that `dout` is already expert-sorted
-        # (a2a + concat_layout=True path — non-gather GEMM). The db2 kernel
-        # always reads dout via a per-grouped-slot index lookup; in the
-        # sorted case we pass identity indices so the lookup degenerates
-        # into a sequential read.
+        # x_gather_idx=None means dout is already expert-sorted (A2A + concat_layout=True, non-gather
+        # GEMM); the db2 kernel always indexes dout, so pass identity indices to make that a plain sequential read.
         if x_gather_idx is None:
             TK = dout.size(0)
             x_gather_idx_eff = torch.arange(TK, dtype=torch.int32, device=ds.device)
@@ -350,9 +323,8 @@ def _down_projection_backward_act(
 
         DS_LEN = ds.size(0)
         old_ds_partial = torch.zeros(DS_LEN, 1, device=ds_scattered.device, dtype=ds_scattered.dtype)
-        # Same fused scatter+mask trick for the db2 path's old_ds_partial.
-        # Sentinel positions remain 0 so they don't pollute db2_and_ds_kernel's
-        # accumulation and the resulting ds.
+        # Same fused scatter+mask trick, now for old_ds_partial; sentinel positions remain 0 so they don't
+        # pollute db2_and_ds_kernel's accumulation.
         _scatter_ds(
             ds_scattered,
             s_scatter_idx,
@@ -363,14 +335,8 @@ def _down_projection_backward_act(
 
         BLOCK_H = min(triton.next_power_of_2(H), 2048)
         NUM_H_BLOCKS = triton.cdiv(H, BLOCK_H)
-        # Must be zero-initialized: db2_and_ds_kernel only writes at the
-        # global slot indices reached by local-expert grouped positions
-        # (cu_seqlens_m bound on E_local). Sentinel slots routed to peer
-        # ranks are never written, and the subsequent
-        # `ds.copy_(new_ds_partial)` propagates whatever lives at those
-        # offsets into ds — corrupting the post-reduce_scatter ds_local
-        # by summing peer ranks' garbage in. The no-bias path stays
-        # correct because _scatter_ds writes only at masked slots.
+        # Must be zero-init: db2_and_ds_kernel never writes sentinel (peer-routed) slots, and
+        # ds.copy_(new_ds_partial) would otherwise leak whatever garbage lives there into ds_local.
         new_ds_partial = torch.zeros(DS_LEN, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
 
         db2_and_ds_kernel[(E, NUM_H_BLOCKS)](

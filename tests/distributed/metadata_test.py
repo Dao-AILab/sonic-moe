@@ -3,9 +3,15 @@
 # ********************************************************************************
 
 import torch
+import triton
 from parameterized import parameterized
 
 from sonicmoe.functional.distributed import build_rank_dedup_a_idx, compute_dispatch_metadata
+from sonicmoe.functional.distributed.metadata import (
+    _worklist_blockscan_kernel,
+    _worklist_count_kernel,
+    _worklist_scatter_kernel,
+)
 from sonicmoe.functional.metadata import general_routing_router_metadata_triton
 from tests.test_commons import TestCommons
 
@@ -19,10 +25,8 @@ def _set_seed(seed: int) -> None:
 
 
 def _ref_compute_dispatch_metadata(topk_idx_g: torch.Tensor, my_rank: int, E_local: int):
-    """Pure-PyTorch reference for compute_dispatch_metadata. Different
-    algorithm than the 3-phase Triton scan (one-shot torch ops on the full
-    (W, TK_local, W) one-hot tensor, no tile structure), so bit-exact
-    agreement is a strong correctness signal."""
+    """Pure-PyTorch reference for compute_dispatch_metadata — algorithmically distinct from the 3-phase
+    Triton scan (one-shot torch ops, no tile structure), so bit-exact agreement is a strong signal."""
     W, T_local, K = topk_idx_g.shape
     TK_local = T_local * K
     TK_global = W * TK_local
@@ -45,11 +49,8 @@ def _ref_compute_dispatch_metadata(topk_idx_g: torch.Tensor, my_rank: int, E_loc
     s, e = my_rank * TK_local, (my_rank + 1) * TK_local
     my_dst = dst[s:e].view(T_local, K)
 
-    # expert_local_padded: real local expert when dst == my_rank, OOB
-    # sentinel (== E_local) otherwise. Downstream
-    # general_routing_router_metadata_triton interprets values >= E_local
-    # as "padding bucket" and routes them to expert_frequency_offset[E_local]
-    # so they don't pollute any real expert's row count.
+    # expert_local_padded: real local expert when dst==my_rank, else sentinel E_local, which
+    # general_routing_router_metadata_triton routes to expert_frequency_offset[E_local] (no pollution).
     local_exp = (flat - dst.long() * E_local).to(torch.int32)
     expert_local_padded = torch.where(
         dst == my_rank,
@@ -112,14 +113,8 @@ def _assert_slot_global_permutation(test_case: TestCommons, out: dict, W: int):
 
 
 def _ref_compute_dedup_metadata(dst_rank_flat: torch.Tensor, my_rank: int, W: int, T_local: int, K: int):
-    """Pure-PyTorch reference for the 5 dedup-related metadata keys
-    (4 dispatch-side + the combine-side ``peer_present_mask``).
-
-    Algorithmically distinct from the Triton scan: builds the
-    (W, T_local, K, W) one-hot tensor in one shot, then derives every
-    output via straight torch reductions / cumsums. Bit-exact agreement
-    with the kernel is the correctness bar.
-    """
+    """Pure-PyTorch reference for the 5 dedup-related metadata keys (4 dispatch-side + peer_present_mask),
+    algorithmically distinct from the Triton scan (one-shot one-hot tensor + torch reductions)."""
     device = dst_rank_flat.device
     TK_global = W * T_local * K
     dst3 = dst_rank_flat.view(W, T_local, K).long()  # (W, T, K)
@@ -148,8 +143,7 @@ def _ref_compute_dedup_metadata(dst_rank_flat: torch.Tensor, my_rank: int, W: in
     within_at = within_pq[p_idx, t_idx, dst3]  # (W, T, K)
     rank_dedup_recv_pos_ref = (pair_off_at + within_at).to(torch.int32).reshape(TK_global).contiguous()
 
-    # peer_present_mask[q, t] (combine side): at this rank as the home
-    # of token t, does peer q have any expert routed-to from my (t)?
+    # peer_present_mask[q, t] (combine side): does peer q have any expert routed-to from my token t?
     # Equivalent to present_ptq[my_rank, t, q] transposed to (q, t).
     peer_present_mask_ref = present_ptq[my_rank, :, :].T.to(torch.int8).contiguous()
 
@@ -183,21 +177,8 @@ def _assert_dedup_metadata_equal(test_case: TestCommons, out: dict, ref: dict):
 
 
 def _assert_dedup_invariants(test_case: TestCommons, out: dict, my_rank: int, W: int, T_local: int, K: int):
-    """Sanity checks independent of the reference function — guard semantic
-    contracts that Phase 2/3 kernels rely on:
-
-      (1) pair_count[p, q] ∈ [0, T_local].
-      (2) sum_q pair_count[p, q] = sum_t |dst-set of (p, t)|.
-      (3) pair_offset[p, q] == exclusive cumsum across p of pair_count[:, q].
-      (4) pair_present_mask sums to sum(pair_count) (one canonical slot per
-          (p, t, q) present-triple).
-      (5) For each (p, q): the rank_dedup_recv_pos values across all CANONICAL
-          slots f with src=p, dst=q form exactly
-          [pair_offset[p, q], pair_offset[p, q] + pair_count[p, q]).
-      (6) rank_dedup_recv_pos is uniform across the K slots of (p, t, q): all K
-          slots routing to the same q at the same (p, t) must agree.
-      (7) peer_present_mask[q, t] != 0 ⇔ at least one slot of (my_rank, t) → q.
-    """
+    """Sanity checks independent of the reference function, guarding the semantic contracts (pair_count
+    bounds, pair_offset/rank_dedup_recv_pos consistency, dedup-mask sums) the dispatch/combine kernels rely on."""
     pc = out["pair_count"]
     po = out["pair_offset"]
     mask = out["pair_present_mask"]
@@ -268,13 +249,8 @@ def _assert_dedup_invariants(test_case: TestCommons, out: dict, my_rank: int, W:
 
 
 def _assert_padded_sentinel(test_case: TestCommons, out: dict, my_rank: int, E_local: int):
-    """expert_local_padded must be:
-       - in [0, E_local) at slots where dst == my_rank, equal to expert_global % E_local
-       - exactly E_local everywhere else (the OOB sentinel consumed by
-         general_routing_router_metadata_triton).
-
-    Independent of the reference function — guards the semantic contract
-    rather than just self-consistency."""
+    """expert_local_padded must be in [0, E_local) where dst==my_rank (= expert_global % E_local), else
+    exactly E_local (the OOB sentinel). Independent of the reference — guards the semantic contract."""
     dst = out["dst_rank_flat"]
     padded = out["expert_local_padded"]
     is_mine = dst == my_rank
@@ -412,10 +388,11 @@ class DispatchMetadataTest(TestCommons):
         results1 = compute_dispatch_metadata(topk, my_rank=0, E_local=E_local)
         results2 = compute_dispatch_metadata(topk, my_rank=0, E_local=E_local)
         for k in results1:
-            self.assertTrue(
-                torch.equal(results1[k], results2[k]),
-                f"Non-deterministic output for key {k}",
-            )
+            v1, v2 = results1[k], results2[k]
+            if torch.is_tensor(v1):  # combine_contrib_C is a Python int scalar
+                self.assertTrue(torch.equal(v1, v2), f"Non-deterministic output for key {k}")
+            else:
+                self.assertEqual(v1, v2, f"Non-deterministic output for key {k}")
 
     @parameterized.expand([(seed,) for seed in range(10)])
     def test_random_stress(self, seed: int) -> None:
@@ -444,9 +421,8 @@ class DedupMetadataTest(TestCommons):
         TestCommons.make_args_matrix(
             [torch.device("cuda")],
             [
-                # (W, T_local, K, E_local) — the 5 validation shapes from the
-                # task spec (covers K<W, K=W, K>W regimes), plus a few small
-                # ones for fast iteration.
+                # (W, T_local, K, E_local) — 5 validation shapes covering
+                # K<W, K=W, K>W regimes, plus a few small ones for fast iteration.
                 (4, 64, 2, 4),
                 (4, 256, 2, 4),
                 (4, 1024, 8, 4),
@@ -479,9 +455,8 @@ class DedupMetadataTest(TestCommons):
             _assert_dedup_metadata_equal(self, out, ref)
 
     def test_dedup_invariants_small(self) -> None:
-        """Invariant checks (K-slot dedup uniformity, packed-row coverage,
-        sentinel ↔ has-route) on a small shape so the python-level loops
-        finish quickly."""
+        """Invariant checks (K-slot dedup uniformity, packed-row coverage, sentinel<->has-route) on a
+        small shape so the python-level loops finish quickly."""
         _set_seed(_SEED)
         W, T_local, K, E_local = 4, 64, 4, 4
         device = torch.device("cuda")
@@ -491,9 +466,8 @@ class DedupMetadataTest(TestCommons):
             _assert_dedup_invariants(self, out, my_rank, W, T_local, K)
 
     def test_dedup_all_to_one_peer(self) -> None:
-        """Every slot routes to peer 0. Each token's K slots collapse to a
-        single canonical pull → pair_count[p, 0] == T_local, all others 0.
-        """
+        """Every slot routes to peer 0: each token's K slots collapse to a single canonical pull, so
+        pair_count[p, 0] == T_local and all others are 0."""
         _set_seed(_SEED)
         W, T_local, K, E_local = 4, 128, 4, 4
         device = torch.device("cuda")
@@ -514,9 +488,8 @@ class DedupMetadataTest(TestCommons):
             self.assertTrue(torch.all(mask3[:, :, 1:] == 0))
 
     def test_dedup_disjoint_destinations(self) -> None:
-        """Each of token (p, t)'s K slots routes to a DIFFERENT peer →
-        K canonical slots per token, dedup gives the same count as A2A.
-        Requires K ≤ W; here K=4, W=4 covers the boundary."""
+        """Each token (p,t)'s K slots route to a DIFFERENT peer, so dedup gives K canonical slots (same
+        count as A2A). Requires K<=W; here K=4, W=4 covers the boundary."""
         _set_seed(_SEED)
         W, T_local, K, E_local = 4, 64, 4, 4
         device = torch.device("cuda")
@@ -535,10 +508,8 @@ class DedupMetadataTest(TestCommons):
             self.assertTrue(torch.all(out["pair_count"] == T_local))
 
     def test_dedup_none_to_me(self) -> None:
-        """All routing goes to peer 0; my_rank=1 receives nothing.
-        peer_present_mask for my_rank=1 must mark only peer 0 as having
-        any contribution (since my (t)'s K experts all live on rank 0).
-        """
+        """All routing goes to peer 0; my_rank=1 receives nothing, so peer_present_mask for my_rank=1
+        must mark only peer 0 (since my (t)'s K experts all live on rank 0)."""
         _set_seed(_SEED)
         W, T_local, K, E_local = 4, 64, 4, 4
         device = torch.device("cuda")
@@ -607,9 +578,8 @@ def _build_consumer_metadata(
     a2a_token_indices: torch.Tensor,
     device: torch.device,
 ):
-    """Mirror of ep.py's ``_build_consumer_metadata`` — runs the histogram +
-    bucketed-sort kernel to produce the s_reverse_local that the dedup
-    A_idx scatter consumes."""
+    """Mirror of ep.py's _build_consumer_metadata — runs the histogram + bucketed-sort kernel to
+    produce the s_reverse_local that the dedup A_idx scatter consumes."""
     TK_global = W * T_local * K
     E_total = E_local + 1
     s_reverse_local = torch.empty(TK_global, dtype=torch.int32, device=device)
@@ -633,12 +603,8 @@ def _build_consumer_metadata(
 
 
 class BuildDedupAIdxTest(TestCommons):
-    """Unit tests for ``build_rank_dedup_a_idx`` — the small Triton scatter that
-    materializes the up-proj A_idx for the RANK_DEDUP_DISPATCH_TRITON path.
-
-    Standalone reference: a_idx[s_reverse_local[f]] = rank_dedup_recv_pos[f]
-    for every f with dst_rank_flat[f] == my_rank.
-    """
+    """Unit tests for build_rank_dedup_a_idx — the small Triton scatter that materializes the up-proj
+    A_idx: a_idx[s_reverse_local[f]] = rank_dedup_recv_pos[f] for every f with dst_rank_flat[f]==my_rank."""
 
     @parameterized.expand(
         TestCommons.make_args_matrix(
@@ -703,14 +669,11 @@ class BuildDedupAIdxTest(TestCommons):
             # Tail beyond #routed is uninitialized in both kernel and
             # reference; only check the populated prefix.
             n_populated = int(is_mine.sum().item())
-            # The kernel writes to a_idx[e_idx] for is_mine; uninit
-            # tail in `a_idx` could be anything. Compare only at the
-            # written e values.
+            # The kernel writes a_idx[e_idx] for is_mine; the uninit tail could be anything, so
+            # compare only at the written e values.
             if n_populated > 0:
-                # All-K-slots-of-(p,t,my_rank)-share-same-pos invariant
-                # ⇒ every e ∈ unique(e_idx) gets the SAME packed-pos
-                # written multiple times harmlessly. Compare the
-                # populated entries.
+                # All-K-slots-of-(p,t,my_rank) share the same pos, so every e in unique(e_idx) gets the
+                # SAME packed-pos written multiple times harmlessly. Compare the populated entries.
                 self.assertTrue(
                     torch.equal(a_idx[e_idx], ref[e_idx]),
                     f"build_rank_dedup_a_idx mismatch at "
@@ -720,15 +683,13 @@ class BuildDedupAIdxTest(TestCommons):
 
 
 # ============================================================================
-# Phase 1 robustness tests (BLOCK_T_MASK scaling + invariant check).
+# Robustness tests (BLOCK_T_MASK scaling + invariant check).
 # ============================================================================
 
 
 class PeerPresentMaskRegisterPressureTest(TestCommons):
-    """``_build_peer_present_mask_kernel`` materializes a (BLOCK_T, K_PAD, W)
-    one-hot tensor in registers; at large W·K the wrapper must scale
-    BLOCK_T_MASK down to keep the working set bounded. Spot-check that
-    the kernel compiles and produces the right mask at W=64, K=16."""
+    """_build_peer_present_mask_kernel materializes a (BLOCK_T, K_PAD, W) one-hot tensor in registers;
+    at large W*K the wrapper must scale BLOCK_T_MASK down. Spot-check at W=64, K=16."""
 
     @parameterized.expand(
         [
@@ -759,3 +720,336 @@ class PeerPresentMaskRegisterPressureTest(TestCommons):
             torch.equal(mask, ref),
             f"peer_present_mask mismatch at (W={W}, K={K}, T_local={T_local})",
         )
+
+
+# =============================================================================
+# Combine-producer work-list compaction (fused 3-kernel: _worklist_count -> _worklist_blockscan ->
+# _worklist_scatter). Stresses degenerate routings via SYNTHETIC mine_count against the torch reference it replaced.
+# =============================================================================
+
+
+def _ref_worklist(mine_count: torch.Tensor, my_rank: int, T_local: int):
+    """Torch reference == the original pre-fuse cumsum/scatter: live[g] = (mine_count[g]>0) | (g//T_local
+    == my_rank); compact in increasing-g order, work_count = #live."""
+    WT_local = mine_count.numel()
+    dev = mine_count.device
+    g = torch.arange(WT_local, device=dev, dtype=torch.int32)
+    is_self = (g // T_local) == my_rank
+    live = (mine_count > 0) | is_self
+    live_i = live.to(torch.int32)
+    excl = torch.cumsum(live_i, dim=0) - live_i
+    safe = torch.where(live, excl, torch.full_like(excl, WT_local))
+    wl = torch.zeros(WT_local + 1, dtype=torch.int32, device=dev)
+    wl.scatter_(0, safe.to(torch.int64), g)
+    return wl[:WT_local], int(live_i.sum().item())
+
+
+def _fused_worklist(mine_count: torch.Tensor, my_rank: int, T_local: int, WL_BLOCK: int):
+    """Invoke the production 3-kernel compaction with a parameterizable block size — small WL_BLOCK
+    lets cheap shapes hit multi-block / exact-full / exact-empty / partial-last-block boundaries."""
+    WT_local = mine_count.numel()
+    dev = mine_count.device
+    num_blocks = triton.cdiv(WT_local, WL_BLOCK)
+    BLOCK_NB = max(triton.next_power_of_2(num_blocks), 1)
+    block_counts = torch.empty(num_blocks, dtype=torch.int32, device=dev)
+    block_offsets = torch.empty(num_blocks, dtype=torch.int32, device=dev)
+    wl = torch.zeros(WT_local, dtype=torch.int32, device=dev)
+    wc = torch.empty(1, dtype=torch.int32, device=dev)
+    _worklist_count_kernel[(num_blocks,)](mine_count, block_counts, WT_local, T_local, my_rank, BLOCK=WL_BLOCK)
+    _worklist_blockscan_kernel[(1,)](block_counts, block_offsets, wc, num_blocks, BLOCK_NB=BLOCK_NB)
+    _worklist_scatter_kernel[(num_blocks,)](mine_count, block_offsets, wl, WT_local, T_local, my_rank, BLOCK=WL_BLOCK)
+    return wl, int(wc.item())
+
+
+class CombineWorklistTest(TestCommons):
+    def _check(self, mine_count, my_rank, T_local, WL_BLOCK, msg=""):
+        wl_f, wc_f = _fused_worklist(mine_count, my_rank, T_local, WL_BLOCK)
+        wl_r, wc_r = _ref_worklist(mine_count, my_rank, T_local)
+        self.assertEqual(wc_f, wc_r, f"work_count mismatch {msg}")
+        self.assertTrue(torch.equal(wl_f[:wc_f], wl_r[:wc_r]), f"work_list[:count] mismatch {msg}")
+        if wc_f > 1:  # strictly increasing g-order
+            self.assertTrue(torch.all(wl_f[1:wc_f] > wl_f[: wc_f - 1]), f"work_list not increasing {msg}")
+        # every live row present exactly once (set equality vs the reference live mask)
+        WT_local = mine_count.numel()
+        g = torch.arange(WT_local, device=mine_count.device, dtype=torch.int32)
+        live = (mine_count > 0) | ((g // T_local) == my_rank)
+        self.assertEqual(int(live.sum().item()), wc_f, f"live-count mismatch {msg}")
+        self.assertTrue(torch.equal(torch.sort(wl_f[:wc_f]).values, g[live]), f"live-set mismatch {msg}")
+
+    def test_worklist_all_dead(self):
+        """No contributions anywhere ⇒ only the self-stripe rows are live."""
+        dev = torch.device("cuda")
+        for W, T_local, WL in [(4, 256, 64), (8, 333, 128), (2, 2048, 2048)]:
+            for my_rank in range(min(W, 3)):
+                mc = torch.zeros(W * T_local, dtype=torch.int32, device=dev)
+                self._check(mc, my_rank, T_local, WL, f"(all_dead W={W} T={T_local} r={my_rank})")
+
+    def test_worklist_all_live(self):
+        dev = torch.device("cuda")
+        for W, T_local, WL in [(4, 256, 64), (3, 1000, 128), (2, 2048, 2048)]:
+            mc = torch.ones(W * T_local, dtype=torch.int32, device=dev)
+            self._check(mc, 0, T_local, WL, f"(all_live W={W} T={T_local})")
+
+    def test_worklist_single_live(self):
+        """One contributing row, my_rank out of [0,W) so there is no self-stripe."""
+        dev = torch.device("cuda")
+        W, T_local, WL = 4, 256, 64
+        for pos in [0, 63, 64, 65, W * T_local - 1]:
+            mc = torch.zeros(W * T_local, dtype=torch.int32, device=dev)
+            mc[pos] = 1
+            self._check(mc, W, T_local, WL, f"(single_live pos={pos})")  # my_rank=W ⇒ no self-stripe
+
+    def test_worklist_empty_and_full_blocks(self):
+        """A whole WL_BLOCK with no live rows, and one with all live rows.
+        my_rank=W disables the self-stripe so the empty block is truly empty."""
+        dev = torch.device("cuda")
+        W, T_local, WL = 4, 512, 64  # WT_local=2048 = 32 blocks
+        WT = W * T_local
+        # block 5 fully live, block 6 fully empty, sparse elsewhere
+        mc = torch.zeros(WT, dtype=torch.int32, device=dev)
+        mc[5 * WL : 6 * WL] = 1  # full block
+        mc[10 * WL + 3] = 1  # a stray live row outside
+        self._check(mc, W, T_local, WL, "(full_block_5 empty_block_6)")
+        # entirely-empty first block, live tail
+        mc2 = torch.ones(WT, dtype=torch.int32, device=dev)
+        mc2[:WL] = 0
+        self._check(mc2, W, T_local, WL, "(empty_first_block)")
+
+    def test_worklist_block_boundaries(self):
+        """Exact-multiple vs partial last block; single block; live straddling a boundary."""
+        dev = torch.device("cuda")
+        cases = [
+            (2, 1024, 2048),  # WT=2048 == 1*WL  (exact single block)
+            (3, 1024, 2048),  # WT=3072  (1.5 blocks → partial last)
+            (2, 2048, 2048),  # WT=4096 == 2*WL  (exact 2 blocks)
+            (4, 100, 64),     # WT=400, partial last block, T_local%WL!=0
+        ]
+        for W, T_local, WL in cases:
+            WT = W * T_local
+            mc = torch.zeros(WT, dtype=torch.int32, device=dev)
+            mc[WL - 1] = 1  # last row of block 0
+            if WT > WL:
+                mc[WL] = 1  # first row of block 1 (straddle boundary)
+            mc[-1] = 1  # very last row (partial-block tail)
+            for my_rank in range(min(W, 2)):
+                self._check(mc, my_rank, T_local, WL, f"(boundary W={W} T={T_local} WL={WL} r={my_rank})")
+
+    @parameterized.expand([(seed,) for seed in range(8)])
+    def test_worklist_random_stress(self, seed: int):
+        dev = torch.device("cuda")
+        gen = torch.Generator(device=dev).manual_seed(1000 + seed)
+        W = [2, 4, 8][seed % 3]
+        T_local = int(torch.randint(50, 3000, (1,), generator=gen, device=dev).item())
+        WL = [64, 128, 256, 2048][seed % 4]
+        density = [0.0, 0.01, 0.1, 0.5, 1.0][seed % 5]
+        WT = W * T_local
+        mc = (torch.rand(WT, generator=gen, device=dev) < density).to(torch.int32)
+        for my_rank in range(min(W, 3)):
+            self._check(mc, my_rank, T_local, WL, f"(stress seed={seed} W={W} T={T_local} WL={WL} d={density} r={my_rank})")
+
+    def test_emit_combine_flag(self):
+        """emit_combine gates ONLY the combine-producer keys; everything else is
+        byte-identical, and emit_combine=True still matches the torch reference."""
+        _set_seed(_SEED)
+        dev = torch.device("cuda")
+        W, T_local, K, E_local = 4, 256, 8, 8
+        combine_keys = ["mine_slot_idx", "mine_count", "combine_contrib_C", "combine_work_list", "combine_work_count", "combine_single_k", "combine_work_list_multi", "combine_work_count_multi"]
+        topk = _make_routing(W, T_local, K, W * E_local, dev)
+        with_c = compute_dispatch_metadata(topk, my_rank=0, E_local=E_local, emit_combine=True)
+        without_c = compute_dispatch_metadata(topk, my_rank=0, E_local=E_local, emit_combine=False)
+        for k in combine_keys:
+            self.assertIn(k, with_c, f"emit_combine=True should produce {k}")
+            self.assertNotIn(k, without_c, f"emit_combine=False should skip {k}")
+        for k in without_c:  # non-combine keys unchanged
+            v = without_c[k]
+            if torch.is_tensor(v):
+                self.assertTrue(torch.equal(with_c[k], v), f"key {k} changed when emit_combine toggled")
+        # emit_combine=True work-list matches the torch reference
+        wl_r, wc_r = _ref_worklist(with_c["mine_count"], 0, T_local)
+        wc = int(with_c["combine_work_count"].item())
+        self.assertEqual(wc, wc_r)
+        self.assertTrue(torch.equal(with_c["combine_work_list"][:wc], wl_r[:wc_r]))
+
+
+def _ref_combine_single_k(dst_rank_flat: torch.Tensor, my_rank: int, W: int, T_local: int, K: int) -> torch.Tensor:
+    """Reference for combine_single_k[q,t]: the k-slot of the SINGLE contributor (exactly one of my_rank's
+    token t experts routes to q), else -1 (0 or >=2 on q). Different algorithm than the Triton kernel."""
+    dst = dst_rank_flat.view(W, T_local, K).long()
+    mine = dst[my_rank]  # (T_local, K) — destination rank of each of my tokens' K slots
+    out = torch.full((W, T_local), -1, dtype=torch.int8, device=dst.device)
+    for q in range(W):
+        eq = mine == q  # (T_local, K)
+        cnt = eq.sum(dim=1)  # (T_local,)
+        kidx = torch.argmax(eq.to(torch.int32), dim=1).to(torch.int8)  # first match (== only when cnt==1)
+        single = cnt == 1
+        out[q, single] = kidx[single]
+    return out
+
+
+class CombineSingleKTest(TestCommons):
+    """Selective-dedup gather metadata: combine_single_k[q,t] must equal the k-slot of the unique single
+    contributor (cnt==1) else -1, consistent with peer_present_mask (single_k>=0 implies present)."""
+
+    @parameterized.expand(
+        TestCommons.make_args_matrix(
+            [torch.device("cuda")],
+            [
+                (4, 256, 2, 4),   # K<W
+                (4, 1024, 8, 4),  # K=W
+                (8, 256, 8, 8),
+                (8, 8192, 8, 8),  # dsv3 W=8
+                (8, 256, 16, 8),  # K>W
+                (16, 1024, 8, 4),
+                (4, 333, 4, 4),   # non-pow2 T_local — BLOCK_T tail
+                (8, 511, 8, 8),
+            ],
+        )
+    )
+    def test_single_k_correctness(self, device: torch.device, problem_shape: tuple[int, int, int, int]) -> None:
+        _set_seed(_SEED)
+        W, T_local, K, E_local = problem_shape
+        E = W * E_local
+        topk = _make_routing(W, T_local, K, E, device)
+        for my_rank in range(min(W, 4)):
+            out = compute_dispatch_metadata(topk, my_rank=my_rank, E_local=E_local)
+            got = out["combine_single_k"]
+            ref = _ref_combine_single_k(out["dst_rank_flat"], my_rank, W, T_local, K)
+            self.assertEqual(tuple(got.shape), (W, T_local))
+            self.assertEqual(got.dtype, torch.int8)
+            self.assertTrue(
+                torch.equal(got, ref),
+                f"single_k mismatch W={W} T={T_local} K={K} rank={my_rank}: "
+                f"{(got != ref).sum().item()} cells differ",
+            )
+            # consistency: single_k>=0 ⇒ peer present; single_k==-1 ⇒ absent or multi
+            present = out["peer_present_mask"].to(torch.bool)
+            self.assertTrue(torch.all((got >= 0) <= present), "single_k>=0 must imply peer_present_mask")
+
+
+# ============================================================================
+# Hierarchical inter-node dispatch metadata (emit_hier x node_size) vs the reference oracle — exercises
+# the SAME compute_dispatch_metadata (node_size=1 is the flat rank-dedup slice). Runs on GPU or via TRITON_INTERPRET=1 on CPU.
+# ============================================================================
+import sys as _hier_sys
+from pathlib import Path as _HierPath
+
+_hier_sys.path.insert(0, str(_HierPath(__file__).resolve().parent))  # for `import hier_ep_reference`
+
+_HIER_CONFIGS = [
+    # (num_nodes, node_size, T_local, K, E_local) — arbitrary node_size x num_nodes, incl. node_size=1
+    (1, 4, 6, 2, 2), (2, 4, 6, 2, 2), (2, 8, 8, 4, 2), (4, 4, 8, 4, 2),
+    (4, 2, 10, 3, 3), (3, 4, 7, 5, 2), (8, 4, 6, 4, 2), (4, 1, 6, 3, 2),
+    (2, 1, 6, 2, 3), (1, 1, 4, 1, 4),
+    (2, 4, 20, 4, 2),
+    (2, 4, 130, 3, 2),   # T_local > BLOCK_T -> multi-tile cross-tile scan path
+]
+_HIER_KINDS = ["uniform", "skewed", "single_expert", "all_remote"]
+
+
+def _make_hier_routing(W, num_nodes, node_size, T_local, K, E_local, kind, seed, device):
+    from hier_ep_reference import rank_of
+    g = torch.Generator().manual_seed(seed)
+    E = W * E_local
+    out = torch.empty(W, T_local, K, dtype=torch.int64)
+
+    def _experts_in_nodes(nodes):
+        eids = []
+        for n in nodes:
+            base = rank_of(n, 0, node_size)
+            for rk in range(base, base + node_size):
+                eids.extend(range(rk * E_local, (rk + 1) * E_local))
+        return torch.tensor(eids, dtype=torch.int64)
+
+    for r in range(W):
+        my_node = r // node_size
+        for t in range(T_local):
+            if kind == "uniform":
+                experts = torch.randperm(E, generator=g)[:K]
+            elif kind == "skewed":
+                probs = torch.ones(E)
+                probs[: max(E // 4, 1)] += 8.0
+                experts = torch.multinomial(probs, K, replacement=False, generator=g)
+            elif kind == "single_expert":
+                e0 = int(torch.randint(0, E, (1,), generator=g))
+                experts = torch.tensor([e0] * K)
+            elif kind == "all_remote":
+                remote = [n for n in range(num_nodes) if n != my_node] or [my_node]
+                pool = _experts_in_nodes(remote)
+                if len(pool) >= K:
+                    experts = pool[torch.randperm(len(pool), generator=g)[:K]]
+                else:
+                    experts = pool[torch.randint(0, len(pool), (K,), generator=g)]
+            else:
+                raise ValueError(kind)
+            out[r, t] = experts
+    return out.to(torch.int32).to(device)
+
+
+def _hier_eq(name, got, want, cfg, kind, seed):
+    a = got.detach().to("cpu").to(torch.int64)
+    b = want.detach().to("cpu").to(torch.int64)
+    if a.shape != b.shape:
+        raise AssertionError(f"{name} SHAPE {tuple(a.shape)} != {tuple(b.shape)} cfg={cfg} {kind} s{seed}")
+    if not torch.equal(a, b):
+        nmis = int((a != b).sum())
+        idx = (a != b).nonzero()[:5].tolist()
+        raise AssertionError(f"{name} MISMATCH {nmis} elems cfg={cfg} {kind} s{seed}; first idx {idx}")
+
+
+def _run_hier_metadata_cases(device):
+    """Sweep emit_hier x node_size; assert metadata is byte-identical to the reference oracle AND that
+    emit_hier doesn't perturb the flat keys (node_size=1 == the flat slice). Returns the case count."""
+    from hier_ep_reference import compute_hier_dispatch_reference, compute_hier_combine_reference
+    n = 0
+    for cfg in _HIER_CONFIGS:
+        num_nodes, node_size, T_local, K, E_local = cfg
+        W = num_nodes * node_size
+        if K > W * E_local:
+            continue
+        for kind in _HIER_KINDS:
+            for seed in (0, 1):
+                topk = _make_hier_routing(W, num_nodes, node_size, T_local, K, E_local, kind, seed, device)
+                ref = compute_hier_dispatch_reference(topk, num_nodes, node_size, E_local)
+                base = compute_dispatch_metadata(topk, 0, E_local, emit_combine=False, emit_hier=False)
+                meta = compute_dispatch_metadata(topk, 0, E_local, emit_combine=False,
+                                                 emit_hier=True, node_size=node_size)
+                # emit_hier must NOT perturb the flat rank-dedup keys (flat == hier node_size=1 slice)
+                for k in ("dst_rank_flat", "pair_count", "pair_offset", "pair_present_mask",
+                          "rank_dedup_recv_pos", "peer_present_mask"):
+                    _hier_eq(f"emit_hier-invariance[{k}]", meta[k], base[k], cfg, kind, seed)
+                ref_map = {
+                    "dst_rank_flat": ref.dst_rank_flat, "pair_present_mask": ref.pair_present_mask,
+                    "rank_dedup_recv_pos": ref.rank_dedup_recv_pos, "dst_node_flat": ref.dst_node_flat,
+                    "is_local_slot": ref.is_local_slot, "node_present_mask": ref.node_present_mask,
+                    "node_token_count": ref.node_token_count, "dst_slot": ref.dst_slot,
+                    "dst_recv_count": ref.dst_recv_count,
+                }
+                for k in ref_map:
+                    _hier_eq(k, meta[k], ref_map[k], cfg, kind, seed)
+                cref = compute_hier_combine_reference(topk, num_nodes, node_size, E_local)
+                _hier_eq("combine_peer_present_all", meta["combine_peer_present_all"], cref.peer_present_mask, cfg, kind, seed)
+                _hier_eq("contrib_node_mask", meta["contrib_node_mask"], cref.contrib_node_mask, cfg, kind, seed)
+                _hier_eq("expected_count_combine", meta["expected_count_combine"], cref.expected_count_combine, cfg, kind, seed)
+                n += 1
+    return n
+
+
+class HierDispatchMetadataTest(TestCommons):
+    """compute_dispatch_metadata(emit_hier=True, node_size=...) vs the reference oracle across the full
+    node_size x num_nodes grid (incl. node_size=1, the flat rank-dedup slice)."""
+
+    def test_hier_metadata_vs_oracle(self) -> None:
+        _set_seed(_SEED)
+        n = _run_hier_metadata_cases(torch.device("cuda"))
+        self.assertGreater(n, 0)
+
+
+if __name__ == "__main__":
+    # CPU validation (no GPU): TRITON_INTERPRET=1 python tests/distributed/metadata_test.py
+    import os as _hier_os
+
+    _interp = _hier_os.environ.get("TRITON_INTERPRET") == "1"
+    _dev = torch.device("cpu") if _interp else torch.device("cuda")
+    _n = _run_hier_metadata_cases(_dev)
+    print(f"[ok] HIER metadata vs reference oracle: {_n} cases byte-identical "
+          f"(device={_dev}, interp={_interp}; rank+node+combine tensors + emit_hier invariance)")
