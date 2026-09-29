@@ -9,11 +9,11 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "torch>=2.11.0",
-    "quack-kernels>=0.6.4",
+    "quack-kernels>=0.6.5",
 ]
 
 [project.optional-dependencies]
-cu13 = ["quack-kernels[cu13]>=0.6.4"]
+cu13 = ["quack-kernels[cu13]>=0.6.5"]
 dev = [
     "pre-commit",
     "ruff",
