@@ -116,17 +116,22 @@ def _bucketize_M(m: int) -> int:
 def _make_bucketized_key(self, args, kwargs) -> tuple:
     """QuACK's autotune cache key, with every tensor's leading dim (M) bucketized.
 
-    Trailing dims stay exact, so structurally different GEMMs cannot alias onto one key,
+    Under varlen-K, A's trailing dim is bucketized too: in the weight-gradient GEMMs
+    (dw1 = x^T dh, dw2 = dout^T a') A is x^T or dout^T, so it carries the token count.
+    Other dims stay exact, so structurally different GEMMs cannot alias onto one key,
     and the stringified entries never collide with QuACK's own exact-shape keys.
     """
     all_args = {**dict(zip(self.arg_names, args)), **kwargs}
     _args = {k: v for k, v in all_args.items() if k in self.arg_names}
     key = [str(_args[k]) for k in self.keys if k in _args]
-    for arg in _args.values():
+    varlen_k = _args.get("cu_seqlens_k") is not None
+    for name, arg in _args.items():
         if isinstance(arg, torch.Tensor):
             shape = list(arg.shape)
             if shape:
                 shape[0] = _bucketize_M(shape[0])
+            if varlen_k and name == "A":
+                shape[-1] = _bucketize_M(shape[-1])
             key.append(str(tuple(shape)))
             # only the {0, 1, other} classes of a stride matter; same folding QuACK does
             key.append(str([s if s in {0, 1} else 2 for s in arg.stride()]))
