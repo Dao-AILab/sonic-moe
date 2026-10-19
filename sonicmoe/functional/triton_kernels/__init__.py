@@ -58,6 +58,8 @@ def _compute_col_partial_sum_kernel(
     flat_mask = tl.reshape(load_mask, [TOKENS_PER_TILE * K_POW2])
     safe_experts = tl.where(flat_mask, flat_experts, 0)
 
+    # Every warp's zeroing tl.store above must land before any warp's tl.atomic_add.
+    tl.debug_barrier()
     tl.atomic_add(
         partial_sum_ptr + safe_experts * n_tiles + tile_id,
         tl.full([TOKENS_PER_TILE * K_POW2], 1, dtype=tl.int32),
@@ -174,6 +176,8 @@ def _general_compute_col_partial_sum_kernel(
     expert_ids = tl.load(selected_E_ptr + offs, mask=mask, other=-1)
 
     safe_experts = tl.where(mask, expert_ids, 0)
+    # Every warp's zeroing tl.store above must land before any warp's tl.atomic_add.
+    tl.debug_barrier()
     tl.atomic_add(
         partial_sum_ptr + safe_experts * n_tiles + tile_id,
         tl.full([BLOCK_SIZE], 1, dtype=tl.int32),
