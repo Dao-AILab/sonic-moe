@@ -314,6 +314,37 @@ class TCTopkRouterMetadataTest(TestCommons):
         _assert_expert_grouping(self, topk_indices.reshape(-1), efo, ss, E)
         self.assertTrue(torch.equal(xg, ss // K))
 
+    def test_concurrent_stream(self) -> None:
+        """Counts must survive a concurrent kernel at a training-sized shape (one 163,840-token
+        micro-batch, E=512, K=16). A matmul on another stream changes how the histogram kernel's
+        warps interleave; without the barrier between its zeroing and its atomics, 5% of calls at
+        this shape lost counts on an H100."""
+        self.set_seed(_SEED)
+
+        T, E, K = 163840, 512, 16
+        TK = T * K
+        device = torch.device("cuda")
+        topk_indices = torch.rand(T, E, device=device).topk(K, dim=1).indices.int()
+        refs = _ref_TC_topk_router_metadata(topk_indices, E)
+
+        ef = torch.empty(E, dtype=torch.int32, device=device)
+        efo = torch.empty(E + 1, dtype=torch.int32, device=device)
+        xg = torch.empty(TK, dtype=torch.int32, device=device)
+        ss = torch.empty(TK, dtype=torch.int32, device=device)
+        sr = torch.empty(TK, dtype=torch.int32, device=device)
+
+        load = torch.randn(8192, 8192, device=device, dtype=torch.bfloat16)
+        side = torch.cuda.Stream()
+        mismatches = torch.zeros((), dtype=torch.int64, device=device)
+        for _ in range(200):
+            with torch.cuda.stream(side):
+                load @ load
+            TC_topk_router_metadata_triton(topk_indices, E, ef, efo, xg, ss, sr)
+            for out, ref in zip((ef, efo, xg, ss, sr), refs):
+                mismatches += (out != ref).sum()
+        torch.cuda.synchronize()
+        self.assertEqual(mismatches.item(), 0, "metadata changed beside a concurrent stream")
+
 
 class GeneralRoutingRouterMetadataTest(TestCommons):
 

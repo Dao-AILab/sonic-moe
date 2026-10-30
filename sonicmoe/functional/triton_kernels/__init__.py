@@ -38,6 +38,11 @@ def _compute_col_partial_sum_kernel(
             mask=e_offs < E,
         )
 
+    # The zero stores above and the atomic_adds below are issued by different warps. Without a
+    # barrier, one warp's increment can land before another warp's zero store and be overwritten,
+    # losing that count: stage 2 then leaves gather/scatter slots unwritten.
+    tl.debug_barrier()
+
     # Load expert ids for this tile: shape [TOKENS_PER_TILE, K_POW2].
     # Tokens beyond T and k-slots beyond K are masked out (other=-1).
     tok_offs = tile_id * TOKENS_PER_TILE + tl.arange(0, TOKENS_PER_TILE)
@@ -167,6 +172,11 @@ def _general_compute_col_partial_sum_kernel(
             tl.zeros([E_POW2], tl.int32),
             mask=e_offs < E,
         )
+
+    # The zero stores above and the atomic_adds below are issued by different warps. Without a
+    # barrier, one warp's increment can land before another warp's zero store and be overwritten,
+    # losing that count: stage 2 then leaves gather/scatter slots unwritten.
+    tl.debug_barrier()
 
     # Load expert ids for this tile (flat indexing into selected_E).
     offs = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
